@@ -29,8 +29,15 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # See the note on User.role: values_callable makes SQLAlchemy persist
+    # the enum's value ("pending") instead of its name ("PENDING"), which
+    # is what migration 0002's Postgres type actually accepts.
     status: Mapped[DocumentStatus] = mapped_column(
-        SAEnum(DocumentStatus, name="document_status"),
+        SAEnum(
+            DocumentStatus,
+            name="document_status",
+            values_callable=lambda e: [m.value for m in e],
+        ),
         nullable=False,
         default=DocumentStatus.PENDING,
     )

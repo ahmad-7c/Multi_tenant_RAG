@@ -45,10 +45,20 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-Phase 2 — Ingestion Pipeline: COMPLETE (models, migrations, Celery,
-ingestion task, endpoints, tests — see Build Log below).
-Next: define Phase 3 (retrieval/query pipeline against the chunks
-ingested here).
+**CHECKPOINT 1 reached — Phase 1 (auth + tenancy) is COMPLETE and audited.**
+
+Done: Organization/User/ApiKey models, migrations 0001–0003 (verified
+`downgrade base` → `upgrade head` round-trip on real Postgres), Settings
+with every tunable env-overridable, bcrypt hashing + JWT mint/verify,
+`get_current_user`/`require_admin`, `/auth/register`, `/auth/login`,
+`/users/me`, 22 tests green against pgvector/pgvector:pg16 (no SQLite).
+
+Next: Phase 2 PART 1 — rewrite `documents`/`document_chunks` toward the
+retrieval schema (`storage_key` replacing `file_path`, `embedding_model`,
+tsvector + GIN, HNSW replacing ivfflat) in migration 0004.
+
+See "Phase 1 Audit" below for the fixes applied and the issues flagged
+but deliberately left alone.
 
 ## Phase 2 Build Log
 
@@ -147,3 +157,104 @@ Postgres+pgvector.
 - Cache key = hash(org_id + normalized rewritten question + org.index_version).
 - Never hold a DB session open while streaming an LLM response.
 - All external providers (embeddings, reranker, LLM) sit behind small interfaces with fake implementations for tests.
+## Phase 1 Audit (2026-10-25)
+
+### Fixed: four directed issues
+1. **organizations.name is now UNIQUE** (model + migration 0003).
+   Login resolves an account by (org name, email); two orgs sharing a
+   name made that lookup ambiguous and whichever row Postgres returned
+   first silently decided which tenant you authenticated into. Register
+   returns **409** on a duplicate name -- matched on the *constraint name*,
+   not on "any IntegrityError", so a NOT NULL/FK bug in register() can
+   no longer hide behind a plausible-looking 409.
+2. **get_current_user turns every malformed claim into 401, never 500.**
+   Claim values are attacker-controlled. UUID(payload["sub"]) previously
+   raised KeyError/TypeError/ValueError straight out of the dependency for
+   a missing key, a non-string, or a non-UUID string. Now both claims are
+   parsed inside one guarded block. decode_access_token also pins
+   options={"require": ["exp", "sub"]} -- without it a token minted with
+   no exp would verify forever.
+3. **Tests run on real Postgres + pgvector, not SQLite.** docker-compose
+   gained a disposable test-db (pgvector/pgvector:pg16, port 5433, tmpfs
+   storage, fsync=off). conftest.py builds schema by running Alembic to
+   head -- so the suite also proves the migrations are runnable -- and
+   refuses to start if TEST_DATABASE_URL is unset or equals DATABASE_URL
+   (it drops the schema). Each test is one transaction on one connection
+   with join_transaction_mode="create_savepoint" and is rolled back, so
+   tests cannot leak rows into each other. bcrypt==4.0.1 / passlib==1.7.4
+   left untouched and verified working.
+4. Suspicious-but-unchanged items are listed below.
+
+### Fixed: three latent bugs the SQLite suite was hiding
+Switching the suite to Postgres immediately failed, which is the point.
+- **Migrations 0001/0002 could not run on a fresh database.** Both did
+  sa.Enum(...).create(bind, checkfirst=True) and then passed the same
+  sa.Enum object into create_table, which emits a *second*, unguarded
+  CREATE TYPE -> DuplicateObject: type "user_role" already exists. Fixed
+  by referencing the type as postgresql.ENUM(..., create_type=False) in
+  create_table. These migrations had evidently never run on Postgres.
+- **The ORM persisted enum *names*, the DB type holds enum *values*.**
+  SAEnum(UserRole) sends 'MEMBER'; the Postgres type accepts 'member'.
+  Every user/document insert failed with
+  invalid input value for enum user_role: "MEMBER". Fixed with
+  values_callable=lambda e: [m.value for m in e] on both enums. SQLite
+  stores either string happily, which is exactly why this survived.
+- **org.id was None when read for user.org_id.** default=uuid.uuid4 on a
+  column fires at INSERT, not at object construction, so
+  Organization(name=...) then User(org_id=org.id) wrote NULL. Fixed by
+  generating both ids explicitly in auth_service.register.
+
+### Also fixed
+- alembic/env.py overwrote sqlalchemy.url from settings.DATABASE_URL
+  unconditionally, so the test harness's URL was ignored and migrations
+  ran against **dev**. Now it only fills in that default when the caller
+  supplied no URL.
+- .gitignore did not cover venv/ (this repo's dev venv), uploads/*, or
+  *.sqlite3.
+
+### Flagged, deliberately NOT changed
+Real issues, but they belong to later parts or to a decision the project
+has not made yet. Listed so none of them is a surprise later.
+- **ingestion.py holds an open DB transaction across N embedding network
+  calls.** It flushes parent rows, loops embedding batches, then commits.
+  A slow or hanging OpenAI call keeps a write transaction (and its locks)
+  open for the duration. Phase 2 PART 4 reverses this: embed everything in
+  memory first, then one transaction.
+- **self.retry() on a mid-stream batch failure re-runs the whole task**,
+  re-paying for every batch already embedded. PART 4 retries only the
+  failed batch.
+- **Model names and batch sizes are hardcoded** in ingestion.py
+  (EMBEDDING_MODEL, EMBEDDING_BATCH_SIZE) and chunking.py
+  (encoding_for_model("text-embedding-3-small"), the token constants).
+  Phase 2 moves all of them into Settings.
+- **document_chunks has no embedding_model column**, so there is no way to
+  tell which model produced a stored vector, making a model migration a
+  guess. Added in PART 1.
+- **The ivfflat index is built on an empty table.** ivfflat derives
+  centroids from existing rows; built at zero rows its lists are
+  meaningless until a REINDEX. Phase 2 replaces it with HNSW, which builds
+  incrementally.
+- **Document.file_path stores a host filesystem path**, which forces API
+  and worker onto a shared filesystem and cannot survive a move to object
+  storage. Becomes storage_key in PART 1.
+- **Upload does await file.read() with no size cap** -- a large upload is
+  read entirely into memory. MAX_UPLOAD_BYTES is in Settings now but is
+  not yet enforced; PART 5 enforces it.
+- **FK cleanup gaps:** documents.org_id, document_chunks.org_id and
+  documents.uploaded_by have no ondelete, so deleting an org or a user
+  raises instead of cascading. Not fixing blind -- "what happens when an
+  org is deleted" is a product decision (hard delete vs. soft).
+- **No uniqueness on (document_id, parent_id, chunk_index).** Ingestion
+  idempotency relies entirely on delete-then-insert; a constraint would
+  make a double-write impossible rather than merely unlikely.
+- **Celery's result backend is Redis but the task returns None**, so it
+  accumulates dead result keys with no TTL configured.
+- **app/ subpackages have no __init__.py** (implicit namespace packages).
+  It works today, but it is why a typo'd module path fails as a confusing
+  attribute error instead of an ImportError.
+- **Swagger's Authorize button cannot work**: OAuth2PasswordBearer declares
+  tokenUrl=/api/v1/auth/login, but that route takes JSON, not the OAuth2
+  form body Swagger posts.
+- **.env ships the placeholder JWT_SECRET_KEY=change-me-...** It is
+  gitignored, so nothing leaked, but every dev box signing tokens with the
+  same published default is worth noting.

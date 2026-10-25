@@ -10,6 +10,7 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 from pgvector.sqlalchemy import Vector
+from sqlalchemy.dialects import postgresql
 
 revision: str = "0002"
 down_revision: Union[str, None] = "0001"
@@ -21,8 +22,15 @@ def upgrade() -> None:
     # Required once per database before any `vector`-typed column can exist.
     op.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
-    document_status = sa.Enum("pending", "processing", "ready", "failed", name="document_status")
-    document_status.create(op.get_bind(), checkfirst=True)
+    # Same two-step as user_role in 0001: create the type once, then
+    # reference it with create_type=False so create_table does not emit a
+    # second CREATE TYPE and fail on a fresh database.
+    sa.Enum("pending", "processing", "ready", "failed", name="document_status").create(
+        op.get_bind(), checkfirst=True
+    )
+    document_status = postgresql.ENUM(
+        "pending", "processing", "ready", "failed", name="document_status", create_type=False
+    )
 
     op.create_table(
         "documents",

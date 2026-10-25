@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "0001"
 down_revision: Union[str, None] = None
@@ -24,8 +25,12 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
-    user_role = sa.Enum("admin", "member", name="user_role")
-    user_role.create(op.get_bind(), checkfirst=True)
+    # Created explicitly, then referenced below with create_type=False.
+    # Without that flag SQLAlchemy emits a second (un-guarded) CREATE TYPE
+    # as part of create_table and the migration dies with
+    # "type user_role already exists" on a completely fresh database.
+    sa.Enum("admin", "member", name="user_role").create(op.get_bind(), checkfirst=True)
+    user_role = postgresql.ENUM("admin", "member", name="user_role", create_type=False)
 
     op.create_table(
         "users",

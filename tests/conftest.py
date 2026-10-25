@@ -1,76 +1,136 @@
+"""Test harness.
+
+These tests run against a real Postgres + pgvector database, not SQLite.
+That is a deliberate cost: SQLite cannot express the things this system
+actually depends on -- the `vector` type and its operators, HNSW/GIN
+indexes, `to_tsvector`/`ts_rank`, generated columns, or native enums. A
+suite that passes on SQLite tells you nothing about whether retrieval
+works, which is the only interesting question here.
+
+Schema comes from Alembic, not Base.metadata.create_all(), so the suite
+also proves the migrations are runnable and complete.
+"""
+import os
 import uuid
-from datetime import datetime, timedelta, timezone
 
-import jwt
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
 
-import app.models  # noqa: F401 -- side-effect import, registers all models on Base.metadata
+import app.models  # noqa: F401 -- side effect: registers models on Base.metadata
 from app.core.config import settings
-from app.db.base import Base
+from app.core.security import create_access_token, hash_password
 from app.db.session import get_db
-from app.main import app
+from app.main import app as fastapi_app
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.services import document_service
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _require_test_database_url() -> str:
+    url = settings.TEST_DATABASE_URL
+    if not url:
+        pytest.skip(
+            "TEST_DATABASE_URL is not set. Start the disposable database with "
+            "`docker compose up -d test-db` and point TEST_DATABASE_URL at it "
+            "(see .env.example)."
+        )
+    # Hard guard, not a convention: this fixture drops every table in the
+    # target database. Pointing it at DATABASE_URL by accident would wipe
+    # dev data, so refuse rather than trust the operator.
+    if url == settings.DATABASE_URL:
+        pytest.fail("TEST_DATABASE_URL must not equal DATABASE_URL -- the suite drops schema.")
+    return url
+
+
+@pytest.fixture(scope="session")
+def engine():
+    url = _require_test_database_url()
+    eng = create_engine(url, pool_pre_ping=True)
+    try:
+        with eng.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except Exception as exc:  # pragma: no cover - environment problem, not a test failure
+        pytest.skip(f"test database at {url} is not reachable: {exc}")
+
+    # Full reset once per session: a leftover table or a half-applied
+    # migration from a previous run would otherwise make results depend on
+    # history instead of on the code under test.
+    with eng.begin() as conn:
+        conn.execute(text("DROP SCHEMA public CASCADE"))
+        conn.execute(text("CREATE SCHEMA public"))
+
+    alembic_cfg = Config(os.path.join(REPO_ROOT, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(REPO_ROOT, "alembic"))
+    # env.py reads settings.DATABASE_URL; override it so migrations land in
+    # the test database and never in dev.
+    alembic_cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(alembic_cfg, "head")
+
+    yield eng
+    eng.dispose()
+
 
 @pytest.fixture()
-def db_session():
-    # In-memory SQLite, not the real Postgres+pgvector stack: these tests
-    # exercise the HTTP/service/auth layer added in Part 4, not pgvector-
-    # specific behavior, so a disposable in-process DB keeps them fast and
-    # dependency-free. StaticPool + check_same_thread=False makes every
-    # session share the one in-memory connection instead of each getting
-    # its own (and therefore empty) database.
-    engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+def db_session(engine) -> Session:
+    """One test = one transaction, rolled back at the end.
+
+    The session is bound to an outer transaction on a single connection
+    rather than committing for real, so tests cannot leak rows into each
+    other even though they share one migrated database. `session.commit()`
+    inside application code commits the inner nested transaction (a
+    SAVEPOINT); the outer one is still rolled back here.
+    """
+    connection = engine.connect()
+    outer = connection.begin()
+    TestingSessionLocal = sessionmaker(
+        bind=connection, autocommit=False, autoflush=False, join_transaction_mode="create_savepoint"
     )
-    Base.metadata.create_all(engine)
-    TestingSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     session = TestingSessionLocal()
     try:
         yield session
     finally:
         session.close()
-        engine.dispose()
+        outer.rollback()
+        connection.close()
 
 
 @pytest.fixture()
 def client(db_session, monkeypatch, tmp_path):
     def override_get_db():
-        # Deliberately does not close db_session here -- its lifecycle is
-        # owned by the db_session fixture so the test body and the route
-        # it calls share one open session/transaction.
+        # Deliberately does not close db_session: its lifecycle belongs to
+        # the db_session fixture, so the test body and the route it calls
+        # observe the same uncommitted transaction.
         yield db_session
 
-    app.dependency_overrides[get_db] = override_get_db
+    fastapi_app.dependency_overrides[get_db] = override_get_db
 
-    # Uploaded files go under a per-test tmp dir instead of the real
-    # uploads/ directory, so running the suite doesn't litter the repo.
+    # Uploads land in a per-test tmp dir so the suite never writes into the
+    # repo's uploads/ directory.
     monkeypatch.setattr(document_service, "UPLOAD_DIR", tmp_path / "uploads")
 
-    # ingest_document.delay() would otherwise try to publish to a real
-    # Redis broker. These tests cover the HTTP/DB layer only -- the
-    # ingestion task itself is exercised separately -- so the enqueue call
-    # is replaced with a no-op.
+    # ingest_document.delay() would publish to a real Redis broker. The
+    # ingestion task has its own tests; here the enqueue is a no-op so the
+    # HTTP-layer tests need no running worker.
     monkeypatch.setattr(document_service.ingest_document, "delay", lambda *a, **k: None)
 
-    with TestClient(app) as test_client:
+    with TestClient(fastapi_app) as test_client:
         yield test_client
 
-    app.dependency_overrides.clear()
+    fastapi_app.dependency_overrides.clear()
 
 
 @pytest.fixture()
 def org_factory(db_session):
-    def _make(name: str = "Org") -> Organization:
-        org = Organization(id=uuid.uuid4(), name=name)
+    def _make(name: str | None = None) -> Organization:
+        # Unique suffix by default: organizations.name is UNIQUE now, so a
+        # shared literal would make the second call in a test fail.
+        org = Organization(id=uuid.uuid4(), name=name or f"Org-{uuid.uuid4().hex[:8]}")
         db_session.add(org)
         db_session.commit()
         return org
@@ -80,14 +140,17 @@ def org_factory(db_session):
 
 @pytest.fixture()
 def user_factory(db_session):
-    def _make(org: Organization, role: UserRole = UserRole.MEMBER, email: str | None = None) -> User:
+    def _make(
+        org: Organization,
+        role: UserRole = UserRole.MEMBER,
+        email: str | None = None,
+        password: str = "correct-horse-battery",
+    ) -> User:
         user = User(
             id=uuid.uuid4(),
             org_id=org.id,
-            email=email or f"{uuid.uuid4()}@example.com",
-            # Never a real hash in tests -- nothing here exercises login,
-            # so there's no password to verify.
-            hashed_password="unused-in-these-tests",
+            email=email or f"{uuid.uuid4().hex[:8]}@example.com",
+            hashed_password=hash_password(password),
             role=role,
         )
         db_session.add(user)
@@ -100,14 +163,11 @@ def user_factory(db_session):
 @pytest.fixture()
 def auth_headers():
     def _make(user: User) -> dict:
-        token = jwt.encode(
-            {
-                "sub": str(user.id),
-                "org_id": str(user.org_id),
-                "exp": datetime.now(timezone.utc) + timedelta(hours=1),
-            },
-            settings.JWT_SECRET_KEY,
-            algorithm=settings.JWT_ALGORITHM,
+        # Minted through the real token factory, not hand-rolled here, so a
+        # change to claim names breaks the tests instead of silently
+        # letting them pass against a shape production never issues.
+        token = create_access_token(
+            user_id=user.id, org_id=user.org_id, role=user.role.value
         )
         return {"Authorization": f"Bearer {token}"}
 

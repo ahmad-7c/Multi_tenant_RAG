@@ -1,5 +1,7 @@
 services:
   db:
+    # pgvector/pgvector, not plain postgres: the `vector` extension must
+    # exist in the image or migration 0002's CREATE EXTENSION fails.
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_USER: documind
@@ -13,41 +15,80 @@ services:
       test: ["CMD-SHELL", "pg_isready -U documind"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+
+  test-db:
+    # Separate instance on a separate port with NO named volume: the test
+    # suite drops and recreates its schema on every run, which must never
+    # be possible against the dev database. tmpfs storage also makes the
+    # suite meaningfully faster since durability is pointless here.
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: documind
+      POSTGRES_PASSWORD: documind
+      POSTGRES_DB: documind_test
+      # Unsafe-by-design settings, acceptable only because this database
+      # is disposable.
+      POSTGRES_INITDB_ARGS: "--no-sync"
+    command: >
+      postgres -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U documind -d documind_test"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   api:
     build: .
     env_file: .env
+    environment:
+      DATABASE_URL: postgresql://documind:documind@db:5432/documind
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     # Bind-mounted (not a named volume) so the host directory is the same
-    # one the worker mounts below -- the API writes uploaded files here,
-    # the worker reads them back by file_path during ingestion.
+    # one the worker mounts below. With STORAGE_BACKEND=local the API
+    # writes the uploaded bytes here and the worker reads them back by
+    # storage_key -- if these were separate volumes the worker would see
+    # an empty directory and every ingestion would fail.
     volumes:
       - ./uploads:/code/uploads
 
   worker:
     build: .
     env_file: .env
-    # Same image as api, different entrypoint: a Celery worker instead of
-    # uvicorn, so it has access to the exact same app.models/app.workers
-    # code the task was defined with.
-    command: celery -A app.workers.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://documind:documind@db:5432/documind
+      REDIS_URL: redis://redis:6379/0
+    # Same image as api, different entrypoint: the worker must be built
+    # from the identical code the task was defined with, or Celery's task
+    # name lookup resolves to a different function body than the producer
+    # intended.
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
     depends_on:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - ./uploads:/code/uploads
 

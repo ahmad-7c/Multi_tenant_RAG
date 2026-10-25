@@ -27,8 +27,15 @@ class User(Base):
     )
     email: Mapped[str] = mapped_column(String(255), nullable=False)
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+    # values_callable is required, not cosmetic: by default SQLAlchemy
+    # persists a Python enum's *name* ("MEMBER"), while the Postgres type
+    # created by migration 0001 holds its *value* ("member"). Without this
+    # every insert fails with "invalid input value for enum user_role".
+    # (SQLite accepts either, which is why this only surfaces on Postgres.)
     role: Mapped[UserRole] = mapped_column(
-        SAEnum(UserRole, name="user_role"), nullable=False, default=UserRole.MEMBER
+        SAEnum(UserRole, name="user_role", values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        default=UserRole.MEMBER,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()

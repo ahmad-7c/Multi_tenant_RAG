@@ -11,7 +11,14 @@ from app.core.config import settings
 from app.db.base import Base
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+
+# Only fall back to settings.DATABASE_URL when no URL was supplied by the
+# caller. The test harness builds a Config and sets sqlalchemy.url to the
+# disposable test database before calling command.upgrade(); overwriting it
+# here unconditionally would silently run every test migration against the
+# dev database instead.
+if not config.get_main_option("sqlalchemy.url", None):
+    config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
