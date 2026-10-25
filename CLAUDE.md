@@ -45,24 +45,31 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**Phase 2 PART 2 (storage service) COMPLETE.** 64 tests green against real
-Postgres + pgvector.
+**Phase 2 PART 3 (Celery) COMPLETE.** 73 tests green against real Postgres
++ pgvector.
 
 Done: Phase 1 complete and audited (see "Phase 1 Audit"). PART 1 -
 migration 0004 (`storage_key`, `embedding_model`, GENERATED `content_tsv` +
-partial GIN, HNSW `vector_cosine_ops` replacing ivfflat);
-`organizations.index_version` from 0003. PART 2 - `app/services/storage.py`:
-`save`/`read`/`delete`/`exists` behind one ABC, `LocalDiskStorage` (atomic
-write via `os.replace`, containment check on every key) and `S3Storage`
-(lazy boto3 import, injectable client, private bucket), chosen by
-`STORAGE_BACKEND`. Key = `{org_id}/{document_id}/{sanitized filename}`,
-built only by `build_storage_key()`. The worker now reads bytes through the
-same backend instead of assuming a shared filesystem, and `_extract_pages`
-takes bytes rather than a path.
+partial GIN, HNSW replacing ivfflat). PART 2 - `app/services/storage.py`
+(local-disk + S3 behind one ABC, key `{org_id}/{document_id}/{filename}`).
+PART 3 - Celery hardened for `acks_late` on a Redis broker:
+`visibility_timeout` (1800s) > hard `task_time_limit` (960s) >
+`task_soft_time_limit` (900s), `task_reject_on_worker_lost`,
+`result_expires`, `worker_max_tasks_per_child`. Verified by booting a real
+worker, confirming it registers `ingest_document`, and round-tripping a
+task through Redis to SUCCESS.
 
-Next: PART 3 - Celery wiring review + worker service (celery_app already
-has acks_late and prefetch 1; needs the result-backend TTL and a
-docker-compose check).
+### Local dev ports (this box)
+- compose `db` publishes **5434** (a local PostgreSQL 18 already owns 5432
+  and has no pgvector; the collision surfaces as a confusing
+  "password authentication failed for user documind").
+- compose `test-db` publishes **5433**. `redis` on 6379.
+- `docker compose up -d db test-db redis`, then `alembic upgrade head`.
+- Another project's container already holds host port 8000, so the compose
+  `api` service will collide if started.
+
+Next: PART 4 - ingestion pipeline split into extractor / cleaner / chunker
+/ embedder / task, with the fake embedder for tests.
 
 ## Phase 2 Build Log
 

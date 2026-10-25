@@ -22,6 +22,19 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     ENV: str = "development"
 
+    # ---- Celery ---------------------------------------------------------
+    # Default to REDIS_URL, but overridable so broker, result backend and
+    # the answer cache can be split onto separate Redis databases -- a
+    # FLUSHDB aimed at the cache must not be able to drop queued tasks.
+    CELERY_BROKER_URL: Optional[str] = None
+    CELERY_RESULT_BACKEND: Optional[str] = None
+    CELERY_TASK_SOFT_TIME_LIMIT: int = 900
+    CELERY_TASK_TIME_LIMIT: int = 960
+    # MUST exceed CELERY_TASK_TIME_LIMIT; see the comment in celery_app.py.
+    CELERY_VISIBILITY_TIMEOUT: int = 1800
+    CELERY_RESULT_EXPIRES: int = 3600
+    CELERY_MAX_TASKS_PER_CHILD: int = 100
+
     # ---- Auth -----------------------------------------------------------
     JWT_SECRET_KEY: str
     JWT_ALGORITHM: str = "HS256"

@@ -8,7 +8,13 @@ services:
       POSTGRES_PASSWORD: documind
       POSTGRES_DB: documind
     ports:
-      - "5432:5432"
+      # 5434 on the host, not 5432: this dev box already runs a local
+      # PostgreSQL 18 service on 5432 (which has no pgvector). Publishing
+      # here would collide with it, and the collision shows up as
+      # "password authentication failed for user documind" -- a confusing
+      # error, because something IS listening, just not this.
+      # Inside the compose network services still reach it as db:5432.
+      - "5434:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
