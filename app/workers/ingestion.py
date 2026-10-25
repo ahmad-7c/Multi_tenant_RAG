@@ -84,7 +84,9 @@ def ingest_document(self, document_id: str) -> None:
         db.commit()
 
         try:
-            pages = _extract_pages(document.file_path)
+            # PART 2 replaces this with storage.read(document.storage_key);
+            # until then the key is resolved against the local upload dir.
+            pages = _extract_pages(str(Path(settings.STORAGE_LOCAL_ROOT) / document.storage_key))
         except Exception as exc:  # corrupt/unreadable file
             # The problem is the input file itself -- retrying the same
             # bytes won't change the outcome, so fail immediately instead

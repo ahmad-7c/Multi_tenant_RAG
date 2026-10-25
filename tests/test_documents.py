@@ -41,7 +41,7 @@ def test_document_status_polling_returns_correct_status(
         org_id=org.id,
         uploaded_by=admin.id,
         filename="report.pdf",
-        file_path="uploads/report.pdf",
+        storage_key="org/doc/report.pdf",
         file_size_bytes=123,
         status=DocumentStatus.READY,
     )
@@ -67,7 +67,7 @@ def test_cross_org_document_access_returns_404(
         org_id=org_a.id,
         uploaded_by=admin_a.id,
         filename="secret.pdf",
-        file_path="uploads/secret.pdf",
+        storage_key="org/doc/secret.pdf",
         file_size_bytes=10,
         status=DocumentStatus.READY,
     )

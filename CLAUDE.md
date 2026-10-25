@@ -45,20 +45,19 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**CHECKPOINT 1 reached — Phase 1 (auth + tenancy) is COMPLETE and audited.**
+**Phase 2 PART 1 (models + migration) COMPLETE.** 34 tests green against
+real Postgres + pgvector; migrations verified `downgrade base` -> `head`.
 
-Done: Organization/User/ApiKey models, migrations 0001–0003 (verified
-`downgrade base` → `upgrade head` round-trip on real Postgres), Settings
-with every tunable env-overridable, bcrypt hashing + JWT mint/verify,
-`get_current_user`/`require_admin`, `/auth/register`, `/auth/login`,
-`/users/me`, 22 tests green against pgvector/pgvector:pg16 (no SQLite).
+Done so far: Phase 1 complete and audited (see "Phase 1 Audit"), plus
+migration 0004 - `documents.file_path` -> `storage_key`,
+`document_chunks.embedding_model`, a GENERATED `content_tsv` column with a
+partial GIN index on children, and HNSW (`vector_cosine_ops`, m=16,
+ef_construction=64, partial on `embedding IS NOT NULL`) replacing ivfflat.
+`organizations.index_version` landed in 0003.
 
-Next: Phase 2 PART 1 — rewrite `documents`/`document_chunks` toward the
-retrieval schema (`storage_key` replacing `file_path`, `embedding_model`,
-tsvector + GIN, HNSW replacing ivfflat) in migration 0004.
-
-See "Phase 1 Audit" below for the fixes applied and the issues flagged
-but deliberately left alone.
+Next: PART 2 - storage service (local-disk + S3-compatible behind one
+interface, key = `{org_id}/{document_id}/{filename}`), which removes the
+`UPLOAD_DIR` stopgap still present in `document_service` and `ingestion`.
 
 ## Phase 2 Build Log
 
@@ -258,3 +257,4 @@ has not made yet. Listed so none of them is a surprise later.
 - **.env ships the placeholder JWT_SECRET_KEY=change-me-...** It is
   gitignored, so nothing leaked, but every dev box signing tokens with the
   same published default is worth noting.
+con

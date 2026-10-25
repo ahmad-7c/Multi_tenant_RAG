@@ -4,11 +4,14 @@ from pathlib import Path
 from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.document import Document, DocumentStatus
 from app.workers.ingestion import ingest_document
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md"}
-UPLOAD_DIR = Path("uploads")
+# Reads Settings rather than a literal so API and worker resolve the same
+# root. PART 2 removes this entirely in favour of the storage service.
+UPLOAD_DIR = Path(settings.STORAGE_LOCAL_ROOT)
 
 
 def _validate_extension(filename: str) -> str:
@@ -36,15 +39,19 @@ def create_document(
     # Stored under the document's own id, not the user-supplied filename --
     # avoids path traversal from a crafted filename and collisions between
     # unrelated uploads that happen to share a name.
-    file_path = UPLOAD_DIR / f"{document_id}{suffix}"
-    file_path.write_bytes(content)
+    #
+    # PART 2 replaces this inline local-disk write with the storage
+    # service; storage_key becomes {org_id}/{document_id}/{filename} and
+    # this function stops knowing what a directory is.
+    storage_key = f"{document_id}{suffix}"
+    (UPLOAD_DIR / storage_key).write_bytes(content)
 
     document = Document(
         id=document_id,
         org_id=org_id,
         uploaded_by=uploaded_by,
         filename=filename,
-        file_path=str(file_path),
+        storage_key=storage_key,
         file_size_bytes=len(content),
         status=DocumentStatus.PENDING,
     )

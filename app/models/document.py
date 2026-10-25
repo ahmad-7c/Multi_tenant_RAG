@@ -26,8 +26,14 @@ class Document(Base):
         ForeignKey("organizations.id"), nullable=False, index=True
     )
     uploaded_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"), nullable=False)
+    # The name the user uploaded, kept only for display and citations. It
+    # is never used to build storage_key -- see the storage service.
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    file_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    # An opaque key, not a filesystem path: only the storage backend knows
+    # how to turn it into bytes. A path would force the API and the worker
+    # onto one shared filesystem and could not describe an object in a
+    # bucket.
+    storage_key: Mapped[str] = mapped_column(String(1024), nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # See the note on User.role: values_callable makes SQLAlchemy persist
     # the enum's value ("pending") instead of its name ("PENDING"), which
