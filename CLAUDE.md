@@ -45,31 +45,31 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**Phase 2 PART 3 (Celery) COMPLETE.** 73 tests green against real Postgres
-+ pgvector.
+**Phase 2 PART 4 (ingestion pipeline) COMPLETE.** 169 tests green against
+real Postgres + pgvector.
 
-Done: Phase 1 complete and audited (see "Phase 1 Audit"). PART 1 -
-migration 0004 (`storage_key`, `embedding_model`, GENERATED `content_tsv` +
-partial GIN, HNSW replacing ivfflat). PART 2 - `app/services/storage.py`
-(local-disk + S3 behind one ABC, key `{org_id}/{document_id}/{filename}`).
-PART 3 - Celery hardened for `acks_late` on a Redis broker:
-`visibility_timeout` (1800s) > hard `task_time_limit` (960s) >
-`task_soft_time_limit` (900s), `task_reject_on_worker_lost`,
-`result_expires`, `worker_max_tasks_per_child`. Verified by booting a real
-worker, confirming it registers `ingest_document`, and round-tripping a
-task through Redis to SUCCESS.
+Pipeline is five single-purpose modules; only the last one touches the DB:
+- `app/services/extraction.py` - bytes -> `Page`s. PyMuPDF page by page for
+  PDFs, one synthetic page for txt/md. Raises `NeedsOCRError` when the mean
+  chars-per-page is below `OCR_MIN_CHARS_PER_PAGE` (a scan).
+- `app/services/cleaning.py` - de-hyphenates line breaks, joins wrapped
+  prose lines while leaving code fences / tables / headings / lists alone,
+  strips running headers/footers (digit-normalized, length-capped, never
+  strips a page empty).
+- `app/services/chunking.py` - structure-aware blocks -> parents ->
+  children. tiktoken only MEASURES. Tables and code fences stay whole,
+  table children repeat the header row, children split on sentence
+  boundaries with token-measured overlap, nearest heading prepended, and a
+  parent never spans pages (page_number feeds citations).
+- `app/services/embedding.py` - provider ABC, OpenAI impl, deterministic
+  `FakeEmbeddings`, `embed_in_batches` retrying ONLY the failed batch with
+  exponential backoff, transient-vs-permanent classified by status code.
+- `app/workers/ingestion.py` - tx1 claim/PROCESSING, session CLOSED for all
+  slow work, embed everything in memory, then ONE transaction for delete +
+  parents + children + READY + `index_version += 1`.
 
-### Local dev ports (this box)
-- compose `db` publishes **5434** (a local PostgreSQL 18 already owns 5432
-  and has no pgvector; the collision surfaces as a confusing
-  "password authentication failed for user documind").
-- compose `test-db` publishes **5433**. `redis` on 6379.
-- `docker compose up -d db test-db redis`, then `alembic upgrade head`.
-- Another project's container already holds host port 8000, so the compose
-  `api` service will collide if started.
-
-Next: PART 4 - ingestion pipeline split into extractor / cleaner / chunker
-/ embedder / task, with the fake embedder for tests.
+Next: PART 5 - endpoints (POST/GET/GET-by-id/DELETE with max size,
+admin gating, 202, 404-not-403, index_version bump on delete).
 
 ## Phase 2 Build Log
 

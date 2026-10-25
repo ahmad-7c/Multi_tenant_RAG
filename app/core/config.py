@@ -85,6 +85,30 @@ class Settings(BaseSettings):
     RERANKER_BASE_URL: str = "https://api.cohere.com/v2/rerank"
     RERANKER_TIMEOUT_SECONDS: float = 3.0
 
+    # ---- Extraction -----------------------------------------------------
+    # A scanned PDF extracts to almost nothing. Below this mean
+    # chars-per-page we refuse the document with a "needs OCR" error rather
+    # than storing a handful of junk chunks that retrieval can never match.
+    # Deliberately low: a sparse-but-real PDF (title pages, figures) should
+    # pass, and only a genuinely image-only document should fail.
+    OCR_MIN_CHARS_PER_PAGE: int = 25
+
+    # ---- Cleaning -------------------------------------------------------
+    # How many lines at the top/bottom of each page to consider as a
+    # candidate running header/footer.
+    CLEAN_EDGE_LINES: int = 3
+    # Repeated-line removal needs enough pages to tell a running header
+    # from a line that simply happens to appear twice.
+    CLEAN_MIN_PAGES_FOR_HEADER_DETECTION: int = 3
+    # Fraction of pages a candidate line must appear on to count as a
+    # running header/footer.
+    CLEAN_REPEAT_RATIO: float = 0.6
+    # Running headers/footers are short. Without a cap, digit
+    # normalization ("Page 3 of 10" -> "Page # of #") makes any prose
+    # sentence containing a number collide with the same sentence on
+    # another page, and real content gets deleted.
+    CLEAN_MAX_HEADER_CHARS: int = 80
+
     # ---- Chunking -------------------------------------------------------
     PARENT_TOKENS: int = 500
     CHILD_TOKENS: int = 125
@@ -93,6 +117,8 @@ class Settings(BaseSettings):
     # ---- Embedding ------------------------------------------------------
     EMBED_BATCH_SIZE: int = 64
     EMBED_MAX_RETRIES: int = 3
+    # Backoff base: sleep is EMBED_RETRY_BASE_SECONDS * 2**attempt.
+    EMBED_RETRY_BASE_SECONDS: float = 5.0
 
     # ---- Retrieval ------------------------------------------------------
     # Candidates surviving the RRF merge of vector + full-text results.
