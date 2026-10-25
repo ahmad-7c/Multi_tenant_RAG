@@ -45,31 +45,25 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**Phase 2 PART 4 (ingestion pipeline) COMPLETE.** 169 tests green against
-real Postgres + pgvector.
+**PHASE 2 COMPLETE (PARTS 1-6). CHECKPOINT 2 reached.** 187 tests green
+against real Postgres + pgvector, no network.
 
-Pipeline is five single-purpose modules; only the last one touches the DB:
-- `app/services/extraction.py` - bytes -> `Page`s. PyMuPDF page by page for
-  PDFs, one synthetic page for txt/md. Raises `NeedsOCRError` when the mean
-  chars-per-page is below `OCR_MIN_CHARS_PER_PAGE` (a scan).
-- `app/services/cleaning.py` - de-hyphenates line breaks, joins wrapped
-  prose lines while leaving code fences / tables / headings / lists alone,
-  strips running headers/footers (digit-normalized, length-capped, never
-  strips a page empty).
-- `app/services/chunking.py` - structure-aware blocks -> parents ->
-  children. tiktoken only MEASURES. Tables and code fences stay whole,
-  table children repeat the header row, children split on sentence
-  boundaries with token-measured overlap, nearest heading prepended, and a
-  parent never spans pages (page_number feeds citations).
-- `app/services/embedding.py` - provider ABC, OpenAI impl, deterministic
-  `FakeEmbeddings`, `embed_in_batches` retrying ONLY the failed batch with
-  exponential backoff, transient-vs-permanent classified by status code.
-- `app/workers/ingestion.py` - tx1 claim/PROCESSING, session CLOSED for all
-  slow work, embed everything in memory, then ONE transaction for delete +
-  parents + children + READY + `index_version += 1`.
+- PART 1 migration 0004: `storage_key`, `embedding_model`, GENERATED
+  `content_tsv` + partial GIN, HNSW `vector_cosine_ops` replacing ivfflat.
+- PART 2 `app/services/storage.py`: local-disk + S3 behind one ABC.
+- PART 3 Celery: `visibility_timeout` > `task_time_limit` >
+  `task_soft_time_limit`, `task_reject_on_worker_lost`, `result_expires`.
+- PART 4 pipeline: `extraction.py` / `cleaning.py` / `chunking.py` /
+  `embedding.py` + a task that embeds in memory then writes everything in
+  ONE transaction and bumps `index_version`.
+- PART 5 endpoints: POST (admin, 202, streaming size cap -> 413),
+  GET list + detail (org-scoped, `chunk_count`, 404 not 403),
+  DELETE (admin, storage + chunks + row + `index_version` bump).
+- PART 6 tests: all eight required behaviours covered.
 
-Next: PART 5 - endpoints (POST/GET/GET-by-id/DELETE with max size,
-admin gating, 202, 404-not-403, index_version bump on delete).
+Next: PHASE 3 PART 7 - retrieval (org-scoped vector + full-text on
+children, merged with RRF k=60, plus the ANN-filter recall problem).
+`docs/phase-3-design.md` holds the pre-existing design for this phase.
 
 ## Phase 2 Build Log
 
