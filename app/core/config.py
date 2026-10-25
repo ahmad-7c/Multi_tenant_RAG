@@ -123,6 +123,26 @@ class Settings(BaseSettings):
     # ---- Retrieval ------------------------------------------------------
     # Candidates surviving the RRF merge of vector + full-text results.
     RETRIEVE_CANDIDATES: int = 50
+    # Rows each leg fetches before the merge. Larger than
+    # RETRIEVE_CANDIDATES on purpose: RRF can only rank what it is given,
+    # so a document that one leg ranks 55th and the other ranks 2nd must
+    # still be visible to the merge.
+    RETRIEVE_PER_LEG: int = 60
+    # RRF's rank-smoothing constant. 60 is the value from the original
+    # Cormack et al. paper and the de-facto default; it controls how
+    # steeply rank 1 outweighs rank 10.
+    RRF_K: int = 60
+    # HNSW search breadth. Higher = better recall, more time.
+    HNSW_EF_SEARCH: int = 100
+    # pgvector >= 0.8 iterative scans: resume the graph walk when the
+    # tenant filter discards too many candidates. Without this a small
+    # tenant in a large table silently gets a short result set.
+    # "relaxed_order" because RRF re-ranks everything downstream anyway.
+    HNSW_ITERATIVE_SCAN: str = "relaxed_order"
+    HNSW_MAX_SCAN_TUPLES: int = 20000
+    # Postgres text-search configuration. Must match migration 0004's
+    # generated column, which is baked to 'english'.
+    TS_CONFIG: str = "english"
     RERANK_TOP_N: int = 8
     # Reranker-specific and uncalibrated until Phase 4; see the gate's
     # comment in app/services/reranker.py.
