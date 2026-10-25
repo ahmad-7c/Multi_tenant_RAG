@@ -45,25 +45,50 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASE 2 COMPLETE (PARTS 1-6). CHECKPOINT 2 reached.** 187 tests green
-against real Postgres + pgvector, no network.
+**PHASES 1-3 COMPLETE. CHECKPOINT 3 reached.** 334 tests green against real
+Postgres + pgvector, no network. Migrations verified `downgrade base` ->
+`head` through 0005.
 
-- PART 1 migration 0004: `storage_key`, `embedding_model`, GENERATED
-  `content_tsv` + partial GIN, HNSW `vector_cosine_ops` replacing ivfflat.
-- PART 2 `app/services/storage.py`: local-disk + S3 behind one ABC.
-- PART 3 Celery: `visibility_timeout` > `task_time_limit` >
-  `task_soft_time_limit`, `task_reject_on_worker_lost`, `result_expires`.
-- PART 4 pipeline: `extraction.py` / `cleaning.py` / `chunking.py` /
-  `embedding.py` + a task that embeds in memory then writes everything in
-  ONE transaction and bumps `index_version`.
-- PART 5 endpoints: POST (admin, 202, streaming size cap -> 413),
-  GET list + detail (org-scoped, `chunk_count`, 404 not 403),
-  DELETE (admin, storage + chunks + row + `index_version` bump).
-- PART 6 tests: all eight required behaviours covered.
+Phase 3 modules:
+- `retrieval.py` - one org-scoped path: HNSW cosine + Postgres FTS on
+  children, merged with RRF (k=60). `SET LOCAL hnsw.iterative_scan` for the
+  ANN+filter recall problem.
+- `reranker.py` - async hosted/passthrough/fake, timeout -> RRF fallback,
+  children -> parents deduped by best rank, confidence gate.
+- `prompting.py` / `llm.py` / `citations.py` - numbered `[n] (file, p.X)`
+  blocks inside unforgeable delimiters, no tools on the LLM, markers
+  resolved against the server-built block set.
+- `query_rewrite.py` / `cache.py` - rewrite only when history exists; cache
+  key = sha256(org_id | normalized rewritten question | index_version).
+- `query_service.py` - three phases; no DB session held during streaming.
+- `conversations.py` route - SSE token events then one citations event.
 
-Next: PHASE 3 PART 7 - retrieval (org-scoped vector + full-text on
-children, merged with RRF k=60, plus the ANN-filter recall problem).
-`docs/phase-3-design.md` holds the pre-existing design for this phase.
+### Measured finding on the ANN+filter recall problem
+At realistic sizes the Postgres planner does NOT choose HNSW for a small
+tenant (12 of 20k rows -> it uses the `org_id` btree + sort, which has
+perfect recall). The ANN failure mode only appears once the filter stops
+being selective enough for that path. Measured with the ANN path forced
+(`enable_seqscan=off`, `enable_sort=off`) on a 30k-row corpus:
+
+| tenant share | iterative_scan=off | relaxed_order |
+|---|---|---|
+| 2000 / 32k (6%) | 6 of 60 | 60 of 60 |
+| 300 / 30k (1%)  | 2 of 60 | 60 of 60 |
+
+`tests/test_retrieval.py::test_forced_ann_path_loses_recall_without_iterative_scan`
+reproduces this in the suite. The plain small-tenant test passes by planner
+choice, and its docstring says so.
+
+### Local dev ports (this box)
+- compose `db` -> host **5434** (local PostgreSQL 18 owns 5432 and has no
+  pgvector; the collision shows up as "password authentication failed").
+- compose `test-db` -> host **5433**. `redis` on 6379.
+- `docker compose up -d db test-db redis` then `alembic upgrade head`.
+- Another project's container holds host port 8000.
+
+Next: Phase 4/5 are explicitly OUT OF SCOPE (eval, rate limiting,
+observability, CI, deploy). CONFIDENCE_THRESHOLD calibration is the first
+Phase 4 task.
 
 ## Phase 2 Build Log
 

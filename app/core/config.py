@@ -151,6 +151,10 @@ class Settings(BaseSettings):
 
     # ---- Cache ----------------------------------------------------------
     CACHE_TTL_SECONDS: int = 3600
+    # Defaults to REDIS_URL. Split onto its own Redis database when the
+    # broker shares the instance: a FLUSHDB aimed at the cache must not be
+    # able to drop queued ingestion tasks.
+    CACHE_REDIS_URL: Optional[str] = None
 
 
 settings = Settings()

@@ -339,13 +339,17 @@ def test_no_duplicate_chunks_in_the_merged_result(
 def test_small_tenant_still_gets_a_full_top_k_beside_a_large_tenant(
     db_session, org_factory, user_factory, embedder
 ):
-    """The headline risk of this phase.
+    """A small tenant beside a large one must still get its full top-k.
 
-    HNSW walks the graph over the WHOLE table and the tenant filter is
-    applied to whatever that walk produced. Without iterative index scans,
-    a small tenant surrounded by a much larger one asks for N candidates
-    and gets a handful -- no error, no warning, just a quietly short result
-    set and worse answers for the smallest customers.
+    IMPORTANT about what this proves. Measured against a real corpus
+    (30k rows for one tenant, 300-2000 for another), Postgres does NOT
+    choose the HNSW index at these ratios -- the `org_id` btree plus a sort
+    is cheaper, and that path has perfect recall. So this test passes by
+    planner choice, not because of iterative scan.
+
+    It is still worth keeping as a black-box guarantee of the behaviour we
+    promise. The test that actually exercises the ANN failure mode is
+    `test_forced_ann_path_loses_recall_without_iterative_scan` below.
     """
     small_org, big_org = org_factory(), org_factory()
     small_user, big_user = user_factory(small_org), user_factory(big_org)
@@ -372,6 +376,86 @@ def test_small_tenant_still_gets_a_full_top_k_beside_a_large_tenant(
     # though 400 of another tenant's rows sit between them in the graph.
     assert len(ids) == 12, f"small tenant got {len(ids)} of 12 candidates"
     assert ids == {c.id for c in small_children}
+
+
+def test_forced_ann_path_loses_recall_without_iterative_scan(
+    db_session, org_factory, user_factory, embedder
+):
+    """The actual ANN + filter recall problem, demonstrated.
+
+    The planner only picks HNSW once the tenant filter stops being
+    selective enough for a btree sort to win -- which is exactly what
+    happens as a corpus grows. This test forces that state now, by
+    disabling seqscan and sort so HNSW is the only ordered path available,
+    and measures the difference the setting makes.
+
+    Measured on a real 30k-row corpus, a forced ANN path with
+    iterative_scan=off returned 6 of 60 and 2 of 60 rows for tenants
+    holding 6% and 1% of the table. relaxed_order returned 60 of 60 in
+    both cases.
+
+    Note what this failure is NOT: not a tenant leak. The filter is
+    applied, so no cross-org row is ever returned. It is a silent recall
+    loss -- nothing errors, answers just get worse for the smallest
+    tenants as the table grows.
+    """
+    from sqlalchemy import text
+
+    other_org, target_org = org_factory(), org_factory()
+    other_user, target_user = user_factory(other_org), user_factory(target_org)
+
+    # Target tenant holds roughly 4% of the table -- the band where the
+    # filter decimates an ANN candidate set.
+    _seed(
+        db_session,
+        other_org,
+        other_user,
+        [f"Unrelated operational note {i}." for i in range(1200)],
+        embedder=embedder,
+    )
+    target_texts = [f"Expense clause {i} on receipts." for i in range(50)]
+    _seed(db_session, target_org, target_user, target_texts, embedder=embedder)
+    db_session.execute(text("ANALYZE document_chunks"))
+
+    [probe] = embedder.embed([target_texts[0]])
+    literal = "[" + ",".join(repr(float(v)) for v in probe) + "]"
+    query = text(
+        "SELECT id FROM document_chunks "
+        "WHERE org_id = :org AND parent_id IS NOT NULL AND embedding IS NOT NULL "
+        "ORDER BY embedding <=> CAST(:v AS vector) LIMIT 50"
+    )
+
+    counts = {}
+    for mode in ("off", settings.HNSW_ITERATIVE_SCAN):
+        # Force the ANN path: without seqscan or sort, HNSW is the only way
+        # to satisfy the ORDER BY.
+        db_session.execute(text("SET LOCAL enable_seqscan = off"))
+        db_session.execute(text("SET LOCAL enable_sort = off"))
+        db_session.execute(text(f"SET LOCAL hnsw.ef_search = {settings.HNSW_EF_SEARCH}"))
+        db_session.execute(text(f"SET LOCAL hnsw.iterative_scan = '{mode}'"))
+        db_session.execute(
+            text(f"SET LOCAL hnsw.max_scan_tuples = {settings.HNSW_MAX_SCAN_TUPLES}")
+        )
+        plan = "\n".join(
+            r[0]
+            for r in db_session.execute(
+                text("EXPLAIN " + str(query)), {"org": str(target_org.id), "v": literal}
+            ).all()
+        )
+        assert "embedding_hnsw" in plan, f"ANN path not forced; plan was:\n{plan}"
+        counts[mode] = len(
+            db_session.execute(query, {"org": str(target_org.id), "v": literal}).all()
+        )
+
+    assert counts[settings.HNSW_ITERATIVE_SCAN] == 50, (
+        f"iterative scan should recover the full top-k, got "
+        f"{counts[settings.HNSW_ITERATIVE_SCAN]}"
+    )
+    assert counts["off"] < 50, (
+        "expected recall loss on the forced ANN path with iterative_scan=off; "
+        f"got {counts['off']} of 50 -- if this stops failing, the corpus in "
+        "this test is no longer large enough to demonstrate the problem"
+    )
 
 
 def test_iterative_scan_settings_are_applied_per_transaction(db_session):

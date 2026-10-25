@@ -6,6 +6,7 @@ create_all, which is how a table quietly goes missing from a migration.
 """
 from app.db.base import Base
 from app.models.api_key import ApiKey
+from app.models.conversation import Conversation, Message, MessageRole
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.models.organization import Organization
@@ -14,6 +15,9 @@ from app.models.user import User, UserRole
 __all__ = [
     "Base",
     "ApiKey",
+    "Conversation",
+    "Message",
+    "MessageRole",
     "Organization",
     "User",
     "UserRole",
