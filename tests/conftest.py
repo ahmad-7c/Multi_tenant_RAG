@@ -28,6 +28,7 @@ from app.main import app as fastapi_app
 from app.models.organization import Organization
 from app.models.user import User, UserRole
 from app.services import document_service
+from app.services.storage import get_storage
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -111,8 +112,12 @@ def client(db_session, monkeypatch, tmp_path):
     fastapi_app.dependency_overrides[get_db] = override_get_db
 
     # Uploads land in a per-test tmp dir so the suite never writes into the
-    # repo's uploads/ directory.
-    monkeypatch.setattr(document_service, "UPLOAD_DIR", tmp_path / "uploads")
+    # repo's uploads/ directory. get_storage() is lru_cached, so the cache
+    # must be cleared on both sides of the override or the first test to
+    # touch storage would pin the root for the whole session.
+    monkeypatch.setattr(settings, "STORAGE_BACKEND", "local")
+    monkeypatch.setattr(settings, "STORAGE_LOCAL_ROOT", str(tmp_path / "storage"))
+    get_storage.cache_clear()
 
     # ingest_document.delay() would publish to a real Redis broker. The
     # ingestion task has its own tests; here the enqueue is a no-op so the
@@ -123,6 +128,7 @@ def client(db_session, monkeypatch, tmp_path):
         yield test_client
 
     fastapi_app.dependency_overrides.clear()
+    get_storage.cache_clear()
 
 
 @pytest.fixture()

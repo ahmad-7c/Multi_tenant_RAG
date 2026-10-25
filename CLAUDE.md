@@ -45,19 +45,24 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**Phase 2 PART 1 (models + migration) COMPLETE.** 34 tests green against
-real Postgres + pgvector; migrations verified `downgrade base` -> `head`.
+**Phase 2 PART 2 (storage service) COMPLETE.** 64 tests green against real
+Postgres + pgvector.
 
-Done so far: Phase 1 complete and audited (see "Phase 1 Audit"), plus
-migration 0004 - `documents.file_path` -> `storage_key`,
-`document_chunks.embedding_model`, a GENERATED `content_tsv` column with a
-partial GIN index on children, and HNSW (`vector_cosine_ops`, m=16,
-ef_construction=64, partial on `embedding IS NOT NULL`) replacing ivfflat.
-`organizations.index_version` landed in 0003.
+Done: Phase 1 complete and audited (see "Phase 1 Audit"). PART 1 -
+migration 0004 (`storage_key`, `embedding_model`, GENERATED `content_tsv` +
+partial GIN, HNSW `vector_cosine_ops` replacing ivfflat);
+`organizations.index_version` from 0003. PART 2 - `app/services/storage.py`:
+`save`/`read`/`delete`/`exists` behind one ABC, `LocalDiskStorage` (atomic
+write via `os.replace`, containment check on every key) and `S3Storage`
+(lazy boto3 import, injectable client, private bucket), chosen by
+`STORAGE_BACKEND`. Key = `{org_id}/{document_id}/{sanitized filename}`,
+built only by `build_storage_key()`. The worker now reads bytes through the
+same backend instead of assuming a shared filesystem, and `_extract_pages`
+takes bytes rather than a path.
 
-Next: PART 2 - storage service (local-disk + S3-compatible behind one
-interface, key = `{org_id}/{document_id}/{filename}`), which removes the
-`UPLOAD_DIR` stopgap still present in `document_service` and `ingestion`.
+Next: PART 3 - Celery wiring review + worker service (celery_app already
+has acks_late and prefetch 1; needs the result-backend TTL and a
+docker-compose check).
 
 ## Phase 2 Build Log
 

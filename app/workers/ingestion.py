@@ -12,6 +12,7 @@ from app.db.session import SessionLocal
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.services.chunking import build_child_chunks, build_parent_chunks
+from app.services.storage import get_storage
 from app.workers.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -21,22 +22,26 @@ EMBEDDING_BATCH_SIZE = 20
 MAX_EMBEDDING_RETRIES = 3
 
 
-def _extract_pages(file_path: str) -> list[tuple[int, str]]:
-    """Extract text with 1-indexed page numbers. PDFs go through PyMuPDF
-    page by page as specified; .txt/.md have no real notion of a "page",
-    so they're treated as a single page rather than forcing PyMuPDF to
-    pretend otherwise.
+def _extract_pages(data: bytes, filename: str) -> list[tuple[int, str]]:
+    """Extract text with 1-indexed page numbers.
+
+    Takes bytes, not a path: the file may live in an object store that the
+    worker can only read over HTTP, so there is no path to hand PyMuPDF.
+    PDFs go page by page; .txt/.md have no notion of a page and are
+    treated as a single one rather than faking pagination.
     """
-    suffix = Path(file_path).suffix.lower()
+    suffix = Path(filename or "").suffix.lower()
 
     if suffix == ".pdf":
         pages: list[tuple[int, str]] = []
-        with pymupdf.open(file_path) as pdf:
+        with pymupdf.open(stream=data, filetype="pdf") as pdf:
             for index, page in enumerate(pdf):
                 pages.append((index + 1, page.get_text()))
         return pages
 
-    return [(1, Path(file_path).read_text(encoding="utf-8"))]
+    # errors="replace" rather than strict: a single bad byte in a 200-page
+    # text file should not fail the whole document.
+    return [(1, data.decode("utf-8", errors="replace"))]
 
 
 def _embed_batch(client: OpenAI, texts: list[str]) -> list[list[float]]:
@@ -84,10 +89,12 @@ def ingest_document(self, document_id: str) -> None:
         db.commit()
 
         try:
-            # PART 2 replaces this with storage.read(document.storage_key);
-            # until then the key is resolved against the local upload dir.
-            pages = _extract_pages(str(Path(settings.STORAGE_LOCAL_ROOT) / document.storage_key))
-        except Exception as exc:  # corrupt/unreadable file
+            # The worker resolves the key through the same storage backend
+            # the API wrote it with -- it never assumes a shared filesystem.
+            pages = _extract_pages(
+                get_storage().read(document.storage_key), document.filename
+            )
+        except Exception as exc:  # corrupt/unreadable file, or missing object
             # The problem is the input file itself -- retrying the same
             # bytes won't change the outcome, so fail immediately instead
             # of burning the embedding-call retry budget on it.
