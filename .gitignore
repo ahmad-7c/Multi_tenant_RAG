@@ -1,0 +1,23 @@
+# Secrets — .env.example is committed, .env never is.
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenvs (this repo's dev venv lives in ./venv)
+.venv/
+venv/
+
+# Local DBs / dev artifacts
+*.db
+*.sqlite3
+
+# Local-disk storage backend writes here in dev; the files themselves are
+# never committed, but the directory must exist for the backend to work.
+uploads/*
+!uploads/.gitkeep
