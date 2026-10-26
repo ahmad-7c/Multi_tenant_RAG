@@ -12,6 +12,7 @@ which the citation validator then strips of any provenance it invented.
 import asyncio
 import json
 import logging
+import uuid
 from abc import ABC, abstractmethod
 from functools import lru_cache
 from typing import AsyncIterator
@@ -234,12 +235,41 @@ class GeminiLLM(LLMProvider):
     surface we can actually classify.
     """
 
-    def __init__(self, *, api_key: str, model: str, base_url: str, timeout: float, client=None):
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        base_url: str,
+        timeout: float,
+        total_timeout: float | None = None,
+        max_retries: int | None = None,
+        retry_base_seconds: float | None = None,
+        client=None,
+        sleep=None,
+    ):
         self._api_key = api_key
         self._model = model
         self._base_url = base_url.rstrip("/")
+        # Per-operation stall limit, handed to httpx. Bounds how long ONE
+        # read may wait, not how long the call may take.
         self._timeout = timeout
+        # Total deadline for the whole call. A separate guarantee: a model
+        # emitting one token every two seconds forever never trips a
+        # per-read limit, because every individual read is fast.
+        self._total_timeout = (
+            settings.LLM_TOTAL_TIMEOUT_SECONDS if total_timeout is None else total_timeout
+        )
+        self._max_retries = (
+            settings.LLM_MAX_RETRIES if max_retries is None else max_retries
+        )
+        self._retry_base_seconds = (
+            settings.LLM_RETRY_BASE_SECONDS
+            if retry_base_seconds is None
+            else retry_base_seconds
+        )
         self._client = client
+        self._sleep = sleep or asyncio.sleep
 
     def __repr__(self) -> str:
         # Explicit, so an exception logged with the provider in scope
@@ -290,34 +320,106 @@ class GeminiLLM(LLMProvider):
         max_tokens: int | None = None,
         temperature: float | None = None,
     ) -> AsyncIterator[str]:
+        """Stream the answer, retrying only BEFORE the first token.
+
+        Retrying after a token has been yielded is not an option: those
+        bytes are already on the client's wire and cannot be recalled, so
+        a second attempt would deliver the opening of one answer followed
+        by the whole of another. Once `produced_text` is set, every
+        failure propagates.
+        """
+        # Correlates every log line this one call emits. Generated here
+        # rather than threaded through the interface, so it identifies
+        # the LLM request specifically.
+        request_id = uuid.uuid4().hex[:8]
+        attempt = 0
+
+        while True:
+            produced_text = False
+            try:
+                async for piece in self._stream_once(
+                    system=system,
+                    user=user,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    request_id=request_id,
+                ):
+                    produced_text = True
+                    yield piece
+            except (LLMRateLimitError, LLMTimeoutError) as exc:
+                # Retryable in principle -- but only while nothing has
+                # been sent to the client yet, and only within budget.
+                if produced_text or attempt >= self._max_retries:
+                    raise
+                delay = self._retry_base_seconds * (2**attempt)
+                logger.warning(
+                    "llm call %s failed before first token (%s); "
+                    "retry %s/%s in %.2fs",
+                    request_id,
+                    type(exc).__name__,
+                    attempt + 1,
+                    self._max_retries,
+                    delay,
+                )
+                if delay:
+                    # Short on purpose: this is in the user's request
+                    # path, where a long backoff is indistinguishable
+                    # from a hang.
+                    await self._sleep(delay)
+                attempt += 1
+                continue
+            return
+
+    async def _stream_once(
+        self, *, system: str, user: str, max_tokens, temperature, request_id: str
+    ) -> AsyncIterator[str]:
         payload = self._payload(
             system=system, user=user, max_tokens=max_tokens, temperature=temperature
         )
         url = self._url("streamGenerateContent", sse=True)
 
         produced_text = False
+        # Counted, then logged once at the end. One line per bad frame
+        # would let a provider having a bad minute bury every other log
+        # entry in the file.
+        malformed = 0
         client, close = await self._acquire_client()
         try:
-            try:
-                stream_cm = client.stream("POST", url, json=payload, headers=self._headers)
-            except Exception as exc:
-                raise _classify_http(exc) from exc
+            # The TOTAL deadline, distinct from the per-read limit handed
+            # to httpx above. asyncio.timeout bounds the whole block --
+            # connection setup, every read, and the gaps between them.
+            async with asyncio.timeout(self._total_timeout):
+                try:
+                    stream_cm = client.stream(
+                        "POST", url, json=payload, headers=self._headers
+                    )
+                except Exception as exc:
+                    raise _classify_http(exc) from exc
 
-            async with stream_cm as response:
-                if response.status_code >= 400:
-                    # The body must be drained before the status can be
-                    # raised on a streaming response, or httpx complains
-                    # that the response was never read.
-                    await response.aread()
-                    try:
-                        response.raise_for_status()
-                    except Exception as exc:
-                        raise _classify_http(exc) from exc
+                async with stream_cm as response:
+                    if response.status_code >= 400:
+                        # The body must be drained before the status can
+                        # be raised on a streaming response, or httpx
+                        # complains it was never read.
+                        await response.aread()
+                        try:
+                            response.raise_for_status()
+                        except Exception as exc:
+                            raise _classify_http(exc) from exc
 
-                async for line in response.aiter_lines():
-                    for piece in self._pieces_from_line(line):
-                        produced_text = True
-                        yield piece
+                    async for line in response.aiter_lines():
+                        pieces, bad = self._pieces_from_line(line)
+                        malformed += bad
+                        for piece in pieces:
+                            produced_text = True
+                            yield piece
+        except TimeoutError as exc:
+            # asyncio.timeout raises TimeoutError on expiry. Distinct
+            # message from a per-read stall so the logs can tell which
+            # limit actually fired.
+            raise LLMTimeoutError(
+                f"total deadline of {self._total_timeout}s exceeded"
+            ) from exc
         except LLMError:
             raise
         except asyncio.CancelledError:
@@ -327,6 +429,14 @@ class GeminiLLM(LLMProvider):
         except Exception as exc:
             raise _classify_http(exc) from exc
         finally:
+            if malformed:
+                logger.warning(
+                    "llm call %s: skipped %d unparseable SSE frame(s) from %s",
+                    request_id,
+                    malformed,
+                    self._model,
+                    extra={"request_id": request_id, "malformed_frames": malformed},
+                )
             if close is not None:
                 await close()
 
@@ -338,25 +448,24 @@ class GeminiLLM(LLMProvider):
                 f"{self._model} returned no text (finishReason was not a refusal)"
             )
 
-    def _pieces_from_line(self, line: str) -> list[str]:
-        """Parse one SSE line into zero or more text pieces.
+    def _pieces_from_line(self, line: str) -> tuple[list[str], int]:
+        """Parse one SSE line into (text pieces, malformed-frame count).
 
         Raises LLMSafetyBlockedError if the frame says the model refused.
         """
         line = (line or "").strip()
         if not line or not line.startswith("data:"):
-            return []
+            return [], 0
         data = line[len("data:") :].strip()
         if not data or data == "[DONE]":
-            return []
+            return [], 0
 
         try:
             frame = json.loads(data)
         except ValueError:
             # One malformed frame must not lose the frames around it. A
             # slightly short answer beats an exception over a bad chunk.
-            logger.warning("ignoring an unparseable SSE frame from %s", self._model)
-            return []
+            return [], 1
 
         self._raise_if_refused(frame)
 
@@ -366,7 +475,7 @@ class GeminiLLM(LLMProvider):
             text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
             if text:
                 pieces.append(text)
-        return pieces
+        return pieces, 0
 
     def _raise_if_refused(self, frame: dict) -> None:
         # Two distinct refusal channels. promptFeedback.blockReason means

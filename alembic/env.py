@@ -21,7 +21,14 @@ if not config.get_main_option("sqlalchemy.url", None):
     config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=False is NOT cosmetic. fileConfig defaults
+    # to True, which DISABLES every logger that already exists -- and
+    # when Alembic is driven in-process (the test harness does exactly
+    # this, and so does any "migrate on startup" entrypoint), every
+    # app.* logger has already been created by the imports above. The
+    # result is an application that silently stops logging the moment it
+    # runs a migration, which is the worst possible time to go quiet.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

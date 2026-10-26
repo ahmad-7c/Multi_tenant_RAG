@@ -83,10 +83,22 @@ class Settings(BaseSettings):
     # already-reranked context is not the hardest thing a model does.
     LLM_MODEL: str = "gemini-3.5-flash-lite"
     LLM_MAX_TOKENS: int = 1024
-    # Bounds the whole generation. Generous relative to the reranker's
-    # 3s because this one is producing tokens the user is reading, not
-    # holding up the pipeline before anything is on screen.
-    LLM_TIMEOUT_SECONDS: float = 60.0
+    # PER-OPERATION stall limit, handed to httpx. Bounds how long ONE
+    # read may wait with no bytes arriving. It does NOT bound the call:
+    # a model emitting one token every 25s forever never trips it.
+    LLM_TIMEOUT_SECONDS: float = 30.0
+    # TOTAL deadline for the whole generation, enforced with
+    # asyncio.timeout around the entire stream. The other half of the
+    # guarantee: without it a slow-but-never-stalled stream runs forever
+    # and holds a request handler open with it.
+    LLM_TOTAL_TIMEOUT_SECONDS: float = 120.0
+    # Retries apply ONLY before the first token reaches the client --
+    # after that the bytes are already on the wire and a second attempt
+    # would splice two different answers together. Kept at 1: this runs
+    # inside the user's request, where a long retry chain is
+    # indistinguishable from a hang.
+    LLM_MAX_RETRIES: int = 1
+    LLM_RETRY_BASE_SECONDS: float = 1.0
     # Low, not zero: grounded extraction wants determinism, but exactly 0
     # makes repeated near-identical questions produce brittle phrasing.
     LLM_TEMPERATURE: float = 0.1

@@ -46,7 +46,7 @@ not "# stores the org id"
 
 ## Current Phase
 **PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 3 of 7
-done).** 396 tests green against real Postgres + pgvector, no network.
+done).** 415 tests green against real Postgres + pgvector, no network.
 Migrations verified `downgrade base` -> `head` through 0005.
 
 ### Free-provider migration (Gemini + Cohere)
@@ -124,6 +124,32 @@ before this** -- every provider test injects a fake client, the
   - `LLM_MODEL` / `REWRITE_MODEL` both default to `gemini-3.5-flash-lite`
     (NB: Gemini 2.5 models are access-restricted for new projects; the
     current line is 3.1/3.5/3.8).
+- **STEP 3 follow-ups (directed review).**
+  - **Two timeouts, not one.** `LLM_TIMEOUT_SECONDS` (30s) is the
+    PER-READ stall limit handed to httpx; `LLM_TOTAL_TIMEOUT_SECONDS`
+    (120s) is a real deadline enforced with `asyncio.timeout` around the
+    whole stream. httpx's `timeout=` alone never fires on a model that
+    emits one token every 25s forever -- each read is fast, the call
+    just never ends.
+  - **One retry before the first token** (`LLM_MAX_RETRIES=1`,
+    `LLM_RETRY_BASE_SECONDS=1.0`, exponential). Retryable only while
+    `produced_text` is False: once bytes are on the client's wire a
+    retry would deliver the opening of one answer followed by the whole
+    of another. 400s, safety blocks and empty responses are never
+    retried.
+  - **Malformed SSE frames are counted, not logged per-frame**, and the
+    single summary carries a per-call `request_id` (uuid4[:8]) as both
+    message text and a `logging` extra.
+  - On a mid-stream failure the **safe message** is what lands in the
+    `Message` row (`cited_chunk_ids` NULL) and **nothing is cached** --
+    `should_cache()` refuses twice, on `errored=True` and on the empty
+    citation list.
+- **Bug fixed: Alembic was silencing the application.** `alembic/env.py`
+  called `fileConfig()` without `disable_existing_loggers=False`, whose
+  default is True -- so every already-created `app.*` logger was
+  DISABLED the moment migrations ran in-process. Found because three LLM
+  tests passed alone and failed in the full suite.
+  `tests/test_logging_survives_migrations.py` pins it.
 - STEPS 4-7 pending: Cohere reranker, connection pool, `prepare_query`
   threading test, live smoke test.
 

@@ -993,3 +993,86 @@ async def test_partial_text_before_a_safety_block_is_discarded(db_session, corpu
 
     assert tokens == ["Here is what I foun"]
     assert done[0] == SAFETY_BLOCKED_ANSWER
+
+
+def test_a_mid_stream_failure_persists_the_safe_message_and_caches_nothing(
+    client, db_session, corpus, auth_headers, monkeypatch
+):
+    """What ends up in the Message row, and in the cache, after a failure.
+
+    Persisted: the safe message, with cited_chunk_ids NULL. The row is
+    what the user actually saw, so the conversation stays honest and the
+    next turn's rewriter has the real history.
+
+    Cached: nothing. should_cache() refuses twice over -- once on
+    errored=True, once on the empty citation list -- because caching a
+    provider blip would serve it for the whole TTL to everyone who asks
+    the same question, long after the provider recovered.
+    """
+    from app.services.llm import SAFETY_BLOCKED_ANSWER, LLMSafetyBlockedError
+
+    org, user, _, _ = corpus
+    conversation = _conversation(db_session, org, user)
+    cache = InMemoryAnswerCache()
+
+    class _PartialThenBlocked(FakeLLM):
+        async def stream(self, **kwargs):
+            yield "Receipts must be sub"
+            raise LLMSafetyBlockedError("blocked mid-stream")
+
+    import app.api.v1.routes.conversations as route
+
+    monkeypatch.setattr(route, "get_llm", lambda: _PartialThenBlocked())
+    monkeypatch.setattr(route, "get_reranker", lambda: FakeReranker())
+    monkeypatch.setattr(
+        route, "get_embedding_provider",
+        lambda: FakeEmbeddings(dimensions=settings.EMBEDDING_DIMENSIONS),
+    )
+    monkeypatch.setattr(route, "get_answer_cache", lambda: cache)
+    monkeypatch.setattr(route, "get_rewrite_llm", lambda: FakeLLM(answer="unused"))
+    monkeypatch.setattr(route, "SessionLocal", lambda: db_session)
+    monkeypatch.setattr(db_session, "close", lambda: None)
+
+    with client.stream(
+        "POST",
+        f"/api/v1/conversations/{conversation.id}/messages",
+        json={"content": "receipts submitted within thirty days of travel"},
+        headers=auth_headers(user),
+    ) as response:
+        body = "".join(response.iter_text())
+
+    # The partial token did reach the wire -- it cannot be unsent.
+    assert "Receipts must be sub" in body
+    # ...but the authoritative answer in the final event replaces it.
+    citations_block = [b for b in body.split("\n\n") if "event: citations" in b][0]
+    payload = json.loads(citations_block.split("data: ")[1])
+    assert payload["answer"] == SAFETY_BLOCKED_ANSWER
+    assert payload["citations"] == []
+
+    assistant = (
+        db_session.query(Message)
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.role == MessageRole.ASSISTANT,
+        )
+        .one()
+    )
+    assert assistant.content == SAFETY_BLOCKED_ANSWER
+    assert "Receipts must be sub" not in assistant.content
+    assert assistant.cited_chunk_ids is None
+
+    # The user's own question is still stored: they asked it, and a retry
+    # should not look like it came out of nowhere.
+    user_message = (
+        db_session.query(Message)
+        .filter(
+            Message.conversation_id == conversation.id,
+            Message.role == MessageRole.USER,
+        )
+        .one()
+    )
+    assert user_message.content == "receipts submitted within thirty days of travel"
+
+    # Nothing cached: should_cache() refuses on errored=True and again on
+    # the empty citation list.
+    assert cache._store == {}
