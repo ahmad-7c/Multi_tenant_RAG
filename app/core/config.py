@@ -76,10 +76,17 @@ class Settings(BaseSettings):
     EMBEDDING_DIMENSIONS: int = 1536
 
     ANTHROPIC_API_KEY: Optional[str] = None
-    LLM_PROVIDER: Literal["anthropic", "fake"] = "anthropic"
+    LLM_PROVIDER: Literal["gemini", "anthropic", "fake"] = "gemini"
     # The answering model: quality matters, it sees the retrieved context.
-    LLM_MODEL: str = "claude-sonnet-5"
+    # flash-lite rather than flash because the free tier's request quota
+    # is the binding constraint here, and grounded extraction over
+    # already-reranked context is not the hardest thing a model does.
+    LLM_MODEL: str = "gemini-3.5-flash-lite"
     LLM_MAX_TOKENS: int = 1024
+    # Bounds the whole generation. Generous relative to the reranker's
+    # 3s because this one is producing tokens the user is reading, not
+    # holding up the pipeline before anything is on screen.
+    LLM_TIMEOUT_SECONDS: float = 60.0
     # Low, not zero: grounded extraction wants determinism, but exactly 0
     # makes repeated near-identical questions produce brittle phrasing.
     LLM_TEMPERATURE: float = 0.1
@@ -87,7 +94,7 @@ class Settings(BaseSettings):
     # The query rewriter only reshapes a follow-up into a standalone
     # question -- a small/cheap model is enough, and it runs on every
     # request including cache hits, so it must be cheap.
-    REWRITE_MODEL: str = "claude-haiku-4-5-20251001"
+    REWRITE_MODEL: str = "gemini-3.5-flash-lite"
     REWRITE_MAX_TOKENS: int = 128
     REWRITE_HISTORY_TURNS: int = 4
 

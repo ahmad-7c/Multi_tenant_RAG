@@ -45,8 +45,8 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 2 of 7
-done).** 364 tests green against real Postgres + pgvector, no network.
+**PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 3 of 7
+done).** 396 tests green against real Postgres + pgvector, no network.
 Migrations verified `downgrade base` -> `head` through 0005.
 
 ### Free-provider migration (Gemini + Cohere)
@@ -90,8 +90,42 @@ before this** -- every provider test injects a fake client, the
     it records the condition and only the query endpoint returns 503, so
     uploads/auth/document management stay up. Deliberately **not**
     org-scoped: it is an operator-level deployment check.
-- STEPS 3-7 pending: Gemini LLM, Cohere reranker, connection pool,
-  `prepare_query` threading test, live smoke test.
+- **STEP 3 done - Gemini streaming LLM.** `GeminiLLM` in
+  `app/services/llm.py`, REST over httpx.
+  - Streams `:streamGenerateContent?alt=sse`. **`alt=sse` is load-
+    bearing**: without it Gemini buffers one JSON array and "streaming"
+    delivers nothing until the answer is finished.
+  - Still **no `tools` key** -- absent, not empty, and a test strips
+    comments from the source before asserting the word never appears.
+    System prompt rides `systemInstruction`, not a prepended user turn,
+    so grounding rules and retrieved context never share a channel.
+  - Error hierarchy: `LLMRateLimitError` (429/503/529), `LLMTimeoutError`
+    (408 + connect/timeout/network/protocol), `LLMSafetyBlockedError`,
+    `LLMEmptyResponseError`, `LLMUpstreamError`. `safe_answer_for()` maps
+    each onto its own user-facing sentence -- "something went wrong" is
+    true of all of them and useful for none, since a rate limit resolves
+    by waiting, a safety block never does, and an empty response usually
+    resolves by rephrasing.
+  - **Two distinct refusal channels**: `promptFeedback.blockReason` (the
+    INPUT was rejected, no candidate ever produced) and
+    `finishReason` in {SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT,
+    SPII, IMAGE_SAFETY} (generation started, then cut off). `MAX_TOKENS`
+    is deliberately NOT a refusal -- truncated text is still readable.
+  - **Empty stream raises** rather than returning "". That is the hung-
+    stream failure mode: zero tokens and a clean finish leaves the user
+    watching a blank bubble forever.
+  - `generate_answer` **discards partial text** on any failure. Half a
+    refused answer reads exactly like a whole one; the route's final
+    `citations` event is authoritative and supersedes what was printed.
+    No citations are attached either -- provenance for text that was
+    never generated is fabricated.
+  - A malformed SSE frame is logged and skipped, not fatal: a slightly
+    short answer beats an exception over one bad chunk.
+  - `LLM_MODEL` / `REWRITE_MODEL` both default to `gemini-3.5-flash-lite`
+    (NB: Gemini 2.5 models are access-restricted for new projects; the
+    current line is 3.1/3.5/3.8).
+- STEPS 4-7 pending: Cohere reranker, connection pool, `prepare_query`
+  threading test, live smoke test.
 
 Phase 3 modules:
 - `retrieval.py` - one org-scoped path: HNSW cosine + Postgres FTS on

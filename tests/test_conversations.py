@@ -847,3 +847,149 @@ async def test_the_question_is_embedded_as_a_query_not_as_a_document(db_session,
     )
 
     assert embedder.tasks == [EmbeddingTask.QUERY]
+
+
+# ------------------------------------------- provider failures -> safe text --
+#
+# The contract: a provider failure becomes a readable sentence in the
+# authoritative `citations` event, never a 500 and never a stream that
+# stops mid-word with no explanation. The route's final event carries the
+# answer precisely so a partial stream can be superseded.
+
+
+async def _answer_with_llm_error(db_session, corpus, error):
+    org, user, _document, _parents = corpus
+    conversation = _conversation(db_session, org, user)
+    prepared = await _prepare(
+        db_session, org, user, conversation, "Receipts submitted within thirty days?"
+    )
+
+    collected = []
+    done = None
+    async for kind, value in query_service.generate_answer(
+        prepared, llm=FakeLLM(error=error)
+    ):
+        if kind == "token":
+            collected.append(value)
+        else:
+            done = value
+    return collected, done
+
+
+async def test_a_safety_block_becomes_a_safe_answer(db_session, corpus):
+    from app.services.llm import SAFETY_BLOCKED_ANSWER, LLMSafetyBlockedError
+
+    _tokens, (answer, citations, errored) = await _answer_with_llm_error(
+        db_session, corpus, LLMSafetyBlockedError("blocked: SAFETY")
+    )
+
+    assert answer == SAFETY_BLOCKED_ANSWER
+    assert errored is True
+    # No citations on an answer that was never generated: citing sources
+    # for text the model refused to write would be fabricated provenance.
+    assert citations == []
+
+
+async def test_an_empty_response_becomes_a_safe_answer(db_session, corpus):
+    from app.services.llm import EMPTY_RESPONSE_ANSWER, LLMEmptyResponseError
+
+    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+        db_session, corpus, LLMEmptyResponseError("no candidates")
+    )
+
+    assert answer == EMPTY_RESPONSE_ANSWER
+    assert errored is True
+
+
+async def test_a_rate_limit_becomes_a_retryable_safe_answer(db_session, corpus):
+    from app.services.llm import RATE_LIMITED_ANSWER, LLMRateLimitError
+
+    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+        db_session, corpus, LLMRateLimitError("429")
+    )
+
+    # Distinct from the safety message on purpose: this one resolves on
+    # its own, and telling the user to try again is accurate advice.
+    assert answer == RATE_LIMITED_ANSWER
+    assert errored is True
+
+
+async def test_a_timeout_becomes_a_safe_answer(db_session, corpus):
+    from app.services.llm import LLMTimeoutError, TIMEOUT_ANSWER
+
+    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+        db_session, corpus, LLMTimeoutError("read timeout")
+    )
+
+    assert answer == TIMEOUT_ANSWER
+    assert errored is True
+
+
+async def test_a_safe_message_is_never_cached(db_session, corpus):
+    from app.services.cache import InMemoryAnswerCache
+    from app.services.llm import SAFETY_BLOCKED_ANSWER, LLMSafetyBlockedError
+
+    org, user, _document, _parents = corpus
+    conversation = _conversation(db_session, org, user)
+    cache = InMemoryAnswerCache()
+    prepared = await _prepare(
+        db_session,
+        org,
+        user,
+        conversation,
+        "Receipts submitted within thirty days?",
+        cache=cache
+    )
+
+    async for _kind, _value in query_service.generate_answer(
+        prepared, llm=FakeLLM(error=LLMSafetyBlockedError("blocked"))
+    ):
+        pass
+
+    await query_service.maybe_cache_answer(
+        prepared,
+        answer=SAFETY_BLOCKED_ANSWER,
+        citations=[],
+        cache=cache,
+        model="gemini-3.5-flash-lite",
+        errored=True,
+    )
+
+    # Caching an error would serve it for CACHE_TTL_SECONDS to everyone
+    # who asks the same question, long after the provider recovered.
+    assert await cache.get(prepared.cache_key) is None
+
+
+async def test_partial_text_before_a_safety_block_is_discarded(db_session, corpus):
+    """Half a refused answer must not be presented as the answer.
+
+    The model stopped because it would not finish the sentence. The
+    tokens already streamed cannot be recalled, but the authoritative
+    `answer` in the final event replaces them -- which is exactly why the
+    route sends that event rather than trusting what it already printed.
+    """
+    from app.services.llm import SAFETY_BLOCKED_ANSWER, LLMSafetyBlockedError
+
+    class _PartialThenBlocked(FakeLLM):
+        async def stream(self, **kwargs):
+            yield "Here is what I foun"
+            raise LLMSafetyBlockedError("blocked mid-stream")
+
+    org, user, _document, _parents = corpus
+    conversation = _conversation(db_session, org, user)
+    prepared = await _prepare(
+        db_session, org, user, conversation, "Receipts submitted within thirty days?"
+    )
+
+    tokens = []
+    done = None
+    async for kind, value in query_service.generate_answer(
+        prepared, llm=_PartialThenBlocked()
+    ):
+        if kind == "token":
+            tokens.append(value)
+        else:
+            done = value
+
+    assert tokens == ["Here is what I foun"]
+    assert done[0] == SAFETY_BLOCKED_ANSWER

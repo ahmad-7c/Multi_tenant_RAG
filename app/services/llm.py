@@ -10,6 +10,7 @@ injection can achieve is a wrong answer in the tenant's own session --
 which the citation validator then strips of any provenance it invented.
 """
 import asyncio
+import json
 import logging
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -21,7 +22,69 @@ logger = logging.getLogger(__name__)
 
 
 class LLMError(Exception):
-    pass
+    """Base for every provider failure the caller is expected to handle.
+
+    The point of the hierarchy below is that `generate_answer` can turn a
+    failure into a SPECIFIC sentence. "Something went wrong" is true of
+    all of them and useful for none: a rate limit resolves by waiting, a
+    safety block never resolves by waiting, and an empty response usually
+    resolves by rephrasing. Collapsing them tells the user to do the
+    wrong thing two times out of three.
+    """
+
+
+class LLMRateLimitError(LLMError):
+    """429, or a 503 that means the same thing on a free tier."""
+
+
+class LLMTimeoutError(LLMError):
+    """The request never reached a decision: timeout, DNS, reset."""
+
+
+class LLMSafetyBlockedError(LLMError):
+    """The provider refused -- before generating, or part-way through."""
+
+
+class LLMEmptyResponseError(LLMError):
+    """The call succeeded and produced no text at all."""
+
+
+class LLMUpstreamError(LLMError):
+    """Any other provider-side failure."""
+
+
+# User-facing text for each failure. Deliberately plain: they appear in
+# the answer bubble, so they must read as sentences rather than as
+# incident reports, and they must never name a model, a provider or a
+# status code -- that is operator detail and belongs in the log.
+SAFETY_BLOCKED_ANSWER = (
+    "I can't answer that question. The request was blocked by the content "
+    "safety filter."
+)
+EMPTY_RESPONSE_ANSWER = (
+    "I wasn't able to produce an answer for that. Please try rephrasing "
+    "the question."
+)
+RATE_LIMITED_ANSWER = (
+    "The answering service is busy right now. Please try again in a moment."
+)
+TIMEOUT_ANSWER = (
+    "The answering service took too long to respond. Please try again."
+)
+GENERIC_ERROR_ANSWER = "Something went wrong generating an answer. Please try again."
+
+
+def safe_answer_for(exc: BaseException) -> str:
+    """Map a provider failure onto the sentence the user should read."""
+    if isinstance(exc, LLMSafetyBlockedError):
+        return SAFETY_BLOCKED_ANSWER
+    if isinstance(exc, LLMEmptyResponseError):
+        return EMPTY_RESPONSE_ANSWER
+    if isinstance(exc, LLMRateLimitError):
+        return RATE_LIMITED_ANSWER
+    if isinstance(exc, LLMTimeoutError):
+        return TIMEOUT_ANSWER
+    return GENERIC_ERROR_ANSWER
 
 
 class LLMProvider(ABC):
@@ -119,6 +182,257 @@ class AnthropicLLM(LLMProvider):
         )
 
 
+# A finishReason in this set means the model stopped because it would not
+# continue, not because it was done. The partial text is NOT an answer:
+# half a refused sentence reads exactly like a complete one.
+_REFUSAL_FINISH_REASONS = {
+    "SAFETY",
+    "RECITATION",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+    "IMAGE_SAFETY",
+}
+# Statuses that mean "try later" rather than "this request is wrong".
+_RATE_LIMIT_STATUS = {429, 503, 529}
+
+
+def _classify_http(exc: BaseException) -> LLMError:
+    """Map a transport/HTTP exception onto the domain hierarchy.
+
+    Reads the status code where one exists rather than matching exception
+    class names, because every client library names them differently.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        if status in _RATE_LIMIT_STATUS:
+            return LLMRateLimitError(f"provider rate limited ({status})")
+        if status == 408:
+            return LLMTimeoutError("provider timed out (408)")
+        return LLMUpstreamError(f"provider error {status}")
+
+    # No status: the request never reached a decision. Same "connect"
+    # rather than "connection" trap as in embedding.classify_error --
+    # httpx.ConnectError lowercases to "connecterror".
+    name = type(exc).__name__.lower()
+    if any(hint in name for hint in ("timeout", "connect", "network", "protocol")):
+        return LLMTimeoutError(f"provider unreachable: {type(exc).__name__}")
+    return LLMUpstreamError(f"provider call failed: {type(exc).__name__}")
+
+
+class GeminiLLM(LLMProvider):
+    """Google Gemini over the REST API.
+
+    Streams via `:streamGenerateContent?alt=sse`. The `alt=sse` matters:
+    without it Gemini returns one buffered JSON array and "streaming"
+    delivers nothing until the answer is finished, which defeats the
+    entire reason for streaming here.
+
+    Like the embedding provider, this talks REST through httpx rather
+    than the google-genai SDK -- one less dependency, and an exception
+    surface we can actually classify.
+    """
+
+    def __init__(self, *, api_key: str, model: str, base_url: str, timeout: float, client=None):
+        self._api_key = api_key
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._client = client
+
+    def __repr__(self) -> str:
+        # Explicit, so an exception logged with the provider in scope
+        # cannot print the key.
+        return f"GeminiLLM(model={self._model!r})"
+
+    __str__ = __repr__
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def _url(self, method: str, *, sse: bool = False) -> str:
+        suffix = "?alt=sse" if sse else ""
+        return f"{self._base_url}/models/{self._model}:{method}{suffix}"
+
+    def _payload(self, *, system: str, user: str, max_tokens, temperature) -> dict:
+        # No "tools" key, and no "toolConfig". Not an empty list -- absent.
+        # Retrieved text is attacker-controlled, so rather than trying to
+        # win an argument with it about what the rules are, the model is
+        # given nothing it could be talked into using.
+        return {
+            # systemInstruction, not a prepended user turn: the grounding
+            # rules travel on a different channel from the retrieved
+            # context, so injected text inside a document cannot present
+            # itself as an instruction.
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens or settings.LLM_MAX_TOKENS,
+                "temperature": (
+                    settings.LLM_TEMPERATURE if temperature is None else temperature
+                ),
+            },
+        }
+
+    @property
+    def _headers(self) -> dict:
+        # Header auth, never ?key= -- a query parameter lands in proxy
+        # logs, access logs and any exception that records a URL.
+        return {"x-goog-api-key": self._api_key}
+
+    async def stream(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> AsyncIterator[str]:
+        payload = self._payload(
+            system=system, user=user, max_tokens=max_tokens, temperature=temperature
+        )
+        url = self._url("streamGenerateContent", sse=True)
+
+        produced_text = False
+        client, close = await self._acquire_client()
+        try:
+            try:
+                stream_cm = client.stream("POST", url, json=payload, headers=self._headers)
+            except Exception as exc:
+                raise _classify_http(exc) from exc
+
+            async with stream_cm as response:
+                if response.status_code >= 400:
+                    # The body must be drained before the status can be
+                    # raised on a streaming response, or httpx complains
+                    # that the response was never read.
+                    await response.aread()
+                    try:
+                        response.raise_for_status()
+                    except Exception as exc:
+                        raise _classify_http(exc) from exc
+
+                async for line in response.aiter_lines():
+                    for piece in self._pieces_from_line(line):
+                        produced_text = True
+                        yield piece
+        except LLMError:
+            raise
+        except asyncio.CancelledError:
+            # The client disconnected. Propagated so the HTTP request to
+            # Gemini is actually aborted rather than left running.
+            raise
+        except Exception as exc:
+            raise _classify_http(exc) from exc
+        finally:
+            if close is not None:
+                await close()
+
+        if not produced_text:
+            # A clean finish with zero tokens. Without this the caller
+            # yields an empty answer and the user watches a blank bubble
+            # that never resolves -- the "hung stream" failure mode.
+            raise LLMEmptyResponseError(
+                f"{self._model} returned no text (finishReason was not a refusal)"
+            )
+
+    def _pieces_from_line(self, line: str) -> list[str]:
+        """Parse one SSE line into zero or more text pieces.
+
+        Raises LLMSafetyBlockedError if the frame says the model refused.
+        """
+        line = (line or "").strip()
+        if not line or not line.startswith("data:"):
+            return []
+        data = line[len("data:") :].strip()
+        if not data or data == "[DONE]":
+            return []
+
+        try:
+            frame = json.loads(data)
+        except ValueError:
+            # One malformed frame must not lose the frames around it. A
+            # slightly short answer beats an exception over a bad chunk.
+            logger.warning("ignoring an unparseable SSE frame from %s", self._model)
+            return []
+
+        self._raise_if_refused(frame)
+
+        pieces = []
+        for candidate in frame.get("candidates") or []:
+            parts = (candidate.get("content") or {}).get("parts") or []
+            text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            if text:
+                pieces.append(text)
+        return pieces
+
+    def _raise_if_refused(self, frame: dict) -> None:
+        # Two distinct refusal channels. promptFeedback.blockReason means
+        # the INPUT was rejected and no candidate was ever produced;
+        # finishReason means generation started and was cut off.
+        block_reason = (frame.get("promptFeedback") or {}).get("blockReason")
+        if block_reason:
+            raise LLMSafetyBlockedError(f"prompt blocked: {block_reason}")
+
+        for candidate in frame.get("candidates") or []:
+            finish = candidate.get("finishReason")
+            if finish in _REFUSAL_FINISH_REASONS:
+                raise LLMSafetyBlockedError(f"generation stopped: {finish}")
+            # MAX_TOKENS is deliberately NOT a refusal: the text produced
+            # so far is real and readable, just incomplete.
+
+    async def complete(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+    ) -> str:
+        payload = self._payload(
+            system=system, user=user, max_tokens=max_tokens, temperature=temperature
+        )
+        url = self._url("generateContent")
+
+        client, close = await self._acquire_client()
+        try:
+            response = await client.post(url, json=payload, headers=self._headers)
+            response.raise_for_status()
+            body = response.json()
+        except Exception as exc:
+            raise _classify_http(exc) from exc
+        finally:
+            if close is not None:
+                await close()
+
+        self._raise_if_refused(body)
+
+        text = ""
+        for candidate in body.get("candidates") or []:
+            parts = (candidate.get("content") or {}).get("parts") or []
+            text += "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+
+        if not text:
+            raise LLMEmptyResponseError(f"{self._model} returned no text")
+        return text
+
+    async def _acquire_client(self):
+        """Return (client, close_or_None).
+
+        An injected client belongs to the caller and must not be closed
+        here; one we create must be.
+        """
+        if self._client is not None:
+            return self._client, None
+
+        import httpx
+
+        client = httpx.AsyncClient(timeout=self._timeout)
+        return client, client.aclose
+
+
 class FakeLLM(LLMProvider):
     """Deterministic provider for tests.
 
@@ -198,10 +512,24 @@ class FakeLLM(LLMProvider):
         return self._answer
 
 
+def _gemini(model: str) -> "GeminiLLM":
+    if not settings.GEMINI_API_KEY:
+        # Loud at startup rather than as a 500 on the first question.
+        raise RuntimeError("LLM_PROVIDER=gemini requires GEMINI_API_KEY")
+    return GeminiLLM(
+        api_key=settings.GEMINI_API_KEY,
+        model=model,
+        base_url=settings.GEMINI_BASE_URL,
+        timeout=settings.LLM_TIMEOUT_SECONDS,
+    )
+
+
 @lru_cache(maxsize=1)
 def get_llm() -> LLMProvider:
     if settings.LLM_PROVIDER == "fake":
         return FakeLLM()
+    if settings.LLM_PROVIDER == "gemini":
+        return _gemini(settings.LLM_MODEL)
     if not settings.ANTHROPIC_API_KEY:
         raise RuntimeError("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
     return AnthropicLLM(api_key=settings.ANTHROPIC_API_KEY, model=settings.LLM_MODEL)
@@ -217,6 +545,8 @@ def get_rewrite_llm() -> LLMProvider:
     """
     if settings.LLM_PROVIDER == "fake":
         return FakeLLM(answer="rewritten question")
+    if settings.LLM_PROVIDER == "gemini":
+        return _gemini(settings.REWRITE_MODEL)
     if not settings.ANTHROPIC_API_KEY:
         raise RuntimeError("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
     return AnthropicLLM(api_key=settings.ANTHROPIC_API_KEY, model=settings.REWRITE_MODEL)

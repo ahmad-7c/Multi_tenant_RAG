@@ -63,7 +63,7 @@ from app.services.cache import (
 )
 from app.services.citations import Citation, validate_citations
 from app.services.embedding import EmbeddingProvider, EmbeddingTask
-from app.services.llm import LLMProvider
+from app.services.llm import LLMProvider, safe_answer_for
 from app.services.prompting import INSUFFICIENT_CONTEXT_ANSWER, BuiltPrompt, build_prompt
 from app.services.query_rewrite import rewrite_question
 from app.services.reranker import (
@@ -217,7 +217,7 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
 
     assert prepared.prompt is not None
     pieces: list[str] = []
-    errored = False
+    failure: BaseException | None = None
     try:
         async for piece in llm.stream(
             system=prepared.prompt.system,
@@ -234,25 +234,34 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
         # for tokens nobody will read.
         logger.info("answer stream cancelled; aborting the upstream LLM call")
         raise
-    except Exception:
+    except Exception as exc:
+        # Logged with the exception, answered without it: the user gets a
+        # sentence, the operator gets the stack trace and the status code.
         logger.warning("LLM stream failed", exc_info=True)
-        errored = True
+        failure = exc
+
+    if failure is not None:
+        # Any partial text is DISCARDED, even though it was already
+        # streamed. The model stopped because it would not continue, and
+        # half a refused answer reads exactly like a whole one. The route
+        # sends the authoritative answer in its final `citations` event
+        # precisely so what was already printed can be superseded.
+        #
+        # No citations either: citing sources for text that was never
+        # generated would be fabricated provenance.
+        yield "done", (safe_answer_for(failure), [], True)
+        return
 
     raw_answer = "".join(pieces)
-    if errored and not raw_answer:
-        yield "done", (
-            "Something went wrong generating an answer. Please try again.",
-            [],
-            True,
-        )
-        return
 
     # Validation runs after streaming on pure text, which is why
     # citations.py needs no database and can run with the session closed.
     answer, citations = validate_citations(raw_answer, prepared.prompt.blocks)
     if not answer.strip():
         answer = INSUFFICIENT_CONTEXT_ANSWER
-    yield "done", (answer, citations, errored)
+    # errored=False: reaching here means the stream completed. Every
+    # failure path returned above with its own specific message.
+    yield "done", (answer, citations, False)
 
 
 async def maybe_cache_answer(
