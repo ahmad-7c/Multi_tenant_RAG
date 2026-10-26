@@ -10,7 +10,7 @@ import uuid
 import pytest
 
 from app.core.config import settings
-from app.models.conversation import Conversation, Message, MessageRole
+from app.models.conversation import Conversation, Message, MessageKind, MessageRole
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.models.organization import Organization
@@ -292,8 +292,9 @@ async def test_gate_closes_for_an_irrelevant_question(db_session, corpus, monkey
     assert prepared.gated is True
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
     assert llm.calls == []
-    answer, citations, errored = events[-1][1]
-    assert citations == []
+    outcome = events[-1][1]
+    answer, citations, errored = outcome.answer, outcome.citations, outcome.errored
+    assert outcome.citations == []
     assert errored is False
 
 
@@ -306,7 +307,8 @@ async def test_invalid_citation_markers_are_dropped(db_session, corpus):
     # The model cites a block that was never supplied.
     llm = FakeLLM(answer="Thirty days [1] and also [99].")
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
-    answer, citations, _ = events[-1][1]
+    outcome = events[-1][1]
+    answer, citations = outcome.answer, outcome.citations
 
     assert "[99]" not in answer
     assert all(c.marker != 99 for c in citations)
@@ -319,7 +321,7 @@ async def test_citations_resolve_to_real_documents(db_session, corpus):
 
     llm = FakeLLM(answer="Thirty days [1].")
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
-    _, citations, _ = events[-1][1]
+    citations = events[-1][1].citations
 
     assert citations
     assert citations[0].document == "expenses.pdf"
@@ -601,7 +603,8 @@ async def test_successful_answer_is_written_to_the_cache(db_session, corpus):
     )
     llm = FakeLLM(answer="Thirty days [1].")
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
-    answer, citations, errored = events[-1][1]
+    outcome = events[-1][1]
+    answer, citations, errored = outcome.answer, outcome.citations, outcome.errored
 
     await query_service.maybe_cache_answer(
         prepared, answer=answer, citations=citations, cache=cache, model="m", errored=errored
@@ -660,9 +663,10 @@ async def test_llm_error_mid_stream_still_ends_with_done(db_session, corpus):
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
 
     assert events[-1][0] == "done"
-    _, citations, errored = events[-1][1]
+    outcome = events[-1][1]
+    citations, errored = outcome.citations, outcome.errored
     assert errored is True
-    assert citations == []
+    assert outcome.citations == []
 
 
 def test_sse_endpoint_emits_token_then_citations_then_done(
@@ -879,50 +883,57 @@ async def _answer_with_llm_error(db_session, corpus, error):
 async def test_a_safety_block_becomes_a_safe_answer(db_session, corpus):
     from app.services.llm import SAFETY_BLOCKED_ANSWER, LLMSafetyBlockedError
 
-    _tokens, (answer, citations, errored) = await _answer_with_llm_error(
+    _tokens, outcome = await _answer_with_llm_error(
         db_session, corpus, LLMSafetyBlockedError("blocked: SAFETY")
     )
 
-    assert answer == SAFETY_BLOCKED_ANSWER
-    assert errored is True
+    assert outcome.answer == SAFETY_BLOCKED_ANSWER
+    assert outcome.errored is True
+    # A safety block is the model declining on content grounds.
+    assert outcome.kind is MessageKind.REFUSAL
     # No citations on an answer that was never generated: citing sources
     # for text the model refused to write would be fabricated provenance.
-    assert citations == []
+    assert outcome.citations == []
 
 
 async def test_an_empty_response_becomes_a_safe_answer(db_session, corpus):
     from app.services.llm import EMPTY_RESPONSE_ANSWER, LLMEmptyResponseError
 
-    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+    _tokens, outcome = await _answer_with_llm_error(
         db_session, corpus, LLMEmptyResponseError("no candidates")
     )
 
-    assert answer == EMPTY_RESPONSE_ANSWER
-    assert errored is True
+    assert outcome.answer == EMPTY_RESPONSE_ANSWER
+    assert outcome.errored is True
+    # Infrastructure, not content: an operator reading the table needs
+    # to tell "we refuse 20% of questions" from "the provider drops 20%".
+    assert outcome.kind is MessageKind.ERROR
 
 
 async def test_a_rate_limit_becomes_a_retryable_safe_answer(db_session, corpus):
     from app.services.llm import RATE_LIMITED_ANSWER, LLMRateLimitError
 
-    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+    _tokens, outcome = await _answer_with_llm_error(
         db_session, corpus, LLMRateLimitError("429")
     )
 
     # Distinct from the safety message on purpose: this one resolves on
     # its own, and telling the user to try again is accurate advice.
-    assert answer == RATE_LIMITED_ANSWER
-    assert errored is True
+    assert outcome.answer == RATE_LIMITED_ANSWER
+    assert outcome.errored is True
+    assert outcome.kind is MessageKind.ERROR
 
 
 async def test_a_timeout_becomes_a_safe_answer(db_session, corpus):
     from app.services.llm import LLMTimeoutError, TIMEOUT_ANSWER
 
-    _tokens, (answer, _citations, errored) = await _answer_with_llm_error(
+    _tokens, outcome = await _answer_with_llm_error(
         db_session, corpus, LLMTimeoutError("read timeout")
     )
 
-    assert answer == TIMEOUT_ANSWER
-    assert errored is True
+    assert outcome.answer == TIMEOUT_ANSWER
+    assert outcome.errored is True
+    assert outcome.kind is MessageKind.ERROR
 
 
 async def test_a_safe_message_is_never_cached(db_session, corpus):
@@ -992,7 +1003,7 @@ async def test_partial_text_before_a_safety_block_is_discarded(db_session, corpu
             done = value
 
     assert tokens == ["Here is what I foun"]
-    assert done[0] == SAFETY_BLOCKED_ANSWER
+    assert done.answer == SAFETY_BLOCKED_ANSWER
 
 
 def test_a_mid_stream_failure_persists_the_safe_message_and_caches_nothing(

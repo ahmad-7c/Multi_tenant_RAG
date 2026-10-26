@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
+from app.models.conversation import MessageKind
 from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.conversation import (
@@ -194,9 +195,9 @@ async def create_message(
     cache = get_answer_cache()
 
     async def event_stream():
-        answer = ""
-        citations: list = []
-        errored = False
+        outcome = query_service.AnswerOutcome(
+            answer="", citations=[], errored=False, kind=MessageKind.ANSWER
+        )
         try:
             # A cache hit is emitted as a single token event, deliberately:
             # the client parses one format whether the answer took three
@@ -205,7 +206,7 @@ async def create_message(
                 if kind == "token":
                     yield _sse("token", {"text": value})
                 else:
-                    answer, citations, errored = value
+                    outcome = value
         except asyncio.CancelledError:
             # The client went away. Nothing is persisted and nothing is
             # cached: a half-streamed answer is not an answer, and the
@@ -221,8 +222,8 @@ async def create_message(
         yield _sse(
             "citations",
             {
-                "answer": answer,
-                "citations": [_citation_payload(c) for c in citations],
+                "answer": outcome.answer,
+                "citations": [_citation_payload(c) for c in outcome.citations],
                 "cached": prepared.cache_hit,
                 "gated": prepared.gated,
                 "rewritten_question": (
@@ -234,11 +235,11 @@ async def create_message(
 
         await query_service.maybe_cache_answer(
             prepared,
-            answer=answer,
-            citations=citations,
+            answer=outcome.answer,
+            citations=outcome.citations,
             cache=cache,
             model=llm.model,
-            errored=errored,
+            errored=outcome.errored,
         )
 
         # ---- phase 3: a new, short session ---------------------------
@@ -246,7 +247,11 @@ async def create_message(
             session = SessionLocal()
             try:
                 query_service.persist_turn(
-                    session, prepared=prepared, answer=answer, citations=citations
+                    session,
+                    prepared=prepared,
+                    answer=outcome.answer,
+                    citations=outcome.citations,
+                    kind=outcome.kind,
                 )
             finally:
                 session.close()

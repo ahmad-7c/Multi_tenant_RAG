@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     # indistinguishable from a hang.
     LLM_MAX_RETRIES: int = 1
     LLM_RETRY_BASE_SECONDS: float = 1.0
+    # A 429 often carries Retry-After, which is the provider stating
+    # exactly how long to wait -- better information than our guess, so
+    # it wins when it is short. A LONG Retry-After is a different
+    # message ("not soon"); honouring 90s inside a request handler is a
+    # hang with extra steps, so past this we surface the rate-limit
+    # sentence immediately and free the handler.
+    LLM_RETRY_AFTER_MAX_SECONDS: float = 5.0
     # Low, not zero: grounded extraction wants determinism, but exactly 0
     # makes repeated near-identical questions produce brittle phrasing.
     LLM_TEMPERATURE: float = 0.1

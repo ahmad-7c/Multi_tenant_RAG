@@ -63,7 +63,12 @@ from app.services.cache import (
 )
 from app.services.citations import Citation, validate_citations
 from app.services.embedding import EmbeddingProvider, EmbeddingTask
-from app.services.llm import LLMProvider, safe_answer_for
+from app.models.conversation import MessageKind
+from app.services.llm import (
+    LLMProvider,
+    LLMSafetyBlockedError,
+    safe_answer_for,
+)
 from app.services.prompting import INSUFFICIENT_CONTEXT_ANSWER, BuiltPrompt, build_prompt
 from app.services.query_rewrite import rewrite_question
 from app.services.reranker import (
@@ -199,8 +204,25 @@ async def prepare_query(
     return prepared
 
 
+@dataclass(frozen=True)
+class AnswerOutcome:
+    """What phase 2 produced.
+
+    A dataclass rather than a tuple because this has now grown twice;
+    positional unpacking at every call site makes each addition a
+    silent-breakage risk.
+    """
+
+    answer: str
+    citations: list[Citation]
+    errored: bool
+    # What to record on the assistant Message row. Drives whether the
+    # turn is visible to the query rewriter later.
+    kind: MessageKind
+
+
 async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
-    """Phase 2. Yields ("token", str) then ("done", (answer, citations, errored)).
+    """Phase 2. Yields ("token", str) then ("done", AnswerOutcome).
 
     No database session is open while this runs.
     """
@@ -208,10 +230,15 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
         # A cache hit or a gated refusal. Emitted as a single token event
         # so the client parses one format either way.
         yield "token", prepared.short_circuit_answer
-        yield "done", (
-            prepared.short_circuit_answer,
-            prepared.short_circuit_citations,
-            False,
+        yield "done", AnswerOutcome(
+            answer=prepared.short_circuit_answer,
+            citations=prepared.short_circuit_citations,
+            errored=False,
+            # A gated "not found" is a REFUSAL, not an answer: the gate
+            # declined on content grounds. Feeding "I could not find
+            # anything..." to the rewriter makes the next question
+            # retrieve against the phrasing of a non-answer.
+            kind=MessageKind.REFUSAL if prepared.gated else MessageKind.ANSWER,
         )
         return
 
@@ -249,7 +276,22 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
         #
         # No citations either: citing sources for text that was never
         # generated would be fabricated provenance.
-        yield "done", (safe_answer_for(failure), [], True)
+        yield "done", AnswerOutcome(
+            answer=safe_answer_for(failure),
+            citations=[],
+            errored=True,
+            # A safety block is the model declining on CONTENT grounds,
+            # which is a refusal; a rate limit or timeout is
+            # infrastructure, which is an error. Both are hidden from
+            # the rewriter -- the split is for the operator reading the
+            # table, where "we refuse 20% of questions" and "the
+            # provider drops 20% of calls" need very different fixes.
+            kind=(
+                MessageKind.REFUSAL
+                if isinstance(failure, LLMSafetyBlockedError)
+                else MessageKind.ERROR
+            ),
+        )
         return
 
     raw_answer = "".join(pieces)
@@ -261,7 +303,15 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
         answer = INSUFFICIENT_CONTEXT_ANSWER
     # errored=False: reaching here means the stream completed. Every
     # failure path returned above with its own specific message.
-    yield "done", (answer, citations, False)
+    yield "done", AnswerOutcome(
+        answer=answer,
+        citations=citations,
+        errored=False,
+        # An answer the citation validator emptied is not an answer: the
+        # model cited nothing the server built, so INSUFFICIENT_CONTEXT
+        # is what the user reads and a refusal is what it is.
+        kind=MessageKind.ANSWER if citations else MessageKind.REFUSAL,
+    )
 
 
 async def maybe_cache_answer(
@@ -299,7 +349,14 @@ async def maybe_cache_answer(
     )
 
 
-def persist_turn(db, *, prepared: PreparedQuery, answer: str, citations: list[Citation]) -> None:
+def persist_turn(
+    db,
+    *,
+    prepared: PreparedQuery,
+    answer: str,
+    citations: list[Citation],
+    kind: MessageKind = MessageKind.ANSWER,
+) -> None:
     """Phase 3. Called with a fresh session, only once streaming is done."""
     from app.models.conversation import Message, MessageRole
 
@@ -321,6 +378,9 @@ def persist_turn(db, *, prepared: PreparedQuery, answer: str, citations: list[Ci
             org_id=prepared.org_id,
             role=MessageRole.ASSISTANT,
             content=answer,
+            # Refusals and errors are stored (the user saw them) but
+            # carry a kind that keeps them out of the rewrite window.
+            kind=kind,
             cited_chunk_ids=[uuid.UUID(str(c.chunk_id)) for c in citations] or None,
         )
     )

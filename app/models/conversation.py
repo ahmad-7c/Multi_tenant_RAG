@@ -22,6 +22,30 @@ class MessageRole(str, enum.Enum):
     ASSISTANT = "assistant"
 
 
+class MessageKind(str, enum.Enum):
+    """What an assistant turn actually is.
+
+    NULL on user turns -- a question is neither an answer nor a refusal,
+    and inventing a fourth member for it would make every filter say
+    "kind == ANSWER or role == USER" instead of just reading the column.
+
+    The distinction that matters downstream is ANSWER vs everything
+    else: only a real grounded answer is useful context for rewriting a
+    follow-up. REFUSAL and ERROR are kept apart from each other because
+    they mean different things to an operator reading the table --
+    refusals are a product signal (the corpus or the gate), errors are
+    an infrastructure signal.
+    """
+
+    # A grounded answer the model actually produced.
+    ANSWER = "answer"
+    # The system declined on CONTENT grounds: the confidence gate found
+    # nothing relevant, or the provider's safety filter refused.
+    REFUSAL = "refusal"
+    # Infrastructure failed: rate limit, timeout, empty response.
+    ERROR = "error"
+
+
 class Conversation(Base):
     __tablename__ = "conversations"
     __table_args__ = (
@@ -79,6 +103,22 @@ class Message(Base):
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Nullable, and NULL means two different things that happen to want
+    # the same treatment: a user turn (kind does not apply) and a row
+    # written before this column existed (a legacy answer). Both are fed
+    # to the rewriter, which is why the filter tests for "not a refusal
+    # or error" rather than for "== ANSWER".
+    kind: Mapped[Optional[MessageKind]] = mapped_column(
+        SAEnum(
+            MessageKind,
+            name="message_kind",
+            # See MessageRole: without values_callable SQLAlchemy
+            # persists the enum's NAME and Postgres rejects it.
+            values_callable=lambda e: [m.value for m in e],
+        ),
+        nullable=True,
+    )
+
     # The parent chunks actually cited by this answer. Stored as an array
     # rather than a join table: it is only ever read back whole with the
     # message, never queried across messages, so a join table would add a
@@ -87,8 +127,12 @@ class Message(Base):
         ARRAY(PGUUID(as_uuid=True)), nullable=True
     )
 
+    # clock_timestamp(), not now(). now() is transaction_timestamp() and
+    # is CONSTANT for a whole transaction -- and persist_turn writes the
+    # question and the answer in one. Both rows would share a timestamp
+    # and nothing in the ordering could separate them. See migration 0007.
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+        DateTime(timezone=True), server_default=func.clock_timestamp()
     )
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")

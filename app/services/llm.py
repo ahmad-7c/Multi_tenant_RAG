@@ -35,11 +35,30 @@ class LLMError(Exception):
 
 
 class LLMRateLimitError(LLMError):
-    """429, or a 503 that means the same thing on a free tier."""
+    """429, or a 503 that means the same thing on a free tier.
+
+    Carries `retry_after` when the provider sent the header, because the
+    server knowing exactly how long to wait beats us guessing an
+    exponential backoff.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class LLMTimeoutError(LLMError):
     """The request never reached a decision: timeout, DNS, reset."""
+
+
+class LLMDeadlineExceededError(LLMTimeoutError):
+    """The TOTAL request budget expired.
+
+    A subclass of LLMTimeoutError so the user-facing message stays
+    "took too long", but a distinct type because it must NEVER be
+    retried: there is no budget left to retry inside of, so a retry
+    would either blow the deadline again or silently extend it.
+    """
 
 
 class LLMSafetyBlockedError(LLMError):
@@ -198,6 +217,33 @@ _REFUSAL_FINISH_REASONS = {
 _RATE_LIMIT_STATUS = {429, 503, 529}
 
 
+def _parse_retry_after(value) -> float | None:
+    """RFC 9110 Retry-After: either delay-seconds or an HTTP-date.
+
+    Returns None for anything unrecognised, so a malformed header falls
+    back to our own backoff rather than failing the request.
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(text)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_http(exc: BaseException) -> LLMError:
     """Map a transport/HTTP exception onto the domain hierarchy.
 
@@ -208,7 +254,13 @@ def _classify_http(exc: BaseException) -> LLMError:
     status = getattr(response, "status_code", None)
     if isinstance(status, int):
         if status in _RATE_LIMIT_STATUS:
-            return LLMRateLimitError(f"provider rate limited ({status})")
+            headers = getattr(response, "headers", None) or {}
+            retry_after = _parse_retry_after(
+                headers.get("retry-after") or headers.get("Retry-After")
+            )
+            return LLMRateLimitError(
+                f"provider rate limited ({status})", retry_after=retry_after
+            )
         if status == 408:
             return LLMTimeoutError("provider timed out (408)")
         return LLMUpstreamError(f"provider error {status}")
@@ -334,6 +386,13 @@ class GeminiLLM(LLMProvider):
         request_id = uuid.uuid4().hex[:8]
         attempt = 0
 
+        # ONE budget for the whole request, fixed before the first
+        # attempt. A deadline that restarts per attempt is not a
+        # deadline: with one retry a "120s" limit permits 240s plus
+        # backoff, and the caller who configured 120 has no way to find
+        # that out.
+        deadline = asyncio.get_running_loop().time() + self._total_timeout
+
         while True:
             produced_text = False
             try:
@@ -343,15 +402,44 @@ class GeminiLLM(LLMProvider):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     request_id=request_id,
+                    deadline=deadline,
                 ):
                     produced_text = True
                     yield piece
+            except LLMDeadlineExceededError:
+                # Never retried. There is no budget left to retry inside
+                # of, so a retry either blows the deadline again or
+                # silently extends the one the caller asked for.
+                raise
             except (LLMRateLimitError, LLMTimeoutError) as exc:
                 # Retryable in principle -- but only while nothing has
                 # been sent to the client yet, and only within budget.
                 if produced_text or attempt >= self._max_retries:
                     raise
-                delay = self._retry_base_seconds * (2**attempt)
+
+                delay, give_up = self._retry_delay(exc, attempt)
+                if give_up:
+                    # Retry-After longer than we are willing to hold a
+                    # request handler open. Waiting is not a retry at
+                    # that point, it is a hang with extra steps.
+                    logger.warning(
+                        "llm call %s rate limited with Retry-After=%ss; "
+                        "failing fast rather than holding the request",
+                        request_id,
+                        getattr(exc, "retry_after", None),
+                    )
+                    raise
+
+                remaining = deadline - asyncio.get_running_loop().time()
+                if delay >= remaining:
+                    # Sleeping would consume the rest of the budget and
+                    # leave nothing for the attempt itself. Fail now
+                    # rather than sleep and then fail.
+                    raise LLMDeadlineExceededError(
+                        f"total deadline of {self._total_timeout}s exceeded "
+                        f"while backing off"
+                    ) from exc
+
                 logger.warning(
                     "llm call %s failed before first token (%s); "
                     "retry %s/%s in %.2fs",
@@ -362,16 +450,37 @@ class GeminiLLM(LLMProvider):
                     delay,
                 )
                 if delay:
-                    # Short on purpose: this is in the user's request
-                    # path, where a long backoff is indistinguishable
-                    # from a hang.
                     await self._sleep(delay)
                 attempt += 1
                 continue
             return
 
+    def _retry_delay(self, exc: BaseException, attempt: int) -> tuple[float, bool]:
+        """How long to wait before the next attempt, and whether to give up.
+
+        A provider that sent Retry-After has told us the answer; guessing
+        an exponential backoff instead is strictly worse information. But
+        a long Retry-After is a different message: "not soon". Honouring
+        90 seconds inside a request handler is a hang, so past
+        LLM_RETRY_AFTER_MAX_SECONDS we surface the rate-limit message
+        immediately and let the user decide whether to try again.
+        """
+        retry_after = getattr(exc, "retry_after", None)
+        if retry_after is not None:
+            if retry_after > settings.LLM_RETRY_AFTER_MAX_SECONDS:
+                return 0.0, True
+            return retry_after, False
+        return self._retry_base_seconds * (2**attempt), False
+
     async def _stream_once(
-        self, *, system: str, user: str, max_tokens, temperature, request_id: str
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens,
+        temperature,
+        request_id: str,
+        deadline: float,
     ) -> AsyncIterator[str]:
         payload = self._payload(
             system=system, user=user, max_tokens=max_tokens, temperature=temperature
@@ -385,10 +494,12 @@ class GeminiLLM(LLMProvider):
         malformed = 0
         client, close = await self._acquire_client()
         try:
-            # The TOTAL deadline, distinct from the per-read limit handed
-            # to httpx above. asyncio.timeout bounds the whole block --
-            # connection setup, every read, and the gaps between them.
-            async with asyncio.timeout(self._total_timeout):
+            # timeout_AT an absolute instant, not timeout(duration):
+            # the deadline was fixed in stream() before the first
+            # attempt, so every attempt and every backoff shares one
+            # budget. Distinct from the per-read limit handed to httpx,
+            # which bounds a single read rather than the call.
+            async with asyncio.timeout_at(deadline):
                 try:
                     stream_cm = client.stream(
                         "POST", url, json=payload, headers=self._headers
@@ -414,10 +525,10 @@ class GeminiLLM(LLMProvider):
                             produced_text = True
                             yield piece
         except TimeoutError as exc:
-            # asyncio.timeout raises TimeoutError on expiry. Distinct
-            # message from a per-read stall so the logs can tell which
-            # limit actually fired.
-            raise LLMTimeoutError(
+            # asyncio.timeout_at raises TimeoutError on expiry. A
+            # distinct type from a per-read stall, so the retry loop can
+            # refuse to retry it and the logs say which limit fired.
+            raise LLMDeadlineExceededError(
                 f"total deadline of {self._total_timeout}s exceeded"
             ) from exc
         except LLMError:

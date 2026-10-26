@@ -46,7 +46,7 @@ not "# stores the org id"
 
 ## Current Phase
 **PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 3 of 7
-done).** 415 tests green against real Postgres + pgvector, no network.
+done).** 439 tests green against real Postgres + pgvector, no network.
 Migrations verified `downgrade base` -> `head` through 0005.
 
 ### Free-provider migration (Gemini + Cohere)
@@ -150,6 +150,43 @@ before this** -- every provider test injects a fake client, the
   DISABLED the moment migrations ran in-process. Found because three LLM
   tests passed alone and failed in the full suite.
   `tests/test_logging_survives_migrations.py` pins it.
+- **STEP 3 follow-ups, round 2 (directed review).**
+  - **The deadline is now ONE budget for the whole request.** Fixed as
+    an absolute instant in `stream()` before the first attempt and
+    passed to each attempt as `asyncio.timeout_at(deadline)`. A
+    deadline that restarts per attempt is not a deadline: with one
+    retry a "120s" limit permitted 240s plus backoff. Backoff time
+    counts against it too -- if the sleep would consume the remaining
+    budget we fail immediately instead of sleeping and then failing.
+  - `LLMDeadlineExceededError` subclasses `LLMTimeoutError` (so the
+    user message stays "took too long") but is **never retried**:
+    there is no budget left to retry inside of.
+  - **Retry-After is honoured when short.** `LLMRateLimitError` carries
+    `retry_after`, parsed from the header as delay-seconds OR an
+    HTTP-date (RFC 9110 allows both). Under
+    `LLM_RETRY_AFTER_MAX_SECONDS` (5s) it replaces our guessed backoff
+    -- the server knows better. Over it we **fail fast** with the
+    rate-limit sentence: honouring 90s inside a request handler is a
+    hang with extra steps. A malformed header falls back to backoff.
+  - **`messages.kind`** (`answer` | `refusal` | `error`, migration
+    0006, nullable). `history_for_rewrite` excludes refusals and errors;
+    `list_messages` still returns them for display. NULL passes the
+    filter, covering both user turns and pre-migration rows. The
+    exclusion is applied BEFORE the limit so a run of refusals cannot
+    empty the window. REFUSAL = declined on content (gate, safety
+    block, zero valid citations); ERROR = infrastructure (rate limit,
+    timeout, empty response).
+  - `generate_answer` now yields a frozen `AnswerOutcome` dataclass
+    instead of a tuple that had grown twice.
+- **Bug fixed: a turn's answer sorted ABOVE its question.** Postgres
+  `now()` is `transaction_timestamp()` -- constant for the whole
+  transaction -- and `persist_turn` writes both rows in one commit, so
+  they shared a `created_at`. The sort then fell through to
+  `Message.role`, which is not a tie-break but an alphabetical sort,
+  and `'assistant' < 'user'`. Fixed with an explicit `_TURN_ORDER`
+  tie-break (works for existing rows) plus migration 0007 moving the
+  column default to `clock_timestamp()` (fixes it at the source for new
+  rows).
 - STEPS 4-7 pending: Cohere reranker, connection pool, `prepare_query`
   threading test, live smoke test.
 
