@@ -822,3 +822,28 @@ async def test_passthrough_reranker_keeps_rrf_order_end_to_end(db_session, corpu
     # rather than compare RRF scores to the threshold.
     assert prepared.gated is False
     assert prepared.prompt is not None
+
+
+async def test_the_question_is_embedded_as_a_query_not_as_a_document(db_session, corpus):
+    """The one call site where the embedding task actually matters.
+
+    EmbeddingProvider.embed() defaults to RETRIEVAL_DOCUMENT because
+    ingestion is the overwhelming majority of calls. That default is wrong
+    exactly once -- here -- and getting it wrong is invisible: Gemini
+    happily embeds a question as a document and returns a perfectly valid
+    vector that simply sits in the wrong part of the space. Retrieval
+    still returns 50 candidates, the gate still opens, the answer is just
+    quietly worse. So the correct task is pinned by a test rather than by
+    the type system.
+    """
+    from app.services.embedding import EmbeddingTask
+
+    org, user, _document, _parents = corpus
+    conversation = _conversation(db_session, org, user)
+    embedder = FakeEmbeddings(dimensions=settings.EMBEDDING_DIMENSIONS)
+
+    await _prepare(
+        db_session, org, user, conversation, "how long do I have?", embedder=embedder
+    )
+
+    assert embedder.tasks == [EmbeddingTask.QUERY]

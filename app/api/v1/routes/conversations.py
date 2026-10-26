@@ -119,6 +119,22 @@ async def create_message(
     request: Request,
     current_user: User = Depends(get_current_user),
 ):
+    # Set at startup by the embedding-model guard in main.py. Refusing is
+    # the honest response: every stored vector was produced by a different
+    # model than the one that will embed this question, so retrieval would
+    # return noise and the LLM would write confident prose over it. A
+    # degraded answer nobody can tell is degraded is worse than a 503.
+    model_error = getattr(request.app.state, "embedding_model_error", None)
+    if model_error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Search is unavailable: the stored document index was built "
+                "with a different embedding model. An administrator must "
+                "re-ingest the documents."
+            ),
+        )
+
     org_id = current_user.org_id
     user_id = current_user.id
 

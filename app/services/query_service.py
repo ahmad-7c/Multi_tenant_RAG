@@ -62,7 +62,7 @@ from app.services.cache import (
     should_cache,
 )
 from app.services.citations import Citation, validate_citations
-from app.services.embedding import EmbeddingProvider
+from app.services.embedding import EmbeddingProvider, EmbeddingTask
 from app.services.llm import LLMProvider
 from app.services.prompting import INSUFFICIENT_CONTEXT_ANSWER, BuiltPrompt, build_prompt
 from app.services.query_rewrite import rewrite_question
@@ -149,7 +149,13 @@ async def prepare_query(
         prepared.short_circuit_citations = [Citation(**c) for c in cached.citations]
         return prepared
 
-    [query_vector] = embedder.embed([rewritten])
+    # QUERY, not the DOCUMENT default. Retrieval is asymmetric: a provider
+    # that supports task types projects a short question and the long
+    # passage that answers it into the same region only when it is told
+    # which is which. Getting this wrong returns a valid vector in the
+    # wrong part of the space -- nothing errors, answers are just quietly
+    # worse.
+    [query_vector] = embedder.embed([rewritten], task=EmbeddingTask.QUERY)
 
     def _retrieve():
         # Own session, opened and closed inside the worker thread: a

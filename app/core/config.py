@@ -57,10 +57,22 @@ class Settings(BaseSettings):
 
     # ---- Providers (never hardcode a model name anywhere else) ----------
     OPENAI_API_KEY: Optional[str] = None
-    EMBEDDING_PROVIDER: Literal["openai", "fake"] = "openai"
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    GEMINI_API_KEY: Optional[str] = None
+    # One base URL for every Gemini call (embeddings and generation). Kept
+    # configurable so a regional endpoint or a local proxy needs no code
+    # change -- and so tests can point it at something unroutable.
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+
+    EMBEDDING_PROVIDER: Literal["gemini", "openai", "fake"] = "gemini"
+    # gemini-embedding-001, not -002/-2: the newer model is multimodal and
+    # self-normalizing but DROPPED the taskType parameter, and asymmetric
+    # document/query embedding matters more to a text-only RAG system than
+    # multimodality it never uses.
+    EMBEDDING_MODEL: str = "gemini-embedding-001"
     # Must match the Vector(...) dimension in the migration. Changing the
     # model to one with a different width is a migration, not a config edit.
+    # Gemini accepts 128..3072 and recommends 768/1536/3072; 1536 scores the
+    # same on MTEB as 3072, so the existing column width costs nothing.
     EMBEDDING_DIMENSIONS: int = 1536
 
     ANTHROPIC_API_KEY: Optional[str] = None
@@ -119,6 +131,13 @@ class Settings(BaseSettings):
     EMBED_MAX_RETRIES: int = 3
     # Backoff base: sleep is EMBED_RETRY_BASE_SECONDS * 2**attempt.
     EMBED_RETRY_BASE_SECONDS: float = 5.0
+    EMBED_TIMEOUT_SECONDS: float = 30.0
+    # Client-side floor on request spacing, in requests per minute; 0
+    # disables it. Set below the free tier's advertised limit on purpose:
+    # the published number is a ceiling the provider enforces, and being
+    # at it means every jitter spike becomes a 429. This throttles HTTP
+    # REQUESTS, not texts -- EMBED_BATCH_SIZE texts ride in one request.
+    EMBED_REQUESTS_PER_MINUTE: int = 90
 
     # ---- Retrieval ------------------------------------------------------
     # Candidates surviving the RRF merge of vector + full-text results.

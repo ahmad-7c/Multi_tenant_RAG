@@ -299,7 +299,7 @@ def test_permanent_embedding_error_fails_the_document_without_retrying(
 
     calls = {"n": 0}
 
-    def boom(texts):
+    def boom(texts, **kwargs):
         calls["n"] += 1
         raise embedding_module.PermanentEmbeddingError("400 input too long")
 
@@ -330,11 +330,11 @@ def test_embedding_failure_leaves_no_partial_chunks(
     original = ingest_env.embed
     state = {"n": 0}
 
-    def fail_on_second_batch(texts):
+    def fail_on_second_batch(texts, **kwargs):
         state["n"] += 1
         if state["n"] == 2:
             raise embedding_module.PermanentEmbeddingError("503-then-exhausted")
-        return original(texts)
+        return original(texts, **kwargs)
 
     monkeypatch.setattr(ingest_env, "embed", fail_on_second_batch)
     monkeypatch.setattr(settings, "EMBED_BATCH_SIZE", 2)

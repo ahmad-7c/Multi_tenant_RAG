@@ -140,14 +140,14 @@ class _FlakyProvider(FakeEmbeddings):
         self.batch_index = -1
         self.attempted_batches: list[tuple[str, ...]] = []
 
-    def embed(self, texts):
+    def embed(self, texts, **kwargs):
         self.attempted_batches.append(tuple(texts))
         if tuple(texts) not in {tuple(b) for b in self.attempted_batches[:-1]}:
             self.batch_index += 1
         if self.batch_index == self._fail_batch_index and self._remaining > 0:
             self._remaining -= 1
             raise self._error
-        return super().embed(texts)
+        return super().embed(texts, **kwargs)
 
 
 def test_only_the_failed_batch_is_retried():

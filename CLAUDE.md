@@ -45,9 +45,53 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. CHECKPOINT 3 reached.** 334 tests green against real
-Postgres + pgvector, no network. Migrations verified `downgrade base` ->
-`head` through 0005.
+**PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 2 of 7
+done).** 364 tests green against real Postgres + pgvector, no network.
+Migrations verified `downgrade base` -> `head` through 0005.
+
+### Free-provider migration (Gemini + Cohere)
+Goal: move off OpenAI/Anthropic onto Gemini (embeddings + answers) and a
+Cohere trial key (reranking), then prove the pipeline with ONE live
+end-to-end run. **No provider code had EVER been run against a real API
+before this** -- every provider test injects a fake client, the
+`anthropic` SDK was never installed, and `requirements.txt` line 19 was
+`pgvector==0.3.4boto3==1.35.49` (unparseable, so a fresh
+`pip install -r` always failed). All three are now fixed/underway.
+
+- **STEP 2 done - Gemini embeddings.** `GeminiEmbeddings` in
+  `app/services/embedding.py`, REST over httpx (not the google-genai SDK:
+  httpx is already a dependency and `httpx.HTTPStatusError` exposes
+  `.response.status_code`, which is exactly what `classify_error()`
+  reads). Model is `gemini-embedding-001`, NOT `gemini-embedding-2` --
+  the newer model is multimodal and self-normalizing but **dropped the
+  `taskType` parameter**, and asymmetric document/query embedding is
+  worth more here than unused multimodality.
+  - `EmbeddingTask.DOCUMENT` / `.QUERY` -> `RETRIEVAL_DOCUMENT` /
+    `RETRIEVAL_QUERY`. Defaults to DOCUMENT; the single query call site
+    (`query_service.prepare_query`) passes QUERY and a test pins it.
+  - `outputDimensionality=1536` requested AND the returned length is
+    asserted against `EMBEDDING_DIMENSIONS`, failing loudly.
+  - **Vectors are L2-normalized by us.** `gemini-embedding-001` only
+    normalizes its full 3072-d output; below that it Matryoshka-truncates
+    and the prefix is not unit length. Cosine is magnitude-invariant so
+    this is not what makes retrieval work today -- it is what stops it
+    breaking under `vector_ip_ops`/`vector_l2_ops`.
+  - Auth via the `x-goog-api-key` **header**, never `?key=` (a query
+    param lands in every proxy and access log).
+  - `RateLimiter`: flat minimum interval, not a token bucket -- a
+    bucket's burst allowance is precisely what trips a per-minute cap at
+    the start of an ingestion. Throttles HTTP **requests**, not texts.
+  - **Bug fixed in `classify_error()`**: the transient-hint list had
+    `"connection"`, but `httpx.ConnectError` lowercases to
+    `"connecterror"`. Every DNS failure and refused connection was
+    classified PERMANENT and the retry loop silently never ran.
+  - **Startup guard** `check_embedding_model_consistency()` runs once in
+    the FastAPI lifespan. On a mismatch it does NOT exit the process --
+    it records the condition and only the query endpoint returns 503, so
+    uploads/auth/document management stay up. Deliberately **not**
+    org-scoped: it is an operator-level deployment check.
+- STEPS 3-7 pending: Gemini LLM, Cohere reranker, connection pool,
+  `prepare_query` threading test, live smoke test.
 
 Phase 3 modules:
 - `retrieval.py` - one org-scoped path: HNSW cosine + Postgres FTS on
