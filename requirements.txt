@@ -19,3 +19,8 @@ tiktoken==0.14.0
 pgvector==0.3.4
 boto3==1.35.49
 pytest-asyncio==0.24.0
+# The golden set is YAML, so this is now a direct dependency. It was
+# already installed as a transitive one, which is exactly why it needs
+# pinning: a fresh install that happened to resolve it away would break
+# eval/loader.py with an ImportError nobody asked for.
+PyYAML==6.0.3

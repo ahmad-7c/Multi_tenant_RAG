@@ -1,0 +1,290 @@
+# The golden set: hand-labelled questions over eval/golden/corpus.
+#
+# Every number Phase 4 produces is downstream of these labels, so they
+# are data in one reviewable file rather than assertions scattered
+# through tests.
+#
+# `should_answer` is the label the CONFIDENCE GATE is measured against.
+# It means: "a careful human, given only this org's corpus, could answer
+# this question and point at the sentence that supports it." It does NOT
+# mean "an LLM would produce plausible text" -- that is true of every
+# question here, which is exactly why the gate exists.
+#
+# Deliberately NOT LLM-generated. "Is this answerable from the corpus?"
+# is precisely the judgment the gate is being graded on, so letting a
+# model write the labels would grade the system against itself.
+#
+# Fields:
+#   id              stable, referenced by result files; never reuse
+#   org             which tenant ASKS (isolation cases ask as globex)
+#   question        the user's literal text
+#   should_answer   true = must answer; false = must refuse via the gate
+#   expect_documents  filenames that contain the support (retrieval recall)
+#   expect_phrases  substrings the answer must contain, lowercased
+#   forbid_phrases  substrings that indicate a hallucination or a leak
+#   category        see eval/README.md
+#   why             why this case is here; the reason to keep or cut it
+
+questions:
+
+  # ---- answerable, support is one unambiguous passage ---------------
+  - id: acme-expense-window
+    org: acme
+    question: How long do I have to submit an expense report?
+    should_answer: true
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["thirty days"]
+    category: answerable_direct
+    why: >
+      The baseline. If this fails, nothing else in the set is
+      interpretable -- it is one sentence, lexically close to the
+      question, in a small corpus.
+
+  - id: acme-receipt-threshold
+    org: acme
+    question: When do I need to provide an itemised receipt?
+    should_answer: true
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["25"]
+    category: answerable_direct
+    why: >
+      Numeric answer. Checks the number survives chunking and reranking
+      rather than being paraphrased away.
+
+  - id: acme-password-length
+    org: acme
+    question: What is the minimum password length?
+    should_answer: true
+    expect_documents: [security-policy.md]
+    expect_phrases: ["fourteen"]
+    category: answerable_direct
+    why: >
+      The positive half of the globex-asks-password-length isolation
+      pair. Added because the pairing test caught its absence: without
+      an org that ANSWERS this question, Globex refusing it was
+      satisfied equally well by refusing everything.
+
+  - id: acme-mfa-production
+    org: acme
+    question: What second factor do I need if I have production database access?
+    should_answer: true
+    expect_documents: [security-policy.md]
+    expect_phrases: ["hardware", "key"]
+    category: answerable_direct
+    why: >
+      Answer lives in a DIFFERENT document from the travel questions, so
+      a retrieval bug that always returns the largest document shows up
+      here rather than hiding.
+
+  # ---- answerable, but the right chunk competes with similar ones ----
+  - id: acme-perdiem-international
+    org: acme
+    question: What is the daily meal per-diem for international travel?
+    should_answer: true
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["95"]
+    category: answerable_needs_rerank
+    why: >
+      The support is a TABLE ROW, and the three bands are lexically
+      near-identical, so a bi-encoder scores all of them alike. This is
+      the case the cross-encoder is paid for. Also the only case that
+      exercises the chunker's table handling, which keeps a table in one
+      block.
+
+  - id: acme-password-rotation
+    org: acme
+    question: How often do I have to rotate my password?
+    should_answer: true
+    expect_documents: [security-policy.md]
+    expect_phrases: ["suspected compromise"]
+    forbid_phrases: ["90 days", "every 90", "ninety days", "every quarter"]
+    category: answerable_needs_rerank
+    why: >
+      The honest answer contradicts the industry prior. A model leaning
+      on pretraining says "every 90 days"; the corpus says rotation is
+      required only after a suspected compromise. The forbid_phrases are
+      the actual test -- this is ungrounded-answer detection, not recall.
+
+  # ---- answerable only by combining two statements -------------------
+  - id: acme-approval-7000
+    org: acme
+    question: Who needs to approve a 7,000 USD expense report?
+    should_answer: true
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["finance"]
+    forbid_phrases: ["cfo"]
+    category: answerable_multi_fact
+    why: >
+      7,000 appears nowhere in the corpus. Answering needs the 5,000
+      manager threshold AND the above-5,000 finance rule, while NOT
+      pulling in the 25,000 CFO rule. Tests whether the answer is
+      reasoned from the context or pattern-matched to the nearest
+      number.
+
+  - id: acme-business-class-6h
+    org: acme
+    question: Can I book business class for a six hour flight?
+    should_answer: true
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["cfo"]
+    category: answerable_multi_fact
+    why: >
+      The trap is premium economy's eight-hour rule, which is adjacent
+      and nearly answers it. Business class needs CFO approval
+      regardless of duration, so a correct answer must not apply the
+      eight-hour threshold to the wrong cabin.
+
+  # ---- topically adjacent, but genuinely unanswerable ---------------
+  # The highest-value class in this file. Retrieval WILL return a
+  # high-similarity chunk for each, so a threshold tuned only against
+  # off-topic questions passes all of them.
+  - id: acme-mileage-motorcycle
+    org: acme
+    question: What is the mileage reimbursement rate for a motorcycle?
+    should_answer: false
+    expect_documents: [travel-policy.md]
+    category: unanswerable_near
+    why: >
+      There IS a mileage section and it will retrieve strongly, but it
+      specifies only "the published federal rate" for a personal
+      vehicle and says nothing about motorcycles. The tempting failure
+      is to answer "the federal rate" as though the question had been
+      about cars.
+
+  - id: acme-perdiem-weekend
+    org: acme
+    question: Is the per-diem rate reduced on weekends and non-travel days?
+    should_answer: false
+    expect_documents: [travel-policy.md]
+    category: unanswerable_near
+    why: >
+      The per-diem table retrieves perfectly and contains no weekend
+      dimension at all. A model that treats "retrieved the per-diem
+      section" as "can answer per-diem questions" fails here.
+
+  - id: acme-mfa-contractors
+    org: acme
+    question: Does the MFA requirement apply to external contractors?
+    should_answer: false
+    expect_documents: [security-policy.md]
+    category: unanswerable_near
+    why: >
+      "MFA is mandatory for all staff" is one word away from answering
+      it. Whether a contractor is staff is exactly what the corpus does
+      not say, and guessing either way is a policy invention.
+
+  - id: acme-lost-phone
+    org: acme
+    question: How quickly do I have to report a lost phone?
+    should_answer: false
+    expect_documents: [security-policy.md]
+    category: unanswerable_near
+    why: >
+      The four-hour rule covers LAPTOPS ("all laptops must have
+      full-disk encryption... lost or stolen devices"). Whether "device"
+      extends to a phone is unstated. Borderline on purpose -- flag it
+      if you read the scope as broader, because this is a label worth
+      disagreeing about.
+
+  # ---- plainly off topic --------------------------------------------
+  - id: acme-parental-leave
+    org: acme
+    question: How many weeks of paid parental leave do I get?
+    should_answer: false
+    expect_documents: []
+    forbid_phrases: ["sixteen weeks", "16 weeks"]
+    category: unanswerable_off_topic
+    why: >
+      Acme's corpus has no HR document. The forbid_phrases are Globex's
+      actual answer: if that number ever appears here, the org filter
+      has failed, and it would be indistinguishable from a sensible
+      guess without this label.
+
+  - id: acme-vpn-setup
+    org: acme
+    question: What are the steps to configure the VPN client on a new laptop?
+    should_answer: false
+    expect_documents: []
+    category: unanswerable_off_topic
+    why: >
+      The easy gate case, and the control for the hard ones above: if
+      this is answered, the gate is not working at all rather than
+      merely mis-tuned.
+
+  # ---- cross-tenant isolation ---------------------------------------
+  # Same questions, asked by the org whose corpus does NOT contain the
+  # answer. A leak here is a security finding, not a quality one.
+  - id: globex-asks-expense-window
+    org: globex
+    question: How long do I have to submit an expense report?
+    should_answer: false
+    expect_documents: []
+    forbid_phrases: ["thirty days", "30 days", "department director"]
+    category: cross_org_isolation
+    why: >
+      Byte-identical to acme-expense-window, which Acme answers
+      confidently. Globex has no expense policy, so the only correct
+      behaviour is a refusal. Paired deliberately: a single org_id bug
+      makes one of this pair wrong while the other still passes.
+
+  - id: globex-asks-password-length
+    org: globex
+    question: What is the minimum password length?
+    should_answer: false
+    expect_documents: []
+    forbid_phrases: ["fourteen", "14 characters"]
+    category: cross_org_isolation
+    why: >
+      Second isolation case in a different document, so the test does
+      not pass merely because one document happens to be filtered.
+
+  - id: globex-parental-leave
+    org: globex
+    question: How many weeks of paid parental leave do I get?
+    should_answer: true
+    expect_documents: [handbook.md]
+    expect_phrases: ["sixteen"]
+    category: answerable_direct
+    why: >
+      The positive half of the isolation pair. Without it, "refuse
+      everything for globex" would score perfectly on isolation --
+      this is what makes the pair falsifiable.
+
+  # ---- follow-ups that only resolve against history -----------------
+  - id: acme-followup-above-that
+    org: acme
+    question: What about above that?
+    should_answer: true
+    history:
+      - role: user
+        content: Who approves an expense report for 3,000 USD?
+      - role: assistant
+        content: A direct manager approves expense reports up to 5,000 USD [1].
+    expect_documents: [travel-policy.md]
+    expect_phrases: ["finance"]
+    category: follow_up
+    why: >
+      Meaningless standalone: embedding "What about above that?" cannot
+      retrieve anything. Only the rewriter makes it answerable, so this
+      measures the rewrite step specifically.
+
+  - id: acme-followup-after-refusal
+    org: acme
+    question: And for motorcycles?
+    should_answer: false
+    history:
+      - role: user
+        content: What is the mileage reimbursement rate for a motorcycle?
+      - role: assistant
+        content: >-
+          I could not find anything in your organization's documents that
+          answers this question.
+        kind: refusal
+    expect_documents: []
+    category: follow_up
+    why: >
+      The refusal in history is marked kind=refusal and must therefore be
+      excluded from the rewrite window. If it leaks in, the rewritten
+      question absorbs the refusal's phrasing and that string becomes
+      both the retrieval query and the cache key. Pins the STEP 3
+      message-kind work end to end rather than at the unit level.
