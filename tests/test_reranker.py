@@ -13,6 +13,7 @@ from app.services.reranker import (
     HostedReranker,
     PassthroughReranker,
     RankedCandidate,
+    RerankerProtocolError,
     map_to_parents,
     rerank_with_fallback,
     should_answer,
@@ -238,7 +239,7 @@ async def test_hosted_reranker_rejects_an_out_of_range_index():
 
     # Attaching a score to the wrong chunk would silently corrupt the
     # ranking, and the citation that follows it.
-    with pytest.raises(ValueError):
+    with pytest.raises(RerankerProtocolError):
         await reranker.rerank("q", [_candidate("only one")], 1)
 
 

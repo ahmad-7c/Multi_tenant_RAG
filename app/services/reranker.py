@@ -36,6 +36,77 @@ from app.services.retrieval import Candidate
 logger = logging.getLogger(__name__)
 
 
+class RerankerError(Exception):
+    """Base class for hosted-reranker failures.
+
+    The split below is not cosmetic. Every one of these ends in the same
+    place -- fall back to RRF order and answer anyway -- so the exception
+    type cannot change what the user gets. What it changes is what the
+    OPERATOR gets: a 429 is a blip that resolves itself and deserves a
+    warning, while a 401 means reranking is off until someone edits an
+    env var and deserves an error plus a stop to calling.
+    """
+
+
+class RerankerTransientError(RerankerError):
+    """Might well succeed on the next request. Retry by simply existing."""
+
+
+class RerankerRateLimitError(RerankerTransientError):
+    """429. On a Cohere trial key this is 10 req/min, or the monthly cap.
+
+    Deliberately transient even though an exhausted monthly quota is not:
+    the status code alone cannot tell the two apart, and treating a
+    minute-long throttle as permanent would disable reranking for the
+    life of the process over a momentary spike.
+    """
+
+
+class RerankerUpstreamError(RerankerTransientError):
+    """5xx, or any status we have no specific reading for."""
+
+
+class RerankerTimeoutError(RerankerTransientError):
+    """The provider did not answer inside the budget."""
+
+
+class RerankerPermanentError(RerankerError):
+    """Cannot succeed until configuration changes.
+
+    A bad key, a retired model name, a wrong URL. Retrying is pure
+    latency: the same request will fail the same way every time.
+    """
+
+
+class RerankerAuthError(RerankerPermanentError):
+    """401/403. Key missing, revoked, or not entitled to this model."""
+
+
+class RerankerRequestError(RerankerPermanentError):
+    """400/404/422. Our payload or our URL is wrong, not their service."""
+
+
+class RerankerDisabledError(RerankerPermanentError):
+    """Raised without an HTTP call because the breaker is open.
+
+    Its own class so the fallback path can log it at DEBUG. The ERROR
+    was already emitted once, when the breaker tripped; repeating it on
+    every query would bury the cause under its own consequences.
+    """
+
+
+class RerankerProtocolError(RerankerError):
+    """The response parsed as JSON but was not the shape we expect.
+
+    Neither transient nor permanent on purpose, so it does NOT trip the
+    breaker. A captive-portal login page or a proxy error page during an
+    outage arrives looking exactly like this, and that resolves on its
+    own -- but so does a wrong base URL look like this forever. Falling
+    back every time and logging loudly is the honest response to not
+    knowing which.
+    """
+
+
 @dataclass(frozen=True)
 class RankedCandidate:
     candidate: Candidate
@@ -141,12 +212,45 @@ class FakeReranker(Reranker):
         ]
 
 
+def classify_rerank_status(status: int) -> RerankerError:
+    """HTTP status -> the exception that says what to do about it.
+
+    Unknown statuses land on UPSTREAM, not on permanent. Guessing
+    "permanent" on a status we have never seen would let one unfamiliar
+    response from a proxy disable reranking for the life of the process.
+    """
+    if status in (401, 403):
+        return RerankerAuthError(
+            f"reranker rejected our credentials ({status}); "
+            "check RERANKER_API_KEY"
+        )
+    if status in (400, 404, 422):
+        # 404 covers the wrong-model-name case as well as the wrong-URL
+        # case: Cohere routes by model inside the body, but a retired
+        # model and a typo'd path both surface here.
+        return RerankerRequestError(
+            f"reranker refused our request ({status}); "
+            "check RERANKER_MODEL and RERANKER_BASE_URL"
+        )
+    if status == 429:
+        return RerankerRateLimitError("reranker rate limited (429)")
+    if status == 408:
+        return RerankerTimeoutError("reranker reported a request timeout (408)")
+    return RerankerUpstreamError(f"reranker returned {status}")
+
+
 class HostedReranker(Reranker):
-    """Cohere-style hosted rerank API.
+    """Cohere v2 /rerank.
 
     Request/response shape follows Cohere v2 /rerank, which several
     providers (Jina, Voyage, Together) accept or closely mirror, so the
     endpoint is configurable rather than hardcoded.
+
+    Checked against the published v2 contract rather than remembered:
+    `documents` is a list of STRINGS (v1's document objects are gone),
+    per-document truncation is `max_tokens_per_doc` (v1 called it
+    `max_chunks_per_doc`), at most 1000 documents are accepted, and the
+    response is `results[].index` / `results[].relevance_score`.
     """
 
     def __init__(
@@ -157,12 +261,30 @@ class HostedReranker(Reranker):
         base_url: str,
         timeout: float,
         client=None,
+        max_tokens_per_doc: int | None = None,
+        max_documents: int | None = None,
     ):
         self._api_key = api_key
         self._model = model
         self._base_url = base_url
         self._timeout = timeout
         self._client = client
+        self._max_tokens_per_doc = (
+            settings.RERANKER_MAX_TOKENS_PER_DOC
+            if max_tokens_per_doc is None
+            else max_tokens_per_doc
+        )
+        self._max_documents = (
+            settings.RERANKER_MAX_DOCUMENTS if max_documents is None else max_documents
+        )
+        # The breaker. Holds the reason string once a permanent failure is
+        # seen; cleared only by a process restart, which is what fixing
+        # the cause requires anyway since env vars are read at startup.
+        # Instance state rather than module state because get_reranker()
+        # is lru_cached to one instance per process, so here the two are
+        # the same thing -- and a test gets a clean breaker by building a
+        # new reranker.
+        self._disabled_reason: str | None = None
 
     @property
     def name(self) -> str:
@@ -172,6 +294,19 @@ class HostedReranker(Reranker):
     def scores_are_calibrated(self) -> bool:
         return True
 
+    @property
+    def is_disabled(self) -> bool:
+        return self._disabled_reason is not None
+
+    def _trip_breaker(self, exc: RerankerPermanentError) -> None:
+        if self._disabled_reason is not None:
+            return
+        # Deliberately silent. The ERROR belongs to rerank_with_fallback,
+        # which sees this failure exactly once -- the next call raises
+        # RerankerDisabledError instead. Logging in both places produced
+        # two ERRORs for one event, which is how a log loses its meaning.
+        self._disabled_reason = str(exc)
+
     async def rerank(
         self, query: str, candidates: list[Candidate], top_n: int
     ) -> list[RankedCandidate]:
@@ -179,42 +314,110 @@ class HostedReranker(Reranker):
         # httpx present at import time.
         import httpx
 
+        if self._disabled_reason is not None:
+            raise RerankerDisabledError(self._disabled_reason)
+
+        # Blank documents are a 400 from Cohere, and one of them would
+        # cost us reranking for the WHOLE query rather than for itself.
+        # The filtered list is kept so a returned index still resolves to
+        # the candidate we actually sent: indices refer to the list as
+        # submitted, so filtering without remapping would attach scores
+        # to the wrong chunks -- silently, and in the right-looking order.
+        sent = [c for c in candidates if c.content and c.content.strip()]
+        if not sent:
+            return []
+        if len(sent) > self._max_documents:
+            logger.warning(
+                "reranker: %d candidates exceeds the %d-document limit; "
+                "truncating. RETRIEVE_CANDIDATES is probably misconfigured.",
+                len(sent),
+                self._max_documents,
+            )
+            sent = sent[: self._max_documents]
+
         payload = {
             "model": self._model,
             "query": query,
-            "documents": [c.content for c in candidates],
-            "top_n": min(top_n, len(candidates)),
+            "documents": [c.content for c in sent],
+            "top_n": min(top_n, len(sent)),
+            "max_tokens_per_doc": self._max_tokens_per_doc,
         }
-        headers = {"Authorization": f"Bearer {self._api_key}"}
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            # Both sent explicitly: httpx sets Content-Type for json=, but
+            # the v2 contract names both, and a provider that content-
+            # negotiates to something other than JSON would then fail in
+            # the parser instead of at the request.
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
 
         # An async HTTP call, not a blocking one. This runs inside the
         # request handler, and a blocking 3-second POST would stall the
         # whole event loop -- every other in-flight request included.
-        if self._client is not None:
-            response = await self._client.post(
-                self._base_url, json=payload, headers=headers
-            )
-        else:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(
+        try:
+            if self._client is not None:
+                response = await self._client.post(
                     self._base_url, json=payload, headers=headers
                 )
-        response.raise_for_status()
-        body = response.json()
+            else:
+                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                    response = await client.post(
+                        self._base_url, json=payload, headers=headers
+                    )
+        except httpx.TimeoutException as exc:
+            # httpx timeouts are NOT TimeoutError subclasses, so without
+            # this they reach the caller's generic handler and get logged
+            # as an unexplained failure instead of as a timeout.
+            raise RerankerTimeoutError(f"reranker request timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            # Connect failures, DNS, protocol violations. Transient: the
+            # next request may route somewhere healthier.
+            raise RerankerUpstreamError(f"reranker request failed: {exc}") from exc
+
+        if response.status_code >= 400:
+            error = classify_rerank_status(response.status_code)
+            if isinstance(error, RerankerPermanentError):
+                self._trip_breaker(error)
+            raise error
+
+        try:
+            body = response.json()
+            results = body["results"]
+        except Exception as exc:
+            raise RerankerProtocolError(
+                f"reranker response was not the expected shape: {exc}"
+            ) from exc
 
         ranked = []
-        for position, item in enumerate(body["results"], start=1):
-            index = item["index"]
-            if not 0 <= index < len(candidates):
+        seen: set[int] = set()
+        for position, item in enumerate(results, start=1):
+            try:
+                index = item["index"]
+                score = float(item["relevance_score"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RerankerProtocolError(
+                    f"reranker result {position} was malformed: {exc}"
+                ) from exc
+            # bool is an int subclass, and True would index position 1.
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise RerankerProtocolError(
+                    f"reranker returned a non-integer index {index!r}"
+                )
+            if not 0 <= index < len(sent):
                 # A provider returning an out-of-range index would
                 # otherwise attach a score to the wrong chunk.
-                raise ValueError(f"reranker returned index {index} out of range")
-            ranked.append(
-                RankedCandidate(
-                    candidate=candidates[index],
-                    score=float(item["relevance_score"]),
-                    rank=position,
+                raise RerankerProtocolError(
+                    f"reranker returned index {index} out of range"
                 )
+            if index in seen:
+                # Two scores for one chunk. map_to_parents dedupes by
+                # parent so the damage would be bounded, but the repeat
+                # still consumes a top_n slot and drops a real candidate.
+                raise RerankerProtocolError(f"reranker returned index {index} twice")
+            seen.add(index)
+            ranked.append(
+                RankedCandidate(candidate=sent[index], score=score, rank=position)
             )
         return ranked
 
@@ -236,6 +439,11 @@ async def rerank_with_fallback(
     degrades to the RRF ordering we already have. The caller is told, via
     the flag, because a fallback also means the scores are no longer
     calibrated and the confidence gate has to behave differently.
+
+    Every failure lands here, so the exception type cannot change what
+    the user receives -- only what the log says. That is the point: the
+    level each class is logged at is the only thing standing between a
+    permanently dead reranker and nobody noticing for a month.
     """
     top_n = settings.RERANK_TOP_N if top_n is None else top_n
     timeout = settings.RERANKER_TIMEOUT_SECONDS if timeout is None else timeout
@@ -250,14 +458,66 @@ async def rerank_with_fallback(
         ranked = await asyncio.wait_for(
             reranker.rerank(query, candidates, top_n), timeout=timeout
         )
-        return ranked, False
+        # An empty result from a reranker that did not raise means it
+        # ranked nothing -- every candidate was blank, or it returned an
+        # empty list. RRF order is better than no context at all, and the
+        # flag has to say so, since the gate must not read an empty list
+        # as calibrated.
+        if not ranked:
+            logger.warning(
+                "reranker %s returned no results; falling back to RRF order",
+                reranker.name,
+            )
+        else:
+            return ranked, False
+    except RerankerDisabledError:
+        # The breaker is open and already logged its ERROR once, when it
+        # tripped. Repeating it per query would bury the cause under
+        # thousands of copies of its own consequence.
+        logger.debug("reranker %s is disabled; using RRF order", reranker.name)
+    except RerankerPermanentError as exc:
+        # ERROR, not warning, and said once -- the breaker makes every
+        # later call raise RerankerDisabledError, which logs at DEBUG.
+        # Silent permanent degradation is the failure this path exists to
+        # prevent: reranking stops, the confidence gate opens (because
+        # uncalibrated scores cannot be thresholded), and every answer
+        # afterwards rests on raw RRF order with nothing in the logs
+        # connecting the two.
+        logger.error(
+            "reranker %s disabled for the life of this process: %s. "
+            "Answers continue on RRF order, and the confidence gate is "
+            "open because RRF scores are not relevance.",
+            reranker.name,
+            exc,
+        )
+    except RerankerProtocolError as exc:
+        # Loud: this is either a wrong URL (forever) or a proxy error
+        # page (momentary), and we cannot tell which from here.
+        logger.error(
+            "reranker %s returned an unusable response: %s; "
+            "falling back to RRF order",
+            reranker.name,
+            exc,
+        )
+    except RerankerTransientError as exc:
+        logger.warning(
+            "reranker %s failed transiently: %s; falling back to RRF order",
+            reranker.name,
+            exc,
+        )
     except asyncio.TimeoutError:
+        # Our own wait_for budget, distinct from a timeout the provider
+        # reported. asyncio.TimeoutError is the builtin TimeoutError in
+        # 3.11+, and httpx's timeouts are not subclasses of it -- those
+        # arrive as RerankerTimeoutError above.
         logger.warning(
             "reranker %s timed out after %.1fs; falling back to RRF order",
             reranker.name,
             timeout,
         )
     except Exception:
+        # Still here deliberately. A reranker implementation we did not
+        # write (or a bug in one we did) must degrade, not 500.
         logger.warning(
             "reranker %s failed; falling back to RRF order", reranker.name, exc_info=True
         )

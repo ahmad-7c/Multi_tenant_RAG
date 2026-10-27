@@ -122,6 +122,16 @@ class Settings(BaseSettings):
     RERANKER_API_KEY: Optional[str] = None
     RERANKER_BASE_URL: str = "https://api.cohere.com/v2/rerank"
     RERANKER_TIMEOUT_SECONDS: float = 3.0
+    # Sent explicitly rather than relying on Cohere's default of the same
+    # value: per-document truncation decides what the cross-encoder
+    # actually scored, so it must not be able to change under us when the
+    # provider changes a default. Child chunks are CHILD_TOKENS (~125), so
+    # this truncates nothing today -- it is here to keep it that way.
+    RERANKER_MAX_TOKENS_PER_DOC: int = 4096
+    # Cohere rejects a request carrying more than 1000 documents. We send
+    # RETRIEVE_CANDIDATES (~50), so this is a guard against a future
+    # config bump turning every query into a 400, not a live constraint.
+    RERANKER_MAX_DOCUMENTS: int = 1000
 
     # ---- Extraction -----------------------------------------------------
     # A scanned PDF extracts to almost nothing. Below this mean
