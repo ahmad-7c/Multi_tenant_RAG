@@ -1,5 +1,6 @@
 from typing import Literal, Optional
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -119,7 +120,17 @@ class Settings(BaseSettings):
 
     RERANKER_PROVIDER: Literal["hosted", "passthrough", "fake"] = "passthrough"
     RERANKER_MODEL: str = "rerank-v3.5"
-    RERANKER_API_KEY: Optional[str] = None
+    # Reads COHERE_API_KEY too. The canonical name stays provider-neutral
+    # because RERANKER_BASE_URL is configurable (Jina, Voyage and Together
+    # all accept this request shape), but "COHERE_API_KEY" is what a
+    # person writes down when Cohere is the service that issued the key --
+    # and the cost of not accepting it is silent: no key means the hosted
+    # reranker is never constructed, so reranking is simply off, with
+    # nothing raised and nothing logged.
+    RERANKER_API_KEY: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("RERANKER_API_KEY", "COHERE_API_KEY"),
+    )
     RERANKER_BASE_URL: str = "https://api.cohere.com/v2/rerank"
     RERANKER_TIMEOUT_SECONDS: float = 3.0
     # Sent explicitly rather than relying on Cohere's default of the same

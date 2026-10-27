@@ -7,6 +7,7 @@ from app.api.v1.routes import auth, conversations, documents, users
 from app.core.config import settings
 from app.core.http import aclose_async_client
 from app.db.session import SessionLocal
+from app.services.reranker import check_reranker_config
 from app.services.embedding import (
     EmbeddingModelMismatch,
     check_embedding_model_consistency,
@@ -34,6 +35,11 @@ async def lifespan(app: FastAPI):
     and the query endpoints alone refuse.
     """
     app.state.embedding_model_error = None
+
+    # Cheap, no I/O. Catches the misconfiguration that costs answer
+    # quality without raising anything: a reranker key set while the
+    # provider is still passthrough.
+    check_reranker_config()
     db = SessionLocal()
     try:
         check_embedding_model_consistency(db, configured_model=settings.EMBEDDING_MODEL)

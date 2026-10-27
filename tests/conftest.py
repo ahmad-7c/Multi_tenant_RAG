@@ -33,6 +33,58 @@ from app.services.storage import get_storage
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _no_live_providers():
+    """The suite is offline BY CONSTRUCTION, not by what .env happens to say.
+
+    Settings are read from .env, and .env is where real keys and real
+    provider names live -- so the moment someone flips
+    EMBEDDING_PROVIDER=gemini to do a live run, every test that reaches
+    a provider factory starts making paid network calls. Found exactly
+    that way: the live smoke test required flipping .env, and nothing in
+    the harness would have stopped the next `pytest` from billing for
+    it.
+
+    Tests that want a real provider construct one explicitly with an
+    injected client, which this does not affect. Live verification lives
+    in scripts/smoke_live.py and is run by hand.
+    """
+    from app.services import embedding, llm, reranker
+
+    originals = (
+        settings.EMBEDDING_PROVIDER,
+        settings.LLM_PROVIDER,
+        settings.RERANKER_PROVIDER,
+    )
+    settings.EMBEDDING_PROVIDER = "fake"
+    settings.LLM_PROVIDER = "fake"
+    settings.RERANKER_PROVIDER = "fake"
+    # The factories are lru_cached, so a provider built before this ran
+    # would survive the override.
+    for factory in (
+        embedding.get_embedding_provider,
+        llm.get_llm,
+        llm.get_rewrite_llm,
+        reranker.get_reranker,
+    ):
+        factory.cache_clear()
+
+    yield
+
+    (
+        settings.EMBEDDING_PROVIDER,
+        settings.LLM_PROVIDER,
+        settings.RERANKER_PROVIDER,
+    ) = originals
+    for factory in (
+        embedding.get_embedding_provider,
+        llm.get_llm,
+        llm.get_rewrite_llm,
+        reranker.get_reranker,
+    ):
+        factory.cache_clear()
+
+
 def _require_test_database_url() -> str:
     url = settings.TEST_DATABASE_URL
     if not url:

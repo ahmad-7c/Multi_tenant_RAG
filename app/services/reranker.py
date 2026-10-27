@@ -667,6 +667,38 @@ def should_answer(
     return ranked[0].score >= threshold
 
 
+def check_reranker_config() -> str | None:
+    """Warn about the silent half of a reranker misconfiguration.
+
+    get_reranker() already fails loudly the obvious way round:
+    RERANKER_PROVIDER=hosted with no key raises at startup. The inverse
+    is silent and far likelier -- someone pastes a key into .env and
+    never flips the provider, so the cross-encoder never runs, answers
+    quietly rest on RRF order, and the confidence gate stays open
+    because RRF scores are not relevance. Nothing raises, nothing logs,
+    and the only symptom is answers that are a bit worse than they
+    should be.
+
+    Returns the message (for tests) and logs it. Not fatal: passthrough
+    is a legitimate configuration, so this is a "you probably did not
+    mean this", not an error.
+    """
+    if settings.RERANKER_API_KEY and settings.RERANKER_PROVIDER != "hosted":
+        message = (
+            f"a reranker API key is configured but RERANKER_PROVIDER is "
+            f"'{settings.RERANKER_PROVIDER}', so the key is unused and no "
+            f"reranking will happen. Set RERANKER_PROVIDER=hosted to use it."
+        )
+        logger.warning(message)
+        return message
+    if settings.RERANKER_PROVIDER == "passthrough":
+        logger.info(
+            "reranker is passthrough: results keep RRF order and the "
+            "confidence gate stays open, since RRF scores are not relevance."
+        )
+    return None
+
+
 @lru_cache(maxsize=1)
 def get_reranker() -> Reranker:
     provider = settings.RERANKER_PROVIDER
