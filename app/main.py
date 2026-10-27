@@ -7,7 +7,7 @@ from app.api.v1.routes import auth, conversations, documents, users
 from app.core.config import settings
 from app.core.http import aclose_async_client
 from app.db.session import SessionLocal
-from app.services.reranker import check_reranker_config
+from app.services.reranker import check_reranker_config, get_reranker
 from app.services.embedding import (
     EmbeddingModelMismatch,
     check_embedding_model_consistency,
@@ -74,4 +74,31 @@ app.include_router(conversations.router, prefix="/api/v1")
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Liveness, plus the degradations that are otherwise invisible.
+
+    `status` stays "ok" for every degradation listed here, deliberately.
+    A load balancer reads this endpoint to decide whether to send
+    traffic, and none of these conditions mean this instance cannot
+    serve: a disabled reranker still answers (on RRF order), and the
+    embedding-model mismatch already refuses only the query routes. A
+    non-ok status would pull a working instance out of rotation over a
+    quality problem and turn a degradation into an outage.
+
+    `degraded` exists because the alternative was nothing. The reranker
+    breaker logged one ERROR when it tripped and then went quiet by
+    design -- so an operator who missed that single line had no way to
+    ask whether reranking was still running.
+    """
+    degraded: list[str] = []
+
+    if app.state.embedding_model_error:
+        degraded.append("embedding_model_mismatch")
+
+    # getattr: passthrough and fake rerankers have no breaker at all.
+    if getattr(get_reranker(), "is_disabled", False):
+        degraded.append("reranker_disabled")
+
+    body: dict = {"status": "ok"}
+    if degraded:
+        body["degraded"] = degraded
+    return body

@@ -1,8 +1,12 @@
 from celery import Celery
-from celery.signals import worker_process_init
+from celery.signals import (
+    worker_process_init,
+    worker_process_shutdown,
+    worker_shutdown,
+)
 
 from app.core.config import settings
-from app.core.http import reset_sync_client
+from app.core.http import close_sync_client, reset_sync_client
 
 celery_app = Celery(
     "documind",
@@ -81,3 +85,23 @@ def _reset_http_pool(**_kwargs):
     fds) makes the child build its own on first use.
     """
     reset_sync_client()
+
+
+@worker_process_shutdown.connect
+@worker_shutdown.connect
+def _close_http_pool(**_kwargs):
+    """Close the pooled sync client when a worker (or child) goes away.
+
+    The counterpart to _reset_http_pool. reset_ deliberately does NOT
+    close, because at fork time the fds still belong to the parent; at
+    shutdown they belong only to us, so leaving keepalive connections
+    for the interpreter to reap means httpx can do nothing but warn
+    about them.
+
+    Both signals, because they fire in different pool modes:
+    worker_process_shutdown per prefork child, worker_shutdown for the
+    worker itself (which is the only one in --pool=solo, as used on
+    Windows). close_sync_client() is idempotent, so firing twice is
+    harmless.
+    """
+    close_sync_client()

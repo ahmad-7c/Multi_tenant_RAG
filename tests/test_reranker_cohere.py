@@ -369,3 +369,45 @@ async def test_a_missing_relevance_score_is_rejected():
 
     with pytest.raises(RerankerProtocolError):
         await reranker.rerank("q", [_candidate("a")], 1)
+
+
+# ---- operator visibility ---------------------------------------------
+
+
+def test_health_reports_an_open_breaker_without_failing_the_probe(client):
+    """An open breaker must be ASKABLE, not just once-loggable.
+
+    The breaker logs one ERROR when it trips and is then silent by
+    design, so an operator who missed that line previously had no way to
+    find out whether reranking was still running -- is_disabled existed
+    but nothing exposed it.
+
+    status stays "ok": a load balancer reads this to decide whether to
+    send traffic, and a disabled reranker still answers on RRF order.
+    Failing the probe would turn a quality degradation into an outage.
+    """
+    import app.main as main
+    from app.services.reranker import get_reranker
+
+    disabled = _reranker(_FakeClient(_FakeResponse({}, status=401)))
+    disabled._disabled_reason = "simulated bad key"
+
+    get_reranker.cache_clear()
+    main.get_reranker = lambda: disabled
+    try:
+        body = client.get("/health").json()
+    finally:
+        main.get_reranker = get_reranker
+        get_reranker.cache_clear()
+
+    assert body["status"] == "ok"
+    assert "reranker_disabled" in body.get("degraded", [])
+
+
+def test_health_is_clean_when_nothing_is_degraded(client):
+    body = client.get("/health").json()
+
+    assert body["status"] == "ok"
+    # No key means no noise: the absence of the field is the healthy
+    # signal, so a dashboard can alert on its presence alone.
+    assert "degraded" not in body
