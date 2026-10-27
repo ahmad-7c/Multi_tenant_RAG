@@ -16,6 +16,8 @@ import pytest
 
 from eval.loader import (
     CATEGORIES,
+    GATE_EXCLUDED,
+    GATE_SCORED,
     GoldenSetError,
     load_golden_set,
     summarise,
@@ -43,20 +45,60 @@ def test_every_question_explains_why_it_exists(golden):
         assert len(question.why.strip()) > 40, f"{question.id}: 'why' is too thin"
 
 
-def test_the_gate_labels_are_balanced(golden):
-    """Roughly even should_answer true/false.
+def test_the_gate_scored_labels_are_balanced(golden):
+    """Roughly even should_answer true/false among GATE-SCORED cases.
 
-    Not cosmetic. The gate will be scored on these labels, and a set
-    that is 80% answerable makes "always answer" look like 80%
-    accuracy -- which is precisely the behaviour the gate exists to
-    prevent.
+    Not cosmetic. The gate is scored on these labels, and a population
+    that is 80% answerable makes "always answer" look like 80% accuracy
+    -- precisely the behaviour the gate exists to prevent.
+
+    Measured over gate_scored() rather than every question, because the
+    ambiguous cases are excluded from the score; counting them in the
+    balance would balance a population nobody scores.
     """
-    answerable = sum(1 for q in golden.questions if q.should_answer)
-    refusable = len(golden.questions) - answerable
+    scored = golden.gate_scored()
+    answerable = sum(1 for q in scored if q.should_answer)
+    refusable = len(scored) - answerable
 
     assert answerable >= 5 and refusable >= 5
-    ratio = answerable / len(golden.questions)
-    assert 0.35 <= ratio <= 0.65, f"unbalanced: {answerable} answerable of {len(golden.questions)}"
+    ratio = answerable / len(scored)
+    assert 0.35 <= ratio <= 0.65, (
+        f"unbalanced: {answerable} answerable of {len(scored)} scored"
+    )
+
+
+def test_ambiguous_cases_are_excluded_from_the_gate_score(golden):
+    """The ambiguous bucket must not reach precision/recall.
+
+    A case whose correct answer is arguable cannot discipline a
+    threshold: whichever way the gate decides, the "error" is in the
+    label. Averaging them in would launder a judgement call into a
+    number.
+    """
+    for case in golden.by_category("ambiguous"):
+        assert case.counts_toward_gate is False
+    assert "ambiguous" in GATE_EXCLUDED
+    assert not (GATE_SCORED & GATE_EXCLUDED)
+
+
+def test_every_ambiguous_case_states_its_ambiguity(golden):
+    # Enforced by the loader; asserted here so the REAL set is checked,
+    # not only the synthetic fixtures. Without it, `ambiguous` becomes a
+    # place to park cases that merely fail.
+    ambiguous = golden.by_category("ambiguous")
+    assert ambiguous, "the ambiguous bucket is empty -- did a case get reclassified?"
+
+
+def test_there_are_enough_near_miss_unanswerables(golden):
+    """The near-miss bucket must not be tiny.
+
+    These are the only cases that can distinguish a well-tuned gate from
+    a broken one: retrieval returns a STRONG chunk that still does not
+    answer. With two or three of them, one coin-flip moves the measured
+    precision by a third.
+    """
+    near = golden.by_category("unanswerable_near")
+    assert len(near) >= 6, f"only {len(near)} near-miss cases"
 
 
 def test_the_hard_refusals_outnumber_the_easy_ones(golden):
@@ -70,7 +112,7 @@ def test_the_hard_refusals_outnumber_the_easy_ones(golden):
     near = len(golden.by_category("unanswerable_near"))
     off_topic = len(golden.by_category("unanswerable_off_topic"))
 
-    assert near >= off_topic, f"{near} near vs {off_topic} off-topic"
+    assert near >= 2 * off_topic, f"{near} near vs {off_topic} off-topic"
 
 
 def test_isolation_cases_are_pairs_with_opposite_labels(golden):
@@ -132,7 +174,7 @@ VALID_ENTRY = """\
     org: acme
     question: How long do I have to submit an expense report?
     should_answer: true
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
     expect_phrases: ["thirty days"]
     category: answerable_direct
     why: >
@@ -170,7 +212,7 @@ def test_a_renamed_document_is_rejected(tmp_path):
     # The realistic rot: someone renames a corpus file and every case
     # pointing at it starts scoring zero recall instead of erroring.
     with pytest.raises(GoldenSetError, match="expect_documents references"):
-        _load(tmp_path, VALID_ENTRY.replace("travel-policy.md", "travel_policy_v2.md"))
+        _load(tmp_path, VALID_ENTRY.replace("travel-policy.pdf", "travel_policy_v2.pdf"))
 
 
 def test_a_phrase_absent_from_the_corpus_is_rejected(tmp_path):
@@ -181,11 +223,14 @@ def test_a_phrase_absent_from_the_corpus_is_rejected(tmp_path):
 def test_an_answerable_case_without_expected_documents_is_rejected(tmp_path):
     with pytest.raises(GoldenSetError, match="no expect_documents"):
         _load(tmp_path, VALID_ENTRY.replace(
-            "    expect_documents: [travel-policy.md]\n", ""))
+            "    expect_documents: [travel-policy.pdf]\n", ""))
 
 
-def test_an_answerable_case_without_expected_phrases_is_rejected(tmp_path):
-    with pytest.raises(GoldenSetError, match="no expect_phrases"):
+def test_an_answerable_case_without_phrases_or_a_rubric_is_rejected(tmp_path):
+    # Either is acceptable now -- expect_phrases for direct cases, a
+    # rubric for synthesis -- but neither means "answered" could not be
+    # told apart from "answered wrongly".
+    with pytest.raises(GoldenSetError, match="neither expect_phrases nor a rubric"):
         _load(tmp_path, VALID_ENTRY.replace(
             '    expect_phrases: ["thirty days"]\n', ""))
 
@@ -228,27 +273,176 @@ def test_a_missing_required_field_is_rejected(tmp_path):
 # ---- the corpus survives the real chunker ---------------------------
 
 
+def test_the_corpus_has_real_multi_page_pdfs(golden):
+    """At least two PDFs, each with several pages.
+
+    Markdown fixtures cannot exercise PyMuPDF extraction, running
+    header/footer stripping, or page numbers reaching a citation -- and
+    those are three of the places a citation can be confidently wrong.
+    """
+    pdfs = [d for d in golden.documents if d.is_pdf]
+    assert len(pdfs) >= 2, f"only {len(pdfs)} PDF(s) in the corpus"
+    for document in pdfs:
+        # 3 is CLEAN_MIN_PAGES_FOR_HEADER_DETECTION: below it the
+        # header stripping deliberately does not run, so a 2-page PDF
+        # would not exercise it.
+        assert len(document.pages) >= 3, (
+            f"{document.filename} has {len(document.pages)} pages; "
+            f"header/footer detection needs at least 3"
+        )
+
+
+def test_running_headers_and_footers_are_stripped(golden):
+    """Page furniture must not survive into retrievable text.
+
+    If it does, every chunk of a 4-page policy carries "Acme Corporation
+    - Internal Use Only", which both pollutes the embedding and gives a
+    citation snippet that quotes a footer back at the reader.
+    """
+    furniture = [
+        "Internal Use Only",
+        "Confidential",
+        "Travel and Expense Policy v4.2",
+        "Deployment Runbook rev 11",
+    ]
+    for document in golden.documents:
+        if not document.is_pdf:
+            continue
+        for page in document.pages:
+            for phrase in furniture:
+                assert phrase not in page.text, (
+                    f"{document.filename} p{page.page_number} still carries "
+                    f"the running {phrase!r}"
+                )
+
+
+def test_page_numbers_are_one_indexed_and_contiguous(golden):
+    for document in golden.documents:
+        numbers = [p.page_number for p in document.pages]
+        # "page 0" is not something a reader can act on.
+        assert numbers == list(range(1, len(numbers) + 1)), (
+            f"{document.filename} has page numbers {numbers}"
+        )
+
+
 def test_the_per_diem_table_stays_in_one_chunk(golden):
     """The table case is only meaningful if the table is not split.
 
-    acme-perdiem-international is the one case that exercises the
-    chunker's table handling, and it would quietly become a different
-    test -- three unrelated rows in three chunks -- if the table were
-    ever split. Asserted against the real chunker, not assumed.
+    acme-perdiem-international is scored on reaching the International
+    row, and it would quietly become a different test -- three unrelated
+    rows in three chunks -- if the table were ever split. Asserted
+    against the real chunker on the real PDF, not assumed.
     """
     from app.services.chunking import chunk_pages
     from app.services.extraction import Page
 
-    document = next(
-        d for d in golden.documents_for("acme") if d.filename == "travel-policy.md"
-    )
-    parents = chunk_pages([Page(1, document.content)])
+    document = golden.document("acme", "travel-policy.pdf")
+    parents = chunk_pages([Page(p.page_number, p.text) for p in document.pages])
 
     holding = [p for p in parents if "95 USD" in p.content]
     assert holding, "the international per-diem row vanished from every parent"
-    # All three bands in one parent: that is what makes the three rows
-    # competing candidates for the reranker rather than separate chunks.
     assert any(
         "64 USD" in p.content and "79 USD" in p.content and "95 USD" in p.content
         for p in parents
     ), "the per-diem table was split across parents"
+    # And it must be on the page the label claims.
+    assert holding[0].page_number == 2, (
+        f"the per-diem table is on page {holding[0].page_number}, "
+        f"but acme-perdiem-international expects page 2"
+    )
+
+
+def test_the_rollback_code_fence_survives_intact(golden):
+    """A code fence split mid-command is worse than no answer.
+
+    acme-rollback-command scores on "acmectl rollback" reaching the
+    user. The command spans a continuation line, so a chunker that split
+    inside the fence would still retrieve and would hand over a command
+    that does not run.
+    """
+    from app.services.chunking import chunk_pages
+    from app.services.extraction import Page
+
+    document = golden.document("acme", "engineering-runbook.pdf")
+    parents = chunk_pages([Page(p.page_number, p.text) for p in document.pages])
+
+    holding = [p for p in parents if "acmectl rollback" in p.content]
+    assert holding, "the rollback command vanished"
+    parent = holding[0]
+    assert parent.page_number == 2
+    # Both halves of the command, and the fence that contains them.
+    assert "--service api" in parent.content
+    assert "--cluster prod-eu" in parent.content
+    assert parent.content.count("```") >= 2, "the code fence was left unclosed"
+
+    # The child that carries it must carry all of it, since children are
+    # what actually get embedded and searched.
+    carriers = [
+        c
+        for p in parents
+        for c in p.children
+        if "acmectl rollback" in c.content
+    ]
+    assert carriers, "no CHILD chunk carries the command, so it cannot be retrieved"
+    assert any("--cluster prod-eu" in c.content for c in carriers), (
+        "the command was split across children mid-invocation"
+    )
+
+
+def test_expect_pages_point_at_pages_that_contain_the_support(golden):
+    """Enforced by the loader; asserted against the REAL set here.
+
+    A label naming the wrong page would score a correct citation as
+    wrong, which looks like a retrieval bug and is not one.
+    """
+    checked = 0
+    for question in golden.questions:
+        if not question.expect_pages or not question.expect_phrases:
+            continue
+        for filename in question.expect_documents:
+            document = golden.document(question.org, filename)
+            for number in question.expect_pages:
+                page = document.page(number)
+                if page is None:
+                    continue
+                text = page.text.lower()
+                assert any(p in text for p in question.expect_phrases), (
+                    f"{question.id}: none of {list(question.expect_phrases)} is on "
+                    f"{filename} p{number}"
+                )
+                checked += 1
+    assert checked >= 5, f"only {checked} page/phrase pairs checked"
+
+
+def test_synthesis_cases_are_scored_by_rubric_not_substring(golden):
+    """Synthesis cases must use a rubric.
+
+    A bare forbidden substring cannot tell "the CFO is required" from
+    "the CFO is not required", and that distinction IS the question.
+    """
+    synthesis = golden.by_category("synthesis")
+    assert synthesis, "no synthesis cases"
+    for case in synthesis:
+        assert case.rubric, f"{case.id}: synthesis case without a rubric"
+        assert case.rubric.get("must_mention"), f"{case.id}: rubric has no must_mention"
+        assert not case.forbid_phrases, (
+            f"{case.id}: uses forbid_phrases, which is the blunt check this "
+            f"category exists to avoid"
+        )
+
+
+def test_an_unknown_field_is_rejected(tmp_path):
+    # The worst golden-set rot: `expect_page` (singular) parses fine,
+    # validates fine, and silently disables the page check -- so the
+    # case reports a pass it never earned.
+    body = VALID_ENTRY + "    expect_page: [1]\n"
+    with pytest.raises(GoldenSetError, match="unknown field"):
+        _load(tmp_path, body)
+
+
+def test_an_ambiguous_case_without_an_ambiguity_is_rejected(tmp_path):
+    body = VALID_ENTRY.replace("should_answer: true", "should_answer: false")
+    body = body.replace('    expect_phrases: ["thirty days"]\n', "")
+    body = body.replace("category: answerable_direct", "category: ambiguous")
+    with pytest.raises(GoldenSetError, match="must state the 'ambiguity'"):
+        _load(tmp_path, body)

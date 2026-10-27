@@ -26,3 +26,7 @@ venv/
 # never committed, but the directory must exist for the backend to work.
 uploads/*
 !uploads/.gitkeep
+
+# Eval run artefacts: regenerate with `python -m eval.calibrate`.
+# Committing them would turn every run into a diff of live model output.
+eval/results.json

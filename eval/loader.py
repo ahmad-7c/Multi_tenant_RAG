@@ -5,33 +5,72 @@ only worth what its labels are worth, and the ways it silently rots are
 boring: a question referencing a document that was renamed, a duplicate
 id quietly overwriting an earlier case, an `expect_phrases` that does
 not actually occur in the corpus (so the case can never pass however
-good the system gets), or a `should_answer: false` carrying
-expect_phrases (which asks for a refusal to contain words).
+good the system gets), an `expect_pages` pointing at a page where the
+answer is not.
 
 None of those are caught by running the eval -- they make it report a
 number that looks fine. So they are errors here, loudly, before any
 scoring code sees the data.
+
+PDF documents are read through the REAL pipeline (extract -> clean), not
+a text sidecar. That is deliberate: the page numbers a citation must
+resolve to are whatever PyMuPDF produces, and the text a phrase must be
+found in is whatever survives header/footer stripping. Validating
+against anything else would validate a fiction.
 """
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import yaml
+
+from app.services.cleaning import clean_pages
+from app.services.extraction import extract_pages
 
 EVAL_ROOT = os.path.dirname(os.path.abspath(__file__))
 GOLDEN_DIR = os.path.join(EVAL_ROOT, "golden")
 CORPUS_DIR = os.path.join(GOLDEN_DIR, "corpus")
 QUESTIONS_PATH = os.path.join(GOLDEN_DIR, "questions.yaml")
 
-CATEGORIES = {
+# Types that count toward the confidence gate's precision/recall.
+GATE_SCORED = {
     "answerable_direct",
     "answerable_needs_rerank",
-    "answerable_multi_fact",
+    "synthesis",
     "unanswerable_near",
     "unanswerable_off_topic",
     "cross_org_isolation",
     "follow_up",
 }
+
+# Excluded from the gate score and reported on its own. A case whose
+# correct answer is genuinely arguable cannot discipline a threshold:
+# whichever way the gate decides, the "error" is in the label. Keeping
+# them in the set is still worth it -- they are exactly the cases a
+# future reader should re-litigate -- but averaging them into a
+# precision figure launders a judgement call into a number.
+GATE_EXCLUDED = {"ambiguous"}
+
+CATEGORIES = GATE_SCORED | GATE_EXCLUDED
+
+KNOWN_FIELDS = {
+    "id",
+    "org",
+    "question",
+    "should_answer",
+    "category",
+    "why",
+    "expect_documents",
+    "expect_pages",
+    "expect_phrases",
+    "forbid_phrases",
+    "rubric",
+    "ambiguity",
+    "history",
+}
+
+TEXT_SUFFIXES = (".md", ".txt")
+PDF_SUFFIXES = (".pdf",)
 
 
 class GoldenSetError(Exception):
@@ -39,11 +78,31 @@ class GoldenSetError(Exception):
 
 
 @dataclass(frozen=True)
+class GoldenPage:
+    page_number: int
+    text: str
+
+
+@dataclass(frozen=True)
 class GoldenDocument:
     org: str
     filename: str
     path: str
-    content: str
+    pages: tuple[GoldenPage, ...]
+
+    @property
+    def content(self) -> str:
+        return "\n\n".join(page.text for page in self.pages)
+
+    @property
+    def is_pdf(self) -> bool:
+        return self.filename.lower().endswith(PDF_SUFFIXES)
+
+    def page(self, number: int) -> Optional[GoldenPage]:
+        for page in self.pages:
+            if page.page_number == number:
+                return page
+        return None
 
 
 @dataclass(frozen=True)
@@ -57,9 +116,17 @@ class GoldenQuestion:
     expect_documents: tuple[str, ...] = ()
     expect_phrases: tuple[str, ...] = ()
     forbid_phrases: tuple[str, ...] = ()
-    # Prior turns, for the follow-up cases. Each is {role, content} and
-    # optionally {kind}, matching what history_for_rewrite consumes.
+    # Pages a citation must resolve to. Only meaningful for PDFs, where
+    # a wrong page is a wrong citation even when the text is right.
+    expect_pages: tuple[int, ...] = ()
+    # Structured check for synthesis cases, where a bare forbidden
+    # substring is too blunt (see eval/scoring.py).
+    rubric: Optional[dict] = None
     history: tuple[dict, ...] = ()
+
+    @property
+    def counts_toward_gate(self) -> bool:
+        return self.category in GATE_SCORED
 
     @property
     def is_isolation_case(self) -> bool:
@@ -77,17 +144,50 @@ class GoldenSet:
     def documents_for(self, org: str) -> tuple[GoldenDocument, ...]:
         return tuple(d for d in self.documents if d.org == org)
 
+    def document(self, org: str, filename: str) -> GoldenDocument:
+        for d in self.documents:
+            if d.org == org and d.filename == filename:
+                return d
+        raise KeyError(f"{org}/{filename}")
+
     def questions_for(self, org: str) -> tuple[GoldenQuestion, ...]:
         return tuple(q for q in self.questions if q.org == org)
 
     def by_category(self, category: str) -> tuple[GoldenQuestion, ...]:
         return tuple(q for q in self.questions if q.category == category)
 
+    def gate_scored(self) -> tuple[GoldenQuestion, ...]:
+        return tuple(q for q in self.questions if q.counts_toward_gate)
+
     def get(self, question_id: str) -> GoldenQuestion:
         for q in self.questions:
             if q.id == question_id:
                 return q
         raise KeyError(question_id)
+
+
+def _load_document(org: str, path: str, filename: str) -> GoldenDocument:
+    if filename.lower().endswith(PDF_SUFFIXES):
+        with open(path, "rb") as handle:
+            data = handle.read()
+        # The real pipeline, so expect_pages is validated against the
+        # page numbers a citation will actually carry, and expect_phrases
+        # against the text that survives header/footer stripping.
+        pages = clean_pages(extract_pages(data, filename))
+    else:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+        # Markdown and text have no page concept; extraction assigns a
+        # single synthetic page 1 and so do we, rather than inventing
+        # page breaks the format does not have.
+        pages = [type("P", (), {"page_number": 1, "text": text})()]
+
+    return GoldenDocument(
+        org=org,
+        filename=filename,
+        path=path,
+        pages=tuple(GoldenPage(p.page_number, p.text) for p in pages),
+    )
 
 
 def load_corpus(corpus_dir: str = CORPUS_DIR) -> tuple[GoldenDocument, ...]:
@@ -100,20 +200,16 @@ def load_corpus(corpus_dir: str = CORPUS_DIR) -> tuple[GoldenDocument, ...]:
         if not os.path.isdir(org_dir):
             continue
         for filename in sorted(os.listdir(org_dir)):
-            if not filename.endswith((".md", ".txt")):
+            if not filename.endswith(TEXT_SUFFIXES + PDF_SUFFIXES):
                 continue
-            path = os.path.join(org_dir, filename)
-            with open(path, encoding="utf-8") as handle:
-                documents.append(
-                    GoldenDocument(
-                        org=org,
-                        filename=filename,
-                        path=path,
-                        content=handle.read(),
-                    )
-                )
+            documents.append(
+                _load_document(org, os.path.join(org_dir, filename), filename)
+            )
     if not documents:
-        raise GoldenSetError(f"no corpus documents found under {corpus_dir}")
+        raise GoldenSetError(
+            f"no corpus documents found under {corpus_dir}. "
+            f"PDFs are generated: run `python -m eval.build_corpus`"
+        )
     return tuple(documents)
 
 
@@ -132,28 +228,39 @@ def load_golden_set(
     _require(isinstance(raw, dict) and "questions" in raw,
              f"{questions_path} must be a mapping with a 'questions' key")
 
-    by_org_files = {}
+    by_org: dict[str, dict[str, GoldenDocument]] = {}
     for document in documents:
-        by_org_files.setdefault(document.org, {})[document.filename] = document
+        by_org.setdefault(document.org, {})[document.filename] = document
 
     questions: list[GoldenQuestion] = []
     seen_ids: set[str] = set()
 
     for index, entry in enumerate(raw["questions"]):
-        where = entry.get("id") or f"entry #{index + 1}"
+        where = (entry or {}).get("id") or f"entry #{index + 1}"
         _require(isinstance(entry, dict), f"{where}: not a mapping")
 
         for required in ("id", "org", "question", "should_answer", "category", "why"):
             _require(required in entry, f"{where}: missing required field '{required}'")
 
         question_id = entry["id"]
+
+        # Unknown fields are an ERROR, not ignored. A typo'd key is the
+        # worst kind of golden-set rot: `expect_page: [2]` (singular)
+        # parses fine, validates fine, and silently disables the page
+        # check -- so the case reports a pass it never earned.
+        unknown_fields = set(entry) - KNOWN_FIELDS
+        _require(
+            not unknown_fields,
+            f"{question_id}: unknown field(s) {sorted(unknown_fields)}; "
+            f"known: {sorted(KNOWN_FIELDS)}",
+        )
         _require(question_id not in seen_ids,
                  f"duplicate question id '{question_id}' -- ids are referenced by "
                  f"result files, so a duplicate silently overwrites a case")
         seen_ids.add(question_id)
 
         org = entry["org"]
-        _require(org in by_org_files,
+        _require(org in by_org,
                  f"{question_id}: org '{org}' has no corpus under {corpus_dir}")
 
         category = entry["category"]
@@ -169,30 +276,36 @@ def load_golden_set(
 
         expect_documents = tuple(entry.get("expect_documents") or ())
         for filename in expect_documents:
-            # The rot this catches: a document gets renamed and every
-            # case referencing it starts scoring zero recall against a
-            # file that does not exist.
             _require(
-                filename in by_org_files[org],
+                filename in by_org[org],
                 f"{question_id}: expect_documents references '{filename}', which "
-                f"is not in org '{org}' ({sorted(by_org_files[org])})",
+                f"is not in org '{org}' ({sorted(by_org[org])})",
             )
 
         expect_phrases = tuple(str(p).lower() for p in (entry.get("expect_phrases") or ()))
         forbid_phrases = tuple(str(p).lower() for p in (entry.get("forbid_phrases") or ()))
+        expect_pages = tuple(int(p) for p in (entry.get("expect_pages") or ()))
+        rubric = entry.get("rubric")
+
+        if category == "ambiguous":
+            _require(
+                "ambiguity" in entry and str(entry["ambiguity"]).strip(),
+                f"{question_id}: an ambiguous case must state the 'ambiguity' -- "
+                f"what exactly the corpus leaves open. Without it the category is "
+                f"a place to hide cases that merely fail.",
+            )
 
         if should_answer:
             _require(expect_documents,
                      f"{question_id}: should_answer is true but no expect_documents, "
                      f"so retrieval recall is unmeasurable for it")
-            _require(expect_phrases,
-                     f"{question_id}: should_answer is true but no expect_phrases, "
-                     f"so 'answered' could not be distinguished from 'answered wrongly'")
-            # A phrase that occurs nowhere can never be produced from
-            # grounded context, so the case would be permanently
-            # unpassable -- and would look like a model failure.
+            _require(expect_phrases or rubric,
+                     f"{question_id}: should_answer is true but has neither "
+                     f"expect_phrases nor a rubric, so 'answered' could not be "
+                     f"distinguished from 'answered wrongly'")
+
             corpus_text = " ".join(
-                by_org_files[org][name].content.lower() for name in expect_documents
+                by_org[org][name].content.lower() for name in expect_documents
             )
             for phrase in expect_phrases:
                 _require(
@@ -205,6 +318,43 @@ def load_golden_set(
             _require(not expect_phrases,
                      f"{question_id}: should_answer is false but expect_phrases is "
                      f"set; a refusal cannot be required to contain content words")
+
+        # expect_pages must name real pages, and the support must really
+        # be on them -- otherwise a correct citation would score as wrong.
+        if expect_pages:
+            _require(expect_documents,
+                     f"{question_id}: expect_pages without expect_documents is "
+                     f"meaningless -- a page number belongs to a document")
+            for page_number in expect_pages:
+                found_on = []
+                for filename in expect_documents:
+                    document = by_org[org][filename]
+                    page = document.page(page_number)
+                    if page is None:
+                        continue
+                    found_on.append(filename)
+                    if expect_phrases:
+                        page_text = page.text.lower()
+                        _require(
+                            any(phrase in page_text for phrase in expect_phrases),
+                            f"{question_id}: expect_pages says page {page_number} of "
+                            f"'{filename}', but none of {list(expect_phrases)} appears "
+                            f"there -- a correct citation would be scored wrong",
+                        )
+                _require(
+                    found_on,
+                    f"{question_id}: page {page_number} does not exist in any of "
+                    f"{list(expect_documents)}",
+                )
+
+        if rubric is not None:
+            _require(isinstance(rubric, dict), f"{question_id}: rubric must be a mapping")
+            unknown = set(rubric) - {"must_mention", "must_not_assert"}
+            _require(not unknown,
+                     f"{question_id}: unknown rubric keys {sorted(unknown)}")
+            _require(rubric.get("must_mention"),
+                     f"{question_id}: a rubric needs must_mention, otherwise it "
+                     f"only says what the answer must avoid")
 
         history = tuple(entry.get("history") or ())
         for turn in history:
@@ -232,6 +382,8 @@ def load_golden_set(
                 expect_documents=expect_documents,
                 expect_phrases=expect_phrases,
                 forbid_phrases=forbid_phrases,
+                expect_pages=expect_pages,
+                rubric=rubric,
                 history=history,
             )
         )
@@ -240,20 +392,62 @@ def load_golden_set(
 
 
 def summarise(golden: GoldenSet) -> str:
-    lines = [
-        f"{len(golden.documents)} documents across {len(golden.orgs())} orgs: "
-        f"{', '.join(golden.orgs())}",
-        f"{len(golden.questions)} questions",
-    ]
-    answerable = sum(1 for q in golden.questions if q.should_answer)
-    lines.append(
-        f"  should_answer=true : {answerable}"
-        f"   should_answer=false: {len(golden.questions) - answerable}"
-    )
+    lines: list[str] = []
+
+    lines.append("corpus")
+    for org in golden.orgs():
+        docs = golden.documents_for(org)
+        for document in docs:
+            kind = "pdf" if document.is_pdf else "text"
+            lines.append(
+                f"  {org:8} {document.filename:28} {kind:5} "
+                f"{len(document.pages)} page(s)"
+            )
+
+    lines.append("")
+    lines.append(f"questions: {len(golden.questions)}")
+
+    lines.append("")
+    lines.append("per type")
     for category in sorted(CATEGORIES):
-        count = len(golden.by_category(category))
-        if count:
-            lines.append(f"  {category:24} {count}")
+        cases = golden.by_category(category)
+        if not cases:
+            continue
+        answerable = sum(1 for q in cases if q.should_answer)
+        scored = "scored" if category in GATE_SCORED else "EXCLUDED from gate score"
+        lines.append(
+            f"  {category:24} {len(cases):3}  "
+            f"(answer={answerable}, refuse={len(cases) - answerable})  {scored}"
+        )
+
+    lines.append("")
+    lines.append("per org")
+    for org in golden.orgs():
+        cases = golden.questions_for(org)
+        answerable = sum(1 for q in cases if q.should_answer)
+        lines.append(
+            f"  {org:24} {len(cases):3}  "
+            f"(answer={answerable}, refuse={len(cases) - answerable})"
+        )
+
+    lines.append("")
+    lines.append("per org x type")
+    for org in golden.orgs():
+        for category in sorted(CATEGORIES):
+            count = sum(
+                1 for q in golden.questions if q.org == org and q.category == category
+            )
+            if count:
+                lines.append(f"  {org:10} {category:24} {count:3}")
+
+    scored = golden.gate_scored()
+    answerable = sum(1 for q in scored if q.should_answer)
+    lines.append("")
+    lines.append(
+        f"gate-scored: {len(scored)} "
+        f"(answer={answerable}, refuse={len(scored) - answerable}); "
+        f"excluded: {len(golden.questions) - len(scored)}"
+    )
     return "\n".join(lines)
 
 

@@ -19,37 +19,45 @@
 #   org             which tenant ASKS (isolation cases ask as globex)
 #   question        the user's literal text
 #   should_answer   true = must answer; false = must refuse via the gate
-#   expect_documents  filenames that contain the support (retrieval recall)
+#   expect_documents  filenames that contain the support
+#   expect_pages    page(s) a citation must resolve to (PDFs)
 #   expect_phrases  substrings the answer must contain, lowercased
-#   forbid_phrases  substrings that indicate a hallucination or a leak
+#   forbid_phrases  blunt substring ban; right for leak detection only
+#   rubric          must_mention / must_not_assert, negation-aware
+#   ambiguity       REQUIRED for category `ambiguous`: what is unclear
 #   category        see eval/README.md
 #   why             why this case is here; the reason to keep or cut it
 
 questions:
 
-  # ---- answerable, support is one unambiguous passage ---------------
+  # ================================================================
+  # answerable, support is one unambiguous passage
+  # ================================================================
   - id: acme-expense-window
     org: acme
     question: How long do I have to submit an expense report?
     should_answer: true
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [1]
     expect_phrases: ["thirty days"]
     category: answerable_direct
     why: >
       The baseline. If this fails, nothing else in the set is
       interpretable -- it is one sentence, lexically close to the
-      question, in a small corpus.
+      question, in a small corpus. Also the simplest page-number check:
+      the support is on page 1 of a 4-page PDF.
 
   - id: acme-receipt-threshold
     org: acme
     question: When do I need to provide an itemised receipt?
     should_answer: true
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [1]
     expect_phrases: ["25"]
     category: answerable_direct
     why: >
-      Numeric answer. Checks the number survives chunking and reranking
-      rather than being paraphrased away.
+      Numeric answer. Checks the number survives PDF extraction and
+      chunking rather than being paraphrased away.
 
   - id: acme-password-length
     org: acme
@@ -72,24 +80,56 @@ questions:
     expect_phrases: ["hardware", "key"]
     category: answerable_direct
     why: >
-      Answer lives in a DIFFERENT document from the travel questions, so
+      Answer lives in a different document from the travel questions, so
       a retrieval bug that always returns the largest document shows up
       here rather than hiding.
 
-  # ---- answerable, but the right chunk competes with similar ones ----
+  - id: acme-rollback-command
+    org: acme
+    question: What command rolls the api service back to the previous revision?
+    should_answer: true
+    expect_documents: [engineering-runbook.pdf]
+    expect_pages: [2]
+    expect_phrases: ["acmectl rollback"]
+    category: answerable_direct
+    why: >
+      The support is inside a fenced CODE BLOCK on page 2 of a 4-page
+      PDF. Exercises the chunker's code handling end to end -- a code
+      fence split mid-command would still retrieve, and would hand the
+      user a command that does not run.
+
+  # ================================================================
+  # answerable, but the right chunk competes with similar ones
+  # ================================================================
   - id: acme-perdiem-international
     org: acme
     question: What is the daily meal per-diem for international travel?
     should_answer: true
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [2]
     expect_phrases: ["95"]
     category: answerable_needs_rerank
     why: >
       The support is a TABLE ROW, and the three bands are lexically
       near-identical, so a bi-encoder scores all of them alike. This is
-      the case the cross-encoder is paid for. Also the only case that
-      exercises the chunker's table handling, which keeps a table in one
-      block.
+      the case the cross-encoder is paid for. Also pins the page: the
+      table is on page 2, and citing page 1 or 3 would send a reader to
+      the wrong part of the policy.
+
+  - id: acme-prod-deploy-approvals
+    org: acme
+    question: How many engineers must approve a production deploy?
+    should_answer: true
+    expect_documents: [engineering-runbook.pdf]
+    expect_pages: [3]
+    expect_phrases: ["two engineers"]
+    category: answerable_needs_rerank
+    why: >
+      Two passages compete: page 1 says "a second engineer must approve
+      the release checklist", page 3's table says production needs "two
+      engineers". The table row is the precise answer and sits on a
+      different page, so a wrong pick is visible as a wrong page number
+      rather than only as softer wording.
 
   - id: acme-password-rotation
     org: acme
@@ -103,46 +143,63 @@ questions:
       The honest answer contradicts the industry prior. A model leaning
       on pretraining says "every 90 days"; the corpus says rotation is
       required only after a suspected compromise. The forbid_phrases are
-      the actual test -- this is ungrounded-answer detection, not recall.
+      the actual test -- this is ungrounded-answer detection, not recall,
+      and a blunt substring ban is correct here because none of those
+      phrases could come from this corpus at all.
 
-  # ---- answerable only by combining two statements -------------------
+  # ================================================================
+  # synthesis: answerable only by combining or discriminating rules
+  # Reported separately, retrieval and generation split, because a
+  # failure here can mean "did not retrieve both rules" or "retrieved
+  # both and reasoned wrongly" -- different bugs with different fixes.
+  # ================================================================
   - id: acme-approval-7000
     org: acme
     question: Who needs to approve a 7,000 USD expense report?
     should_answer: true
-    expect_documents: [travel-policy.md]
-    expect_phrases: ["finance"]
-    forbid_phrases: ["cfo"]
-    category: answerable_multi_fact
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [3]
+    rubric:
+      must_mention: ["finance"]
+      must_not_assert: ["cfo"]
+    category: synthesis
     why: >
       7,000 appears nowhere in the corpus. Answering needs the 5,000
       manager threshold AND the above-5,000 finance rule, while NOT
-      pulling in the 25,000 CFO rule. Tests whether the answer is
-      reasoned from the context or pattern-matched to the nearest
-      number.
+      claiming the 25,000 CFO rule applies. Scored with a rubric, not a
+      forbidden substring: "finance review is required, CFO approval is
+      not" is a CORRECT answer that a substring ban on "cfo" would have
+      failed. See eval/scoring.py.
 
   - id: acme-business-class-6h
     org: acme
     question: Can I book business class for a six hour flight?
     should_answer: true
-    expect_documents: [travel-policy.md]
-    expect_phrases: ["cfo"]
-    category: answerable_multi_fact
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [4]
+    rubric:
+      must_mention: ["cfo"]
+      must_not_assert: ["premium economy is permitted"]
+    category: synthesis
     why: >
       The trap is premium economy's eight-hour rule, which is adjacent
       and nearly answers it. Business class needs CFO approval
-      regardless of duration, so a correct answer must not apply the
-      eight-hour threshold to the wrong cabin.
+      regardless of duration, so a correct answer must not transfer the
+      eight-hour threshold to the wrong cabin. Here the CFO is the
+      required mention, the inverse of acme-approval-7000 -- so a model
+      that simply always names the CFO cannot pass both.
 
-  # ---- topically adjacent, but genuinely unanswerable ---------------
+  # ================================================================
+  # topically adjacent, but genuinely unanswerable
   # The highest-value class in this file. Retrieval WILL return a
   # high-similarity chunk for each, so a threshold tuned only against
   # off-topic questions passes all of them.
+  # ================================================================
   - id: acme-mileage-motorcycle
     org: acme
     question: What is the mileage reimbursement rate for a motorcycle?
     should_answer: false
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
     category: unanswerable_near
     why: >
       There IS a mileage section and it will retrieve strongly, but it
@@ -155,38 +212,81 @@ questions:
     org: acme
     question: Is the per-diem rate reduced on weekends and non-travel days?
     should_answer: false
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
     category: unanswerable_near
     why: >
       The per-diem table retrieves perfectly and contains no weekend
       dimension at all. A model that treats "retrieved the per-diem
       section" as "can answer per-diem questions" fails here.
 
-  - id: acme-mfa-contractors
+  - id: acme-mileage-exact-rate
     org: acme
-    question: Does the MFA requirement apply to external contractors?
+    question: What is the exact cents-per-mile mileage rate this year?
     should_answer: false
-    expect_documents: [security-policy.md]
+    expect_documents: [travel-policy.pdf]
     category: unanswerable_near
     why: >
-      "MFA is mandatory for all staff" is one word away from answering
-      it. Whether a contractor is staff is exactly what the corpus does
-      not say, and guessing either way is a policy invention.
+      A clean omission: the policy defers to "the published federal
+      rate" and never states a number. The retrieved chunk is the
+      precise right chunk, and it still cannot answer. Tempting failure
+      is to supply a real-world IRS figure from pretraining, which would
+      be ungrounded and also wrong next January.
 
-  - id: acme-lost-phone
+  - id: acme-deploy-friday
     org: acme
-    question: How quickly do I have to report a lost phone?
+    question: Can I deploy to production on a Friday afternoon?
     should_answer: false
-    expect_documents: [security-policy.md]
+    expect_documents: [engineering-runbook.pdf]
     category: unanswerable_near
     why: >
-      The four-hour rule covers LAPTOPS ("all laptops must have
-      full-disk encryption... lost or stolen devices"). Whether "device"
-      extends to a phone is unstated. Borderline on purpose -- flag it
-      if you read the scope as broader, because this is a label worth
-      disagreeing about.
+      The window is "Tuesday through Thursday, 09:00 to 16:00 UTC",
+      which strongly implies no but never says what happens on a Friday
+      or whether an exception exists. Retrieval is perfect; the
+      inference is the model's, not the corpus's. Deliberately the
+      sharpest near-miss in the set: a reasonable human might argue the
+      answer IS implied, which is why the label is "refuse" rather than
+      a guess dressed as policy.
 
-  # ---- plainly off topic --------------------------------------------
+  - id: acme-rollback-migrations-how
+    org: acme
+    question: How do I revert a database migration after a rollback?
+    should_answer: false
+    expect_documents: [engineering-runbook.pdf]
+    category: unanswerable_near
+    why: >
+      The runbook says explicitly that a rollback does NOT revert
+      migrations and that reverting one is "a separate, manual change" --
+      then never describes the procedure. The corpus names the gap in
+      so many words, so an answer here is pure invention.
+
+  - id: acme-oncall-weekend-rota
+    org: acme
+    question: Who is on call at the weekend and how is the rota decided?
+    should_answer: false
+    expect_documents: [engineering-runbook.pdf]
+    category: unanswerable_near
+    why: >
+      The escalation section covers timings (five, ten, twenty minutes)
+      and roles (primary, secondary, manager) but says nothing about how
+      the rota is set or whether weekends differ. Retrieves strongly on
+      "on call" while answering a different question than the one asked.
+
+  - id: acme-staging-secrets
+    org: acme
+    question: Where are staging secrets stored?
+    should_answer: false
+    expect_documents: [engineering-runbook.pdf]
+    category: unanswerable_near
+    why: >
+      "Staging mirrors production configuration except for secrets" is
+      one clause away from the answer and will retrieve top-ranked on
+      the word "secrets". It states that secrets DIFFER, not where they
+      live. A model that answers has filled in a storage location from
+      nowhere -- a security-relevant invention.
+
+  # ================================================================
+  # plainly off topic -- the control for the near-misses above
+  # ================================================================
   - id: acme-parental-leave
     org: acme
     question: How many weeks of paid parental leave do I get?
@@ -211,9 +311,9 @@ questions:
       this is answered, the gate is not working at all rather than
       merely mis-tuned.
 
-  # ---- cross-tenant isolation ---------------------------------------
-  # Same questions, asked by the org whose corpus does NOT contain the
-  # answer. A leak here is a security finding, not a quality one.
+  # ================================================================
+  # cross-tenant isolation -- a leak here is a security finding
+  # ================================================================
   - id: globex-asks-expense-window
     org: globex
     question: How long do I have to submit an expense report?
@@ -250,7 +350,9 @@ questions:
       everything for globex" would score perfectly on isolation --
       this is what makes the pair falsifiable.
 
-  # ---- follow-ups that only resolve against history -----------------
+  # ================================================================
+  # follow-ups that only resolve against history
+  # ================================================================
   - id: acme-followup-above-that
     org: acme
     question: What about above that?
@@ -260,7 +362,8 @@ questions:
         content: Who approves an expense report for 3,000 USD?
       - role: assistant
         content: A direct manager approves expense reports up to 5,000 USD [1].
-    expect_documents: [travel-policy.md]
+    expect_documents: [travel-policy.pdf]
+    expect_pages: [3]
     expect_phrases: ["finance"]
     category: follow_up
     why: >
@@ -288,3 +391,49 @@ questions:
       question absorbs the refusal's phrasing and that string becomes
       both the retrieval query and the cache key. Pins the STEP 3
       message-kind work end to end rather than at the unit level.
+
+  # ================================================================
+  # ambiguous: EXCLUDED from gate precision/recall, reported alone
+  # The corpus genuinely leaves these open, so whichever way the gate
+  # decides, the "error" is in the label. Kept because they are the
+  # cases a future reader should re-litigate -- but averaging them into
+  # a precision figure would launder a judgement call into a number.
+  # ================================================================
+  - id: acme-lost-phone
+    org: acme
+    question: How quickly do I have to report a lost phone?
+    should_answer: false
+    expect_documents: [security-policy.md]
+    category: ambiguous
+    ambiguity: >
+      The four-hour reporting rule is written inside the device-
+      encryption section, whose subject is laptops, but the sentence
+      itself says "lost or stolen devices". Whether a phone is a
+      "device" under that heading is unstated. Labelled refuse on the
+      reading that the section scopes the sentence; a reader who scopes
+      it by the sentence's own wording would label it answer. If this is
+      reclassified as answerable, acme-mfa-contractors must flip too, to
+      stay consistent -- both turn on how far a general noun carries
+      past its heading.
+    why: >
+      Retained as a documented disagreement rather than silently
+      resolved. The point of the ambiguous bucket is that a threshold
+      should never be tuned to win an argument about scope.
+
+  - id: acme-mfa-contractors
+    org: acme
+    question: Does the MFA requirement apply to external contractors?
+    should_answer: false
+    expect_documents: [security-policy.md]
+    category: ambiguous
+    ambiguity: >
+      "MFA is mandatory for all staff" is one word from answering it.
+      Whether an external contractor counts as "staff" is exactly what
+      the corpus does not define. Labelled refuse because inventing the
+      scope of a security control is the more expensive error, but a
+      reader who treats "all staff" as "everyone with access" would
+      label it answer.
+    why: >
+      Paired with acme-lost-phone: both are scope questions about a
+      general noun, so they should be judged the same way. Reported
+      separately so a gate is never credited or blamed for them.
