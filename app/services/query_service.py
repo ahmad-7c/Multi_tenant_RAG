@@ -160,7 +160,17 @@ async def prepare_query(
     # which is which. Getting this wrong returns a valid vector in the
     # wrong part of the space -- nothing errors, answers are just quietly
     # worse.
-    [query_vector] = embedder.embed([rewritten], task=EmbeddingTask.QUERY)
+    def _embed_query():
+        return embedder.embed([rewritten], task=EmbeddingTask.QUERY)
+
+    # Off the event loop, like the two DB calls below. embed() is
+    # SYNCHRONOUS -- a blocking httpx POST, preceded by RateLimiter's
+    # time.sleep() -- so calling it inline here stalled the whole loop
+    # for the duration: every other in-flight request, every other
+    # user's stream, stopped mid-token. Up to EMBED_TIMEOUT_SECONDS of it
+    # in the worst case, and nothing in a test would have noticed,
+    # because a fake embedder returns instantly.
+    [query_vector] = await run_blocking(_embed_query)
 
     def _retrieve():
         # Own session, opened and closed inside the worker thread: a
