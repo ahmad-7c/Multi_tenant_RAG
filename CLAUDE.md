@@ -45,9 +45,11 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. Free-provider migration in progress (STEP 3 of 7
-done).** 439 tests green against real Postgres + pgvector, no network.
-Migrations verified `downgrade base` -> `head` through 0005.
+**PHASES 1-3 COMPLETE. Free-provider migration: STEPS 1-6 of 7 done;
+STEP 7 (live smoke test) PARTLY done -- Gemini legs verified live, the
+Cohere leg is blocked on a missing key.** 487 tests green against real
+Postgres + pgvector, no network. Migrations verified
+`downgrade base` -> `head` through 0005.
 
 ### Free-provider migration (Gemini + Cohere)
 Goal: move off OpenAI/Anthropic onto Gemini (embeddings + answers) and a
@@ -187,8 +189,158 @@ before this** -- every provider test injects a fake client, the
   tie-break (works for existing rows) plus migration 0007 moving the
   column default to `clock_timestamp()` (fixes it at the source for new
   rows).
-- STEPS 4-7 pending: Cohere reranker, connection pool, `prepare_query`
-  threading test, live smoke test.
+- **STEP 4 done - Cohere v2 reranker.** `HostedReranker` existed but had
+  never met a real API.
+  - Wire format checked against the published v2 contract rather than
+    remembered: `documents` is a list of STRINGS (v1's document objects
+    are a 400), per-document truncation is `max_tokens_per_doc` (v1
+    called it `max_chunks_per_doc`), at most 1000 documents. The limit
+    is now sent explicitly so a provider changing its own default cannot
+    change what the cross-encoder actually read.
+  - Typed failures replace one blanket `except Exception`. Every failure
+    still ends in the same place (RRF fallback, answer anyway), so the
+    type cannot change what the USER gets -- it changes what the
+    OPERATOR gets. 429 -> `RerankerRateLimitError`, transient, warning.
+    401/403 -> `RerankerAuthError`; 400/404/422 -> `RerankerRequestError`
+    -- both permanent, and both **trip a breaker**: ERROR logged exactly
+    once, and every later query skips the network instead of paying
+    latency to fail identically. That was the real bug: a bad key
+    degraded to RRF silently, and because `used_fallback` OPENS the
+    confidence gate, every answer afterwards was built on uncalibrated
+    RRF scores with one WARNING to show for it.
+  - A malformed body is `RerankerProtocolError` and deliberately does
+    NOT trip the breaker: a proxy error page and a wrong base URL arrive
+    looking identical, and only one of them resolves on its own.
+  - **Blank documents are filtered before sending** (one of them is a
+    400 for the whole query) through a PARALLEL list, because a returned
+    index refers to the list as submitted -- filtering without remapping
+    would attach scores to the wrong chunks, in a plausible-looking
+    order, with the citations following them. Duplicate and non-integer
+    indices (bool is an int subclass, and `True` indexes position 1) are
+    rejected too.
+  - **No client-side throttle**, unlike embedding's `RateLimiter`.
+    Reranking runs inside a user request with a 3s budget; a trial key's
+    10 req/min means 6s spacing, which would guarantee the timeout the
+    throttle was meant to avoid. Throttling is right for ingestion,
+    where wall-clock is free, and wrong here.
+  - `rerank-v3.5` kept as the model: 4k context is irrelevant for
+    125-token children. NB the v5.0 line advertises **calibrated**
+    relevance scores, which is what would make `CONFIDENCE_THRESHOLD` a
+    meaningful absolute threshold rather than a guess -- worth revisiting
+    when Phase 4 calibrates the gate.
+- **STEP 5 done - one shared HTTP connection pool.** Every provider was
+  building its own client per call, and a client owns a connection pool,
+  so a client per call is a pool per call -- which is no pool at all:
+  a fresh TCP connection and TLS handshake (2-3 round trips) before any
+  payload moved, on every embedding batch, every rerank and every
+  answer.
+  - `app/core/http.py`. Two pools, because there are two execution
+    contexts: `httpx.AsyncClient` for the API process (LLM, reranker),
+    `httpx.Client` for the Celery worker (embeddings).
+  - **The async registry is keyed by the RUNNING LOOP, not a module
+    global.** An AsyncClient's pooled connections belong to the loop
+    that opened them, so a bare global works perfectly in production
+    (one loop, forever) and raises "Event loop is closed" under
+    pytest-asyncio, which builds a loop per test -- invisible where it
+    matters, baffling where you debug. `WeakKeyDictionary` rather than
+    `id(loop)` because CPython reuses `id()` after collection, which
+    would hand a new loop a pool belonging to a dead one.
+  - **Timeouts moved onto the REQUEST, not the client.** The reranker
+    gets 3s and the LLM 30s, so a client-level timeout would force one
+    pool per timeout value and undo the sharing. The client keeps a
+    never-None backstop (None means "wait forever" in httpx), and a test
+    pins that the LLM still passes its own -- otherwise a configured
+    `LLM_TIMEOUT_SECONDS=60` would be silently capped at the pool
+    default with every streaming test still green.
+  - Lifecycle: the FastAPI lifespan closes the loop's client on
+    shutdown; `worker_process_init` **drops** (never closes) any pool
+    inherited across fork, since prefork forks after importing task
+    modules and two processes writing into one TLS socket interleave
+    their bytes. Closing there would tear down the parent's connections.
+  - 9 fake-client signatures needed `timeout=None`: they are INJECTED
+    clients, and a fake that would not accept it turned every call into
+    a `TypeError` the provider classified as an upstream failure -- 47
+    tests failed without one of them mentioning a timeout.
+- **STEP 6 done - the query embedding no longer blocks the event loop.**
+  `prepare_query` threaded both of its DB calls through `run_blocking`
+  and then called `embedder.embed(...)` inline. `embed()` is
+  SYNCHRONOUS -- a blocking httpx POST preceded by
+  `RateLimiter.acquire()`'s `time.sleep` -- so it froze the whole API
+  process for its duration: not slowing the question being asked, but
+  stopping every other user's stream mid-token, for up to
+  `EMBED_TIMEOUT_SECONDS` in the worst case.
+  - Nothing in the suite could have caught it, which is the more useful
+    half: every test injects a fake embedder that returns instantly, so
+    "blocking" had no observable consequence. The new tests pin the
+    dispatch (a flag set only inside `run_blocking`), the worker-thread
+    identity, and the consequence (a ticker that keeps counting through
+    a real `time.sleep(0.3)`). All four were confirmed to FAIL against
+    the inline call before being committed.
+  - NOT fixed by making `embed()` async: the same method is called from
+    the synchronous Celery task, which would then need an event loop per
+    batch -- and `asyncio.run()` per batch would defeat STEP 5's pool
+    outright, since a new loop gets a new pooled client every time.
+
+### STEP 7 - the live run (Gemini verified, Cohere blocked)
+`scripts/smoke_live.py`, run deliberately and never from pytest. Legs:
+`config`, `models`, `embed`, `answer`, `rerank`. Each leg is one request
+(two where the point is comparing two responses); nothing loops, because
+Gemini's free tier counts requests per minute and a Cohere trial key
+allows 10 rerank req/min and 1000 calls a month. It reports keys as
+"present (NN chars)" and never prints one.
+
+**Measured against the real API:**
+- `models` leg: 60 models visible to this key. `gemini-embedding-001`
+  and `gemini-3.5-flash-lite` are both present, so the configured names
+  are right for THIS project (availability is per-project -- the 2.5
+  line is restricted for new projects).
+- **`supportedGenerationMethods` is INCOMPLETE and must not be trusted.**
+  `gemini-3.5-flash-lite` lists only `generateContent`, `countTokens`,
+  `createCachedContent`, `batchGenerateContent` -- no
+  `streamGenerateContent` -- and yet `:streamGenerateContent?alt=sse`
+  streams correctly. The `models` leg deliberately does not check for
+  it; doing so would reject a model that works.
+- `embed` leg PASSES: 1536 dims as requested via
+  `outputDimensionality`, unit norm (our own L2 normalization), and
+  **`taskType` is genuinely honoured** -- the same sentence embedded as
+  RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY gives cosine **0.8813**, not
+  1.0. That is the asymmetric-retrieval decision confirmed rather than
+  assumed; had Gemini ignored the parameter the vectors would have been
+  identical and the whole choice a no-op that errors nowhere.
+- `answer` leg PASSES: a grounded answer streamed in 2 chunks and cited
+  `[1]` correctly, through the real `build_prompt` output (1123-char
+  system, 412-char user), not a hand-written prompt.
+- **Thinking: measured, and NOT a problem for this workload.** The model
+  metadata says `"thinking": true`, which raised three concerns --
+  reasoning eating the 1024-token `LLM_MAX_TOKENS`, latency before the
+  first visible token, and `thought` parts leaking into the answer.
+  Measured on a grounded prompt: TTFT **2.89s**, total 2.98s,
+  `thoughtsTokenCount` absent, **zero** thought parts. Gemini does not
+  return thought parts unless `thinkingConfig.includeThoughts` is set,
+  so the leak is latent, not live. `thinkingBudget: 0` is **rejected
+  with a 400** on this model, so disabling thinking is not even an
+  available lever.
+  - Still latent and worth knowing: `llm.py` concatenates every part's
+    `text` with no `thought` filter (two places). Harmless today
+    because those parts are not sent; it would become an answer-
+    corrupting bug the moment anyone enables `includeThoughts`.
+- **Observed live: the first attempt intermittently fails with a
+  connection-level error classified `LLMTimeoutError`, and the single
+  pre-first-token retry absorbs it.** That is STEP 3's retry doing
+  exactly its job. But the log said only "(LLMTimeoutError)", which
+  cannot distinguish a read stalled for 30s from a connection refused in
+  20ms -- the same class, nothing else in common. The retry warning now
+  carries the cause message too, with a test pinning that the API key
+  never appears in it (auth rides the `x-goog-api-key` header, never the
+  URL, which is the only reason logging httpx messages is safe).
+
+**Blocked:** the `rerank` leg SKIPs -- `RERANKER_API_KEY` is absent, so
+the Cohere path has still never run against a real API. `.env` also
+still has `EMBEDDING_PROVIDER=fake` / `LLM_PROVIDER=fake`, so the smoke
+script constructs the Gemini providers directly rather than through
+`get_embedding_provider()`; a fake default must not be able to turn "the
+live smoke test passed" into "the fakes still work". A full end-to-end
+run through the HTTP API (upload -> ingest -> ask) has NOT been done.
 
 Phase 3 modules:
 - `retrieval.py` - one org-scoped path: HNSW cosine + Postgres FTS on

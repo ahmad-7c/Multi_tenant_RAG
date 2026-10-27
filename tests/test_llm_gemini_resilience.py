@@ -334,3 +334,53 @@ async def test_a_stream_that_is_entirely_malformed_still_reports_empty(caplog):
             await _collect(_llm(client))
 
     assert [r for r in caplog.records if "unparseable" in r.getMessage()]
+
+
+async def test_the_retry_warning_names_the_cause_not_just_the_class(caplog):
+    """A log line that says only "(LLMTimeoutError)" is not diagnosable.
+
+    LLMTimeoutError covers a read that stalled for the full 30s AND a
+    connection refused in 20ms. They are the same class and have nothing
+    else in common, so the class alone cannot tell an operator which one
+    happened -- which is exactly the hole hit while running the live
+    smoke test, where a first attempt failed and the log could not say
+    why.
+    """
+    async def _sleep(seconds):
+        return None
+
+    client = _SequencedClient(
+        [([], 429), ([_frame("ok"), _frame(finish_reason="STOP")], 200)]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.services.llm"):
+        await _collect(_retrying(client, max_retries=1, sleep=_sleep))
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    retry_lines = [m for m in warnings if "failed before first token" in m]
+    assert retry_lines, "no retry warning was logged"
+    # The class AND the message the provider gave us.
+    assert "LLMRateLimitError" in retry_lines[0]
+    assert "429" in retry_lines[0]
+
+
+async def test_the_retry_warning_never_logs_the_api_key(caplog):
+    """Logging exception text is only safe while the key stays out of it.
+
+    The key rides the x-goog-api-key HEADER, never the URL, so an httpx
+    message cannot contain it. This test is what keeps that true: move
+    auth to ?key= and the retry warning starts writing the key into
+    every log aggregator downstream.
+    """
+    async def _sleep(seconds):
+        return None
+
+    client = _SequencedClient(
+        [([], 503), ([_frame("ok"), _frame(finish_reason="STOP")], 200)]
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="app.services.llm"):
+        await _collect(_retrying(client, max_retries=1, sleep=_sleep))
+
+    for record in caplog.records:
+        assert SECRET not in record.getMessage()

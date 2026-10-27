@@ -440,11 +440,18 @@ class GeminiLLM(LLMProvider):
                         f"while backing off"
                     ) from exc
 
+                # The CAUSE, not just the class. "(LLMTimeoutError)"
+                # alone cannot distinguish a read that stalled for 30s
+                # from a connection refused in 20ms -- they are the same
+                # class here and have nothing else in common. The key
+                # rides a header, never the URL, so an httpx message is
+                # safe to log; a test pins that.
                 logger.warning(
-                    "llm call %s failed before first token (%s); "
+                    "llm call %s failed before first token (%s: %s); "
                     "retry %s/%s in %.2fs",
                     request_id,
                     type(exc).__name__,
+                    exc,
                     attempt + 1,
                     self._max_retries,
                     delay,
