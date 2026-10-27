@@ -304,10 +304,16 @@ class GeminiEmbeddings(EmbeddingProvider):
             if self._client is not None:
                 response = self._client.post(self._url, json=payload, headers=headers)
             else:
-                import httpx
+                # The process-wide pooled client, not a fresh one per
+                # batch. A client per call is a connection pool per call:
+                # a 400-chunk document paid a TLS handshake on every one
+                # of its 7 batches. Timeout rides the REQUEST so the pool
+                # stays shared with providers on other budgets.
+                from app.core.http import get_sync_client
 
-                with httpx.Client(timeout=self._timeout) as client:
-                    response = client.post(self._url, json=payload, headers=headers)
+                response = get_sync_client().post(
+                    self._url, json=payload, headers=headers, timeout=self._timeout
+                )
             response.raise_for_status()
             body = response.json()
         except Exception as exc:

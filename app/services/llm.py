@@ -501,8 +501,17 @@ class GeminiLLM(LLMProvider):
             # which bounds a single read rather than the call.
             async with asyncio.timeout_at(deadline):
                 try:
+                    # timeout on the REQUEST, not on the client: the
+                    # client is shared with providers whose budgets
+                    # differ (the reranker gets 3s), and a client-level
+                    # value would silently override LLM_TIMEOUT_SECONDS
+                    # with the pool's backstop.
                     stream_cm = client.stream(
-                        "POST", url, json=payload, headers=self._headers
+                        "POST",
+                        url,
+                        json=payload,
+                        headers=self._headers,
+                        timeout=self._timeout,
                     )
                 except Exception as exc:
                     raise _classify_http(exc) from exc
@@ -618,7 +627,9 @@ class GeminiLLM(LLMProvider):
 
         client, close = await self._acquire_client()
         try:
-            response = await client.post(url, json=payload, headers=self._headers)
+            response = await client.post(
+                url, json=payload, headers=self._headers, timeout=self._timeout
+            )
             response.raise_for_status()
             body = response.json()
         except Exception as exc:
@@ -642,15 +653,18 @@ class GeminiLLM(LLMProvider):
         """Return (client, close_or_None).
 
         An injected client belongs to the caller and must not be closed
-        here; one we create must be.
+        here. Neither must the SHARED pooled one -- closing it would tear
+        down the connection pool every other request is using, which is
+        the opposite of pooling. Hence the second element is now always
+        None, kept so the caller's `finally` needs no change and so an
+        implementation that does own its client can still say so.
         """
         if self._client is not None:
             return self._client, None
 
-        import httpx
+        from app.core.http import get_async_client
 
-        client = httpx.AsyncClient(timeout=self._timeout)
-        return client, client.aclose
+        return get_async_client(), None
 
 
 class FakeLLM(LLMProvider):

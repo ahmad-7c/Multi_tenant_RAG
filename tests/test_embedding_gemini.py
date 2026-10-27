@@ -49,8 +49,10 @@ class _FakeHttpClient:
         self._raises = raises
         self.requests: list[dict] = []
 
-    def post(self, url, *, json, headers):
-        self.requests.append({"url": url, "json": json, "headers": headers})
+    def post(self, url, *, json, headers, timeout=None):
+        self.requests.append(
+            {"url": url, "json": json, "headers": headers, "timeout": timeout}
+        )
         if self._raises is not None:
             raise self._raises
         return _FakeResponse(self._payload, self._status)

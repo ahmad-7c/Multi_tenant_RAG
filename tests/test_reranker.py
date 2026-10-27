@@ -193,8 +193,10 @@ class _FakeHttpClient:
         self._status = status
         self.requests: list[dict] = []
 
-    async def post(self, url, *, json, headers):
-        self.requests.append({"url": url, "json": json, "headers": headers})
+    async def post(self, url, *, json, headers, timeout=None):
+        self.requests.append(
+            {"url": url, "json": json, "headers": headers, "timeout": timeout}
+        )
         return _FakeResponse(self._payload, self._status)
 
 

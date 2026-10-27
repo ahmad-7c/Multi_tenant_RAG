@@ -59,7 +59,7 @@ class _ScriptedClient(_FakeAsyncClient):
         self._script = list(script)
         self.attempts = 0
 
-    def stream(self, method, url, *, json, headers):
+    def stream(self, method, url, *, json, headers, timeout=None):
         self.stream_calls.append({"url": url, "json": json, "headers": headers})
         self.attempts += 1
         lines, status, delay, hdrs = self._script.pop(0)
@@ -268,7 +268,7 @@ class _DropsMidStreamResponse(_ScriptedResponse):
 
 
 class _DropsMidStreamClient(_ScriptedClient):
-    def stream(self, method, url, *, json, headers):
+    def stream(self, method, url, *, json, headers, timeout=None):
         self.stream_calls.append({"url": url, "json": json, "headers": headers})
         self.attempts += 1
         if self.attempts == 1:

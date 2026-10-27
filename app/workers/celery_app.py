@@ -1,6 +1,8 @@
 from celery import Celery
+from celery.signals import worker_process_init
 
 from app.core.config import settings
+from app.core.http import reset_sync_client
 
 celery_app = Celery(
     "documind",
@@ -65,3 +67,17 @@ celery_app.conf.update(
     # leak instead of letting a long-lived worker grow unbounded.
     worker_max_tasks_per_child=settings.CELERY_MAX_TASKS_PER_CHILD,
 )
+
+
+@worker_process_init.connect
+def _reset_http_pool(**_kwargs):
+    """Give every forked child its own connection pool.
+
+    The prefork pool forks AFTER importing the task modules, so anything
+    the parent opened is inherited as shared file descriptors. Two
+    processes writing into one TLS socket interleave their bytes and both
+    connections break in ways that look like provider flakiness. Dropping
+    the reference here (not closing it -- the parent still needs those
+    fds) makes the child build its own on first use.
+    """
+    reset_sync_client()

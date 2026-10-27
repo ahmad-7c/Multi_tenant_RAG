@@ -64,8 +64,10 @@ class _FakeClient:
         self._responses = list(responses)
         self.requests: list[dict] = []
 
-    async def post(self, url, *, json, headers):
-        self.requests.append({"url": url, "json": json, "headers": headers})
+    async def post(self, url, *, json, headers, timeout=None):
+        self.requests.append(
+            {"url": url, "json": json, "headers": headers, "timeout": timeout}
+        )
         item = self._responses.pop(0) if len(self._responses) > 1 else self._responses[0]
         if isinstance(item, Exception):
             raise item

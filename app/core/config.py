@@ -133,6 +133,25 @@ class Settings(BaseSettings):
     # config bump turning every query into a 400, not a live constraint.
     RERANKER_MAX_DOCUMENTS: int = 1000
 
+    # ---- HTTP connection pool -------------------------------------------
+    # Shared across every provider call. Small on purpose: the pool caps
+    # in-flight provider requests, and on a free tier the per-minute
+    # request quota binds long before the socket count does.
+    HTTP_MAX_CONNECTIONS: int = 20
+    HTTP_MAX_KEEPALIVE_CONNECTIONS: int = 10
+    # Below the idle timeout of a typical provider load balancer (60s+).
+    # A pooled connection the far end has already dropped is worse than
+    # none: the next request spends its budget finding out the socket is
+    # dead. Expiring ours first keeps that off the user's query.
+    HTTP_KEEPALIVE_EXPIRY_SECONDS: float = 30.0
+    # Connect is split from read because they mean different things: a
+    # hanging connect is a dead endpoint and should fail fast, a slow
+    # read is a model thinking.
+    HTTP_CONNECT_TIMEOUT_SECONDS: float = 5.0
+    # Backstop only -- every provider passes its own per-request timeout.
+    # Never None, which in httpx means "wait forever".
+    HTTP_DEFAULT_TIMEOUT_SECONDS: float = 30.0
+
     # ---- Extraction -----------------------------------------------------
     # A scanned PDF extracts to almost nothing. Below this mean
     # chars-per-page we refuse the document with a "needs OCR" error rather

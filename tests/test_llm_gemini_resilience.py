@@ -50,9 +50,15 @@ class _SlowClient(_FakeAsyncClient):
         super().__init__(lines=lines)
         self._delay = delay
 
-    def stream(self, method, url, *, json, headers):
+    def stream(self, method, url, *, json, headers, timeout=None):
         self.stream_calls.append(
-            {"method": method, "url": url, "json": json, "headers": headers}
+            {
+                "method": method,
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+            }
         )
         return _SlowStreamResponse(self._lines, self._delay)
 
@@ -106,9 +112,15 @@ class _SequencedClient(_FakeAsyncClient):
         self._responses = list(responses)
         self.attempts = 0
 
-    def stream(self, method, url, *, json, headers):
+    def stream(self, method, url, *, json, headers, timeout=None):
         self.stream_calls.append(
-            {"method": method, "url": url, "json": json, "headers": headers}
+            {
+                "method": method,
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+            }
         )
         self.attempts += 1
         lines, status = self._responses.pop(0)

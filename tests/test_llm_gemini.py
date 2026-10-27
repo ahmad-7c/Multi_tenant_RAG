@@ -82,15 +82,21 @@ class _FakeAsyncClient:
         self.stream_calls: list[dict] = []
         self.post_calls: list[dict] = []
 
-    def stream(self, method, url, *, json, headers):
+    def stream(self, method, url, *, json, headers, timeout=None):
         self.stream_calls.append(
-            {"method": method, "url": url, "json": json, "headers": headers}
+            {
+                "method": method,
+                "url": url,
+                "json": json,
+                "headers": headers,
+                "timeout": timeout,
+            }
         )
         if self._raises is not None:
             raise self._raises
         return _FakeStreamResponse(self._lines, self._status)
 
-    async def post(self, url, *, json, headers):
+    async def post(self, url, *, json, headers, timeout=None):
         self.post_calls.append({"url": url, "json": json, "headers": headers})
         if self._raises is not None:
             raise self._raises
@@ -437,3 +443,21 @@ def test_gemini_provider_requires_a_key(monkeypatch):
             llm_module.get_llm()
     finally:
         llm_module.get_llm.cache_clear()
+
+
+async def test_the_per_read_timeout_rides_the_request_not_the_client():
+    """LLM_TIMEOUT_SECONDS must reach httpx on the request itself.
+
+    The client is now shared from a connection pool, and the pool sets a
+    client-level timeout as a backstop for callers that pass none. If the
+    provider stopped passing its own, a configured LLM_TIMEOUT_SECONDS of
+    60 would be silently capped at the pool's default -- with every other
+    streaming test still green, because a fake client has no timeout
+    behaviour of its own to contradict it.
+    """
+    client = _FakeAsyncClient(lines=['data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}'])
+    provider = _llm(client)
+
+    await _collect(provider, system="s", user="u")
+
+    assert client.stream_calls[0]["timeout"] == 10.0

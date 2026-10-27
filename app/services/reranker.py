@@ -361,10 +361,19 @@ class HostedReranker(Reranker):
                     self._base_url, json=payload, headers=headers
                 )
             else:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.post(
-                        self._base_url, json=payload, headers=headers
-                    )
+                # The shared pooled client. Not `async with`: that would
+                # close the pool the LLM and the embedder are using. The
+                # 3-second budget rides the request instead of the
+                # client, which is what lets one pool serve providers
+                # whose timeouts differ by 10x.
+                from app.core.http import get_async_client
+
+                response = await get_async_client().post(
+                    self._base_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._timeout,
+                )
         except httpx.TimeoutException as exc:
             # httpx timeouts are NOT TimeoutError subclasses, so without
             # this they reach the caller's generic handler and get logged

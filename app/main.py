@@ -5,6 +5,7 @@ from fastapi import FastAPI
 
 from app.api.v1.routes import auth, conversations, documents, users
 from app.core.config import settings
+from app.core.http import aclose_async_client
 from app.db.session import SessionLocal
 from app.services.embedding import (
     EmbeddingModelMismatch,
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup checks.
+    """Startup checks, and shutdown of the shared connection pool.
 
     The embedding-model guard runs ONCE here rather than per request.
     That is sufficient, not a shortcut: the only way stored vectors can
@@ -50,6 +51,11 @@ async def lifespan(app: FastAPI):
         db.close()
 
     yield
+
+    # Shutdown. Closes the pooled AsyncClient for this loop so in-flight
+    # keepalive connections are released deliberately rather than at
+    # interpreter exit, where httpx can only warn about them.
+    await aclose_async_client()
 
 
 app = FastAPI(title="DocuMind", version="0.1.0", lifespan=lifespan)
