@@ -45,11 +45,21 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. Free-provider migration: STEPS 1-6 of 7 done;
-STEP 7 (live smoke test) PARTLY done -- Gemini legs verified live, the
-Cohere leg is blocked on a missing key.** 487 tests green against real
-Postgres + pgvector, no network. Migrations verified
-`downgrade base` -> `head` through 0005.
+**PHASES 1-3 COMPLETE. Free-provider migration COMPLETE: all 7 steps
+done and verified against the real APIs, including one full end-to-end
+run through the HTTP API.** 487 tests green against real Postgres +
+pgvector with no network (the suite is now pinned offline by
+construction). Migrations verified `downgrade base` -> `head` through
+0005; dev DB is at 0007.
+
+`.env` is now LIVE: `EMBEDDING_PROVIDER=gemini`, `LLM_PROVIDER=gemini`,
+`RERANKER_PROVIDER=hosted`. A backup of the pre-live file is at
+`.env.backup-pre-live`. The test suite is unaffected either way -- see
+the offline guard in `tests/conftest.py`.
+
+Next: Phase 4/5 remain out of scope. `CONFIDENCE_THRESHOLD` calibration
+is the first Phase 4 task, and there is now one real data point for it
+(below).
 
 ### Free-provider migration (Gemini + Cohere)
 Goal: move off OpenAI/Anthropic onto Gemini (embeddings + answers) and a
@@ -334,13 +344,63 @@ allows 10 rerank req/min and 1000 calls a month. It reports keys as
   never appears in it (auth rides the `x-goog-api-key` header, never the
   URL, which is the only reason logging httpx messages is safe).
 
-**Blocked:** the `rerank` leg SKIPs -- `RERANKER_API_KEY` is absent, so
-the Cohere path has still never run against a real API. `.env` also
-still has `EMBEDDING_PROVIDER=fake` / `LLM_PROVIDER=fake`, so the smoke
-script constructs the Gemini providers directly rather than through
-`get_embedding_provider()`; a fake default must not be able to turn "the
-live smoke test passed" into "the fakes still work". A full end-to-end
-run through the HTTP API (upload -> ingest -> ask) has NOT been done.
+- `rerank` leg PASSES against live Cohere v2. Three chunks submitted
+  deliberately mis-ordered, the answer-bearing one last; it came back at
+  **rank 1 with score 0.7400** -- a result passthrough cannot produce by
+  accident, so this exercises the real wire format AND the index remap,
+  not just connectivity. The v2 payload (string documents,
+  `max_tokens_per_doc`) was accepted as written.
+  - **First real calibration data point for `CONFIDENCE_THRESHOLD`.** A
+    clearly-on-topic match scored 0.74 against a default threshold of
+    0.3. One point is not a calibration, but it says the default is at
+    least not absurd, and that the gate's useful range is well below a
+    strong match. Phase 4 needs the other half: what an off-topic
+    question scores.
+- **The key arrived as `COHERE_API_KEY`, which the app did not read.**
+  Settings wanted `RERANKER_API_KEY`, so the key resolved to None, the
+  hosted reranker was never constructed, and reranking was simply OFF --
+  nothing raised, nothing logged. The same silent-degradation class
+  STEP 4 was built to eliminate, one layer up in configuration. Fixed
+  twice over: `RERANKER_API_KEY` now also reads `COHERE_API_KEY` (the
+  canonical name stays provider-neutral because `RERANKER_BASE_URL` is
+  configurable, but COHERE_API_KEY is what a person writes down), and
+  `check_reranker_config()` runs in the lifespan to warn when a key is
+  set while the provider is not `hosted`. `get_reranker()` already
+  failed loudly the obvious way round; the inverse was the silent one.
+- **The suite is now offline BY CONSTRUCTION.** Settings read `.env`,
+  and `.env` is where real keys live -- so flipping
+  `EMBEDDING_PROVIDER=gemini` for this run would have made the next
+  plain `pytest` start billing for network calls through the provider
+  factories. A session fixture in `conftest.py` forces all three
+  providers to `fake` and clears the `lru_cache`s that would otherwise
+  hold a provider built before it ran. Confirmed by runtime: 487 tests,
+  same 150s as before the flip.
+
+### The full end-to-end run (done, live)
+Register -> login -> upload -> Celery ingest -> ask -> cited SSE answer,
+driven over the real HTTP API against live Gemini + live Cohere:
+- Ingestion: a 644-byte markdown policy became **5 parents / 5 children**
+  in **1.05s**, embedded in a **single** `batchEmbedContents` request --
+  so batching holds, and the STEP 5 pool served it.
+- The answer was grounded and cited twice: "Expense reports must be
+  submitted within thirty days of the end of travel [1]. If submitted
+  after this window, you require written approval from a department
+  director [1]." The `citations` event resolved marker 1 to the right
+  document_id, chunk_id, page and snippet.
+- History round-trips in the right order (question above its own
+  answer), which is the `_TURN_ORDER` + migration 0007 fix holding on
+  real rows written in one transaction.
+- DB check: the assistant row carries `kind='answer'` with
+  `cited_chunk_ids` set, and the user row carries `kind=NULL`, exactly
+  as designed.
+- **Noted, not changed:** `MessageResponse` does not expose `kind`, so a
+  client cannot tell a refusal or an error from an answer. The data is
+  right and `list_messages` returns the rows; whether the API should
+  surface the marker is a product decision, not a bug.
+- Harness friction worth remembering: `/auth/register` rejects
+  `.test` email domains (email-validator treats reserved TLDs as
+  invalid), upload returns `document_id` rather than `id`, and Celery on
+  Windows needs `--pool=solo`.
 
 Phase 3 modules:
 - `retrieval.py` - one org-scoped path: HNSW cosine + Postgres FTS on
@@ -381,7 +441,20 @@ choice, and its docstring says so.
 
 Next: Phase 4/5 are explicitly OUT OF SCOPE (eval, rate limiting,
 observability, CI, deploy). CONFIDENCE_THRESHOLD calibration is the first
-Phase 4 task.
+Phase 4 task -- see the 0.74 data point above.
+
+Known gaps carried forward:
+- `llm.py` concatenates every response part's `text` with no `thought`
+  filter (two places). Latent only: Gemini does not send thought parts
+  unless `thinkingConfig.includeThoughts` is set, and `thinkingBudget: 0`
+  is rejected by `gemini-3.5-flash-lite` with a 400. It becomes an
+  answer-corrupting bug the moment anyone enables includeThoughts.
+- `MessageResponse` does not expose `messages.kind`.
+- The reranker breaker clears only on process restart, which is correct
+  for a config fix but means a provider-side 401 that is later resolved
+  still needs a restart.
+- No live test covers a refusal path (safety block, gated no-answer) or
+  cache-hit behaviour end to end.
 
 ## Phase 2 Build Log
 

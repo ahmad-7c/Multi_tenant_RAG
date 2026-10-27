@@ -1,6 +1,11 @@
 # Secrets — .env.example is committed, .env never is.
 .env
 .env.local
+# Any .env.<something> copy. A backup taken before flipping providers to
+# live holds the same real keys the original does, and "it was only
+# temporary" is how a key reaches a public remote.
+.env.*
+!.env.example
 
 # Python
 __pycache__/
