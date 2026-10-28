@@ -630,6 +630,7 @@ def should_answer(
     reranker: Reranker,
     used_fallback: bool,
     threshold: float | None = None,
+    vector_floor: float | None = None,
 ) -> bool:
     """The confidence gate.
 
@@ -644,24 +645,67 @@ def should_answer(
     two index scans, not a full generation over several thousand tokens of
     context.
 
-    CONFIDENCE_THRESHOLD is RERANKER-SPECIFIC and currently a guess. A
-    Cohere rerank-v3.5 score of 0.3 does not mean what a Jina or Voyage
-    0.3 means, and neither is comparable to a local cross-encoder's logit.
-    Calibrating it needs a labelled set of question/should-answer pairs,
-    which is Phase 4 (eval) work. Until then the default is deliberately
-    permissive: a gate that is too tight silently refuses answerable
-    questions, which is harder to notice than an occasional weak answer.
+    CONFIDENCE_THRESHOLD is RERANKER-SPECIFIC and now MEASURED, not
+    guessed: 0.4162 for Cohere rerank-v3.5, chosen by a rule fixed in
+    advance (the midpoint of the widest gap below the lowest answerable
+    score) over 24 labelled cases. See docs/eval-baseline.md. It is
+    still provisional at n=24, and it is NOT transferable -- a Jina or
+    Voyage score of 0.4162 means something else, and a local
+    cross-encoder's logit is not even on the same scale.
+
+    What the measurement also established: no threshold separates the
+    classes. Two should-refuse questions score ABOVE every answerable
+    one, because a cross-encoder measures RELEVANCE and those chunks are
+    maximally relevant to a question they do not answer. The gate is a
+    cheap filter, not a correctness guarantee; what actually declines
+    those two is the grounding instruction in the prompt.
     """
     if not ranked:
         return False
 
     # Uncalibrated scores cannot be compared to the threshold at all. RRF
-    # scores top out around 1/(k+1) ~= 0.016, so testing them against 0.3
-    # would gate EVERY question -- the system would answer nothing. When
-    # the score is not a relevance, having retrieved anything at all is
-    # the only signal available, so the gate opens.
+    # scores top out around 1/(k+1) ~= 0.016, so testing them against
+    # 0.4162 would gate EVERY question -- the system would answer
+    # nothing.
     if used_fallback or not reranker.scores_are_calibrated:
-        return True
+        # But "cannot use the reranker score" is not "have no signal".
+        # Cosine similarity from the vector leg is unaffected by the
+        # reranker being down, and it is calibrated -- measured over the
+        # same 24 cases as the threshold above. Before this, a dead
+        # reranker meant the gate opened unconditionally and the system
+        # answered everything, which is the worst behaviour available
+        # during exactly the incident when nobody is watching quality.
+        #
+        # The floor is deliberately weaker than the reranker threshold:
+        # cosine separates the classes worse (8 false positives vs 3 at
+        # full recall), so this is damage limitation during an outage,
+        # not an equivalent substitute.
+        floor = (
+            settings.VECTOR_SIMILARITY_FLOOR
+            if vector_floor is None
+            else vector_floor
+        )
+        if floor <= 0:
+            # 0 disables it, preserving the old answer-everything
+            # behaviour for anyone who has not calibrated a floor. An
+            # uncalibrated floor applied by default would refuse real
+            # questions on a number nobody measured.
+            return True
+        best = max(
+            (
+                c.candidate.vector_similarity
+                for c in ranked
+                if c.candidate.vector_similarity is not None
+            ),
+            default=None,
+        )
+        if best is None:
+            # Nothing in the ranking came from the vector leg -- a
+            # keyword-only match. No calibrated signal exists, so fall
+            # back to the permissive reading rather than refusing on an
+            # absence of evidence.
+            return True
+        return best >= floor
 
     threshold = settings.CONFIDENCE_THRESHOLD if threshold is None else threshold
     return ranked[0].score >= threshold

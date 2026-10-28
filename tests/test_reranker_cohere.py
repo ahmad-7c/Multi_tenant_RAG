@@ -15,6 +15,7 @@ import pytest
 
 from app.services.reranker import (
     HostedReranker,
+    PassthroughReranker,
     RerankerAuthError,
     RerankerDisabledError,
     RerankerProtocolError,
@@ -411,3 +412,106 @@ def test_health_is_clean_when_nothing_is_degraded(client):
     # No key means no noise: the absence of the field is the healthy
     # signal, so a dashboard can alert on its presence alone.
     assert "degraded" not in body
+
+
+# ---- the vector floor: the gate's other regime ----------------------
+
+
+def _ranked(similarity, *, rrf=0.016):
+    """One RRF-ranked candidate carrying a cosine similarity."""
+    from app.services.reranker import RankedCandidate
+
+    candidate = _candidate("body", rrf=rrf)
+    candidate = Candidate(
+        chunk_id=candidate.chunk_id,
+        parent_id=candidate.parent_id,
+        document_id=candidate.document_id,
+        filename=candidate.filename,
+        page_number=candidate.page_number,
+        content=candidate.content,
+        token_count=candidate.token_count,
+        rrf_score=rrf,
+        vector_rank=1,
+        text_rank=None,
+        vector_similarity=similarity,
+    )
+    return [RankedCandidate(candidate=candidate, score=rrf, rank=1)]
+
+
+async def test_the_floor_refuses_a_weak_match_when_the_reranker_is_down():
+    """The regime this floor exists for.
+
+    Before it, used_fallback=True opened the gate unconditionally: a
+    dead reranker meant the system answered EVERY question, during
+    exactly the incident when nobody is watching answer quality.
+    """
+    reranker = PassthroughReranker()
+    ranked = _ranked(0.55)
+
+    assert (
+        should_answer(ranked, reranker=reranker, used_fallback=True, vector_floor=0.6175)
+        is False
+    )
+
+
+async def test_the_floor_admits_a_strong_match_when_the_reranker_is_down():
+    reranker = PassthroughReranker()
+    ranked = _ranked(0.78)
+
+    assert (
+        should_answer(ranked, reranker=reranker, used_fallback=True, vector_floor=0.6175)
+        is True
+    )
+
+
+async def test_a_floor_of_zero_keeps_the_old_permissive_behaviour():
+    """0 disables it, deliberately.
+
+    An uncalibrated floor applied by default would refuse real questions
+    on a number nobody measured -- worse than the permissive behaviour
+    it replaces, because it fails silently in the other direction.
+    """
+    reranker = PassthroughReranker()
+
+    assert (
+        should_answer(_ranked(0.10), reranker=reranker, used_fallback=True, vector_floor=0.0)
+        is True
+    )
+
+
+async def test_a_keyword_only_match_is_not_refused_for_lacking_a_similarity():
+    """No vector hit means no calibrated signal, not a bad signal.
+
+    A chunk the keyword leg alone returned has no cosine similarity.
+    Refusing it would be refusing on an absence of evidence, and the
+    text leg finding something is still evidence.
+    """
+    reranker = PassthroughReranker()
+
+    assert (
+        should_answer(
+            _ranked(None), reranker=reranker, used_fallback=True, vector_floor=0.6175
+        )
+        is True
+    )
+
+
+async def test_the_floor_does_not_apply_when_the_reranker_worked():
+    """Two regimes, two signals, never mixed.
+
+    With a calibrated reranker score available, the cosine floor is not
+    consulted at all -- it separates the classes worse (8 false
+    positives vs 3 at full recall), so letting it veto a good reranker
+    score would make the gate worse whenever both are present.
+    """
+    client = _FakeClient(_FakeResponse({"results": [{"index": 0, "relevance_score": 0.90}]}))
+    reranker = _reranker(client)
+    ranked = _ranked(0.10)
+
+    assert (
+        should_answer(
+            ranked, reranker=reranker, used_fallback=False, threshold=0.4162,
+            vector_floor=0.6175,
+        )
+        is False
+    ), "a 0.016 RRF score must fail the reranker threshold"

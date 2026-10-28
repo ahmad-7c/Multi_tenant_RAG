@@ -231,7 +231,18 @@ class Settings(BaseSettings):
     RERANK_TOP_N: int = 8
     # Reranker-specific and uncalibrated until Phase 4; see the gate's
     # comment in app/services/reranker.py.
-    CONFIDENCE_THRESHOLD: float = 0.3
+    # MEASURED, not guessed: see docs/eval-baseline.md. Provisional
+    # at n=24, and specific to Cohere rerank-v3.5.
+    CONFIDENCE_THRESHOLD: float = 0.4162
+    # The gate's other regime. When the reranker falls back, scores are
+    # RRF ranks (~0.016 at best) and cannot be compared to the threshold
+    # above -- so the gate used to open unconditionally, meaning a dead
+    # reranker answered EVERYTHING. This floor is the only calibrated
+    # signal still available there: cosine similarity from the vector
+    # leg, which is unaffected by the reranker being down.
+    # Measured on the same 24 cases. 0 disables the floor and keeps
+    # the old answer-everything-on-fallback behaviour.
+    VECTOR_SIMILARITY_FLOOR: float = 0.6175
     CONTEXT_TOKEN_BUDGET: int = 6000
 
     # ---- Cache ----------------------------------------------------------

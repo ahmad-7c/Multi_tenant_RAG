@@ -45,21 +45,66 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. Free-provider migration COMPLETE: all 7 steps
-done and verified against the real APIs, including one full end-to-end
-run through the HTTP API.** 487 tests green against real Postgres +
-pgvector with no network (the suite is now pinned offline by
-construction). Migrations verified `downgrade base` -> `head` through
-0005; dev DB is at 0007.
+**PHASES 1-3 COMPLETE. Free-provider migration COMPLETE (all 7 steps,
+verified against the real APIs including a full end-to-end HTTP run).
+PHASE 4 IN PROGRESS: the gate is now CALIBRATED from measurement, and
+the refusal behaviour is measured end to end.** 554 tests green against
+real Postgres + pgvector with no network (the suite is pinned offline by
+construction). Dev DB at migration 0007.
 
-`.env` is now LIVE: `EMBEDDING_PROVIDER=gemini`, `LLM_PROVIDER=gemini`,
-`RERANKER_PROVIDER=hosted`. A backup of the pre-live file is at
-`.env.backup-pre-live`. The test suite is unaffected either way -- see
-the offline guard in `tests/conftest.py`.
+`.env` is LIVE: `EMBEDDING_PROVIDER=gemini`, `LLM_PROVIDER=gemini`,
+`RERANKER_PROVIDER=hosted`. Backup at `.env.backup-pre-live`. The test
+suite is unaffected either way -- see the offline guard in
+`tests/conftest.py`.
 
-Next: Phase 4/5 remain out of scope. `CONFIDENCE_THRESHOLD` calibration
-is the first Phase 4 task, and there is now one real data point for it
-(below).
+### Phase 4 so far
+- **Golden set** in `eval/` -- 26 questions, 24 gate-scored (12/12
+  balanced), two generated 4-page PDFs (table, fenced code block,
+  running headers/footers), `ambiguous` and `synthesis` types,
+  `expect_pages` validated against real extracted text. Labels are
+  hand-written, never LLM-generated: "is this answerable from the
+  corpus?" is the exact judgement the gate is graded on.
+- **Thresholds applied from measurement**, by a rule fixed in advance
+  (`eval/thresholds.py`): `CONFIDENCE_THRESHOLD = 0.4162`,
+  `VECTOR_SIMILARITY_FLOOR = 0.6175`. Full data and the rule's rationale
+  in `docs/eval-baseline.md`. Both provisional at n=24, both
+  env-overridable, neither transferable to another provider.
+- **The gate's fallback regime now has a signal.** `used_fallback=True`
+  previously opened the gate unconditionally, so a dead reranker
+  answered EVERYTHING -- during exactly the incident when nobody is
+  watching quality. `Candidate.vector_similarity` now carries cosine
+  from the vector leg (free: the leg already computes that distance to
+  order by) and the floor is applied there. A floor of 0 restores the
+  old permissive behaviour, which is the default for anyone who has not
+  calibrated one.
+- **The central finding: the classes OVERLAP and no threshold separates
+  them.** Worst answerable 0.5530 sits below best refusable 0.8730. A
+  cross-encoder scores RELEVANCE, and `acme-rollback-migrations-how`
+  (0.8730) and `acme-deploy-friday` (0.6722) are maximally relevant to
+  questions they do not answer. Reported as *irreducible* rather than
+  averaged away. The gate is a cheap filter, not a correctness
+  guarantee.
+- **What actually refuses the hard cases is the prompt.** With the gate
+  forced open, the model declined 11 of 12 should-refuse questions
+  unaided -- including the 0.8730 case, where it answered "the provided
+  documents do not contain instructions on how to perform that manual
+  change". The one dispute is `acme-deploy-friday` ("No, deploys run
+  Tuesday through Thursday"): an unsupported inference on the stricter
+  reading, SUPPORTED per the judge. Candidate for the `ambiguous`
+  bucket.
+- **`eval/judge.py` judges two axes, not one.** Asked for a single
+  verdict it got both decisive cases wrong -- grading a correct refusal
+  as SUPPORTED, which was true of every claim in it and beside the
+  point. `asserts_answer` and `supported` are now separate and the label
+  is derived. A judge asked for one label answers whichever question is
+  easier.
+- The eval throttles RERANK CALLS, not the loop around them (a Cohere
+  trial key is 10/min, and step 2 made three reranks per case), and uses
+  a 25s reranker budget rather than production's 3s -- a timeout in the
+  eval scores the case on RRF, calibrating the fallback while claiming
+  to calibrate the gate.
+
+Next: Phase 4 steps 3-6 (rate limiting, usage logging, tests).
 
 ### Free-provider migration (Gemini + Cohere)
 Goal: move off OpenAI/Anthropic onto Gemini (embeddings + answers) and a

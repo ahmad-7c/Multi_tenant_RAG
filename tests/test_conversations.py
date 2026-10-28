@@ -813,17 +813,28 @@ async def test_prepared_query_holds_no_orm_objects(db_session, corpus):
         assert not hasattr(block, "_sa_instance_state")
 
 
-async def test_passthrough_reranker_keeps_rrf_order_end_to_end(db_session, corpus):
+async def test_passthrough_reranker_keeps_rrf_order_end_to_end(
+    db_session, corpus, monkeypatch
+):
     org, user, _, _ = corpus
     conversation = _conversation(db_session, org, user)
+
+    # The cosine floor is disabled for this fixture on purpose.
+    # FakeEmbeddings produces deterministic but semantically MEANINGLESS
+    # vectors -- similarity between a question and its answer is
+    # arbitrary there -- so a calibrated floor measured on real Gemini
+    # embeddings cannot say anything about it. Leaving it on would make
+    # this test assert the value of a number that does not apply.
+    # The floor's own behaviour is covered in test_reranker_cohere.py.
+    monkeypatch.setattr(settings, "VECTOR_SIMILARITY_FLOOR", 0.0)
 
     prepared = await _prepare(
         db_session, org, user, conversation, "receipts thirty days",
         reranker=PassthroughReranker(),
     )
 
-    # Uncalibrated scores: the gate must open on "we retrieved something"
-    # rather than compare RRF scores to the threshold.
+    # Uncalibrated RRF scores are never compared to CONFIDENCE_THRESHOLD:
+    # they top out near 0.016 and would refuse everything.
     assert prepared.gated is False
     assert prepared.prompt is not None
 

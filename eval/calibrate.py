@@ -50,10 +50,22 @@ from app.services.cleaning import clean_pages
 from app.services.embedding import EmbeddingTask, get_embedding_provider
 from app.services.extraction import Page, extract_pages
 from app.services.llm import get_llm, get_rewrite_llm
-from app.services.reranker import get_reranker, rerank_with_fallback, map_to_parents
+from app.services.reranker import (
+    Reranker,
+    get_reranker,
+    map_to_parents,
+    rerank_with_fallback,
+)
 from app.services.retrieval import retrieve_candidates
 from eval.loader import GATE_EXCLUDED, load_golden_set, summarise
+from eval.judge import judge_answer
 from eval.scoring import check_citation_pages, check_phrases, check_rubric
+from eval.thresholds import (
+    ScoredCase,
+    confusion,
+    select_threshold,
+)
+from eval.thresholds import score_table as sorted_score_table
 
 RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.json")
 
@@ -72,6 +84,11 @@ DEFAULT_PACE_SECONDS = 7.0
 # claiming to calibrate the gate. Measured in a first pass: 3s timed out
 # on roughly a third of cases.
 DEFAULT_RERANK_TIMEOUT = 25.0
+
+# 10 rerank req/min on a Cohere trial key. 6.5s spacing leaves a
+# little headroom; sitting exactly on a published limit turns every
+# jitter spike into a 429.
+DEFAULT_RERANK_MIN_INTERVAL = 6.5
 
 
 @dataclass
@@ -106,11 +123,79 @@ class CaseResult:
     cache_hit_second_time: bool | None = None
     cache_answer_identical: bool | None = None
 
+    # --- step 2: what the LLM does with the gate FORCED OPEN ---
+    # Collected for every should-refuse case, including those the gate
+    # blocks. Without it, a case the gate catches tells us nothing about
+    # whether the model would also have refused -- and that is the whole
+    # question when deciding if a sufficiency check is needed.
+    forced_answer: str | None = None
+    forced_verdict: str | None = None
+    forced_verdict_reason: str | None = None
+    forced_verdict_deterministic: bool | None = None
+    context_sent: str | None = None
+
     error: str | None = None
 
 
 def log(message: str = "") -> None:
     print(message, flush=True)
+
+
+class ThrottledReranker(Reranker):
+    """Spaces rerank calls to stay under a trial key's per-minute cap.
+
+    Wraps rather than replaces, so the real HostedReranker -- its wire
+    format, its typed errors, its breaker -- is still what gets
+    exercised. Only the timing changes.
+
+    This lives in the EVAL, not in app/. Production deliberately has no
+    reranker throttle: inside a request, waiting 6s to avoid a 429 blows
+    a 3-second budget, and falling back to RRF order in milliseconds is
+    strictly better. A batch job has the opposite trade -- wall-clock is
+    free and a 429 would corrupt the measurement.
+    """
+
+    def __init__(self, inner: Reranker, min_interval: float):
+        self._inner = inner
+        self._min_interval = min_interval
+        self._last: float | None = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def name(self) -> str:
+        return f"throttled:{self._inner.name}"
+
+    @property
+    def scores_are_calibrated(self) -> bool:
+        return self._inner.scores_are_calibrated
+
+    @property
+    def is_disabled(self) -> bool:
+        return getattr(self._inner, "is_disabled", False)
+
+    async def rerank(self, query, candidates, top_n):
+        # The lock makes the spacing real rather than advisory: without
+        # it, two coroutines both read the same `_last` and both decide
+        # they may proceed.
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            if self._last is not None:
+                wait = self._min_interval - (loop.time() - self._last)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+            self._last = asyncio.get_running_loop().time()
+        return await self._inner.rerank(query, candidates, top_n)
+
+
+_RERANKER: Reranker | None = None
+
+
+def eval_reranker() -> Reranker:
+    """One throttled reranker shared by every call in the run."""
+    global _RERANKER
+    if _RERANKER is None:
+        _RERANKER = ThrottledReranker(get_reranker(), RERANK_MIN_INTERVAL)
+    return _RERANKER
 
 
 # ---------------------------------------------------------------- setup ----
@@ -306,7 +391,7 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
     )
 
     embedder = get_embedding_provider()
-    reranker = get_reranker()
+    reranker = eval_reranker()
 
     try:
         # --- phase 1 pieces, run explicitly so the scores are visible ---
@@ -349,13 +434,16 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
             result.retrieval_hit = None
 
         # --- generation, only where an answer gets scored ---
-        wants_generation = generate and (
-            question.should_answer or question.is_isolation_case
-        )
+        # Every case now generates. Step 2 needs the FINAL ANSWER for
+        # should-refuse questions too: "the gate caught it" and "the
+        # system declined" are different claims, and only the second is
+        # what a user experiences.
+        wants_generation = generate
         if wants_generation:
-            answer, citations = await generate_once(
+            answer, citations, context = await generate_once(
                 db, golden, handles, question, rewritten
             )
+            result.context_sent = context
             result.answer = answer
             result.citations = citations
             result.answered = bool(answer) and not answer.startswith(
@@ -400,9 +488,52 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
                             f"CITATION LEAK: {citation.get('document')}"
                         )
 
+            # --- step 2: the same question with the gate FORCED OPEN ---
+            if not question.should_answer:
+                forced, forced_context = await generate_with_gate_open(
+                    db, golden, handles, question
+                )
+                result.forced_answer = forced
+                verdict = await judge_answer(
+                    question=question.question,
+                    context=forced_context or result.context_sent or "",
+                    answer=forced,
+                    llm=get_llm(),
+                )
+                result.forced_verdict = verdict.verdict
+                result.forced_verdict_reason = verdict.reason
+                result.forced_verdict_deterministic = verdict.deterministic
+
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
     return result
+
+
+async def generate_with_gate_open(db, golden, handles, question):
+    """Answer a should-refuse question with the confidence gate disabled.
+
+    The gate is bypassed by lowering CONFIDENCE_THRESHOLD for the call
+    rather than by reconstructing the prompt by hand: the point is to
+    measure the REAL answering path on this context, and a hand-built
+    prompt would measure a prompt that never ships.
+
+    Why this matters for the decision in front of us: if the model
+    declines these unaided, a sufficiency check is redundant work on
+    every request. If it answers them confidently, the gate is the only
+    thing standing between a near-miss and a fabricated policy -- and the
+    gate provably cannot catch all of them, because two of these score
+    above every answerable case.
+    """
+    original = settings.CONFIDENCE_THRESHOLD
+    # Below any possible score, so should_answer always opens.
+    settings.CONFIDENCE_THRESHOLD = -1.0
+    try:
+        answer, _citations, context = await generate_once(
+            db, golden, handles, question, question.question
+        )
+        return answer, context
+    finally:
+        settings.CONFIDENCE_THRESHOLD = original
 
 
 async def generate_once(db, golden, handles, question, rewritten):
@@ -448,7 +579,7 @@ async def generate_once(db, golden, handles, question, rewritten):
         ],
         index_version=index_version,
         embedder=get_embedding_provider(),
-        reranker=get_reranker(),
+        reranker=eval_reranker(),
         rewrite_llm=get_rewrite_llm(),
         cache=cache,
         run_blocking=run_blocking,
@@ -486,6 +617,12 @@ async def generate_once(db, golden, handles, question, rewritten):
         }
         for c in (outcome.citations if outcome else [])
     ]
+    # The context blocks the answerer actually saw. The judge grades
+    # against THIS, not against the corpus: an answer is ungrounded if it
+    # claims something the retrieved context does not state, even when
+    # the corpus says it elsewhere.
+    context = prepared.prompt.user if prepared.prompt is not None else ""
+
     # The AUTHORITATIVE answer, not the raw stream. validate_citations
     # may rewrite marker placement, and the validated text is what the
     # route's final `citations` event sends, what the Message row
@@ -494,13 +631,14 @@ async def generate_once(db, golden, handles, question, rewritten):
     # as a cache "hit" whose answer looked DIFFERENT, when the only
     # difference was that ask 1 was compared against pre-validation text.
     answer = outcome.answer if outcome is not None else "".join(pieces)
-    return answer, citations
+    return answer, citations, context
 
 
 _CACHES: dict[str, InMemoryAnswerCache] = {}
 
-# Set from --rerank-timeout before any case runs.
+# Set from the CLI before any case runs.
 RERANK_TIMEOUT = DEFAULT_RERANK_TIMEOUT
+RERANK_MIN_INTERVAL = DEFAULT_RERANK_MIN_INTERVAL
 
 
 async def probe_cache(db, golden, handles, question) -> tuple[bool, bool, str]:
@@ -538,7 +676,7 @@ async def probe_cache(db, golden, handles, question) -> tuple[bool, bool, str]:
         ],
         index_version=index_version,
         embedder=get_embedding_provider(),
-        reranker=get_reranker(),
+        reranker=eval_reranker(),
         rewrite_llm=get_rewrite_llm(),
         cache=cache,
         run_blocking=run_blocking,
@@ -662,8 +800,9 @@ def score_table(title, results, attr):
 
 
 async def main_async(args) -> int:
-    global RERANK_TIMEOUT
+    global RERANK_TIMEOUT, RERANK_MIN_INTERVAL
     RERANK_TIMEOUT = args.rerank_timeout
+    RERANK_MIN_INTERVAL = args.rerank_interval
     # Also raised on the client itself: rerank_with_fallback's wait_for
     # bounds the operation, but HostedReranker hands its own value to
     # httpx per request, and the smaller of the two wins.
@@ -752,15 +891,26 @@ async def main_async(args) -> int:
         db.close()
         await aclose_async_client()
 
-    report(golden, results, args)
-    with open(RESULTS_PATH, "w", encoding="utf-8") as handle:
-        json.dump([asdict(r) for r in results], handle, indent=2)
-    log()
-    log(f"raw results written to {RESULTS_PATH}")
+    # Written first, on purpose: see the note in main_async.
+    if not args.only:
+        with open(RESULTS_PATH, "w", encoding="utf-8") as handle:
+            json.dump([asdict(r) for r in results], handle, indent=2)
+        log()
+        log(f"raw results written to {RESULTS_PATH} (before reporting, so a")
+        log("reporting bug cannot discard the run)")
+
+    choices = report(golden, results, args)
+    if args.only:
+        # A partial run must not overwrite the full dataset: the
+        # threshold choice and docs/eval-baseline.md are derived from
+        # it, and silently replacing 26 cases with 2 would make both
+        # wrong while still looking like data.
+        log()
+        log("partial run (--only): results.json left untouched")
     return 0
 
 
-def report(golden, results, args) -> None:
+def report(golden, results, args):
     log()
     log("================ RESULTS ================")
 
@@ -932,26 +1082,146 @@ def report(golden, results, args) -> None:
                     f"identical={r.cache_answer_identical}"
                 )
 
-    # ---- the proposal ----
+    # ---- STEP 1: the full sorted lists and the fixed-rule choice ----
+    def scored(attr):
+        return [
+            ScoredCase(
+                id=r.id,
+                category=r.category,
+                score=getattr(r, attr),
+                should_answer=r.should_answer,
+            )
+            for r in results
+            if r.counts_toward_gate
+            and r.error is None
+            and getattr(r, attr) is not None
+        ]
+
     log()
-    log("================ PROPOSAL ================")
-    log(f"    current CONFIDENCE_THRESHOLD = {settings.CONFIDENCE_THRESHOLD}")
-    if best_rerank:
+    log("================ STEP 1: THRESHOLD SELECTION ================")
+
+    choices = {}
+    for label, attr, setting in (
+        ("RERANKER SCORE", "top_rerank_score", "CONFIDENCE_THRESHOLD"),
+        ("VECTOR COSINE", "top_vector_similarity", "VECTOR_SIMILARITY_FLOOR"),
+    ):
+        cases = scored(attr)
+        log()
+        log(sorted_score_table(cases, f"--- {label}: every gate-scored case ---"))
+
+        choice = select_threshold(cases)
+        choices[setting] = (choice, cases)
+
+        log()
+        log(f"  rule: midpoint of the widest gap below the lowest answerable")
+        log(f"        score; fall back to 0.50 if no gap reaches 0.03")
+        log(f"  -> {setting} = {choice.value}")
+        log(f"     {choice.reason}")
+        if choice.irreducible_false_positives:
+            log(
+                f"     IRREDUCIBLE: {len(choice.irreducible_false_positives)} "
+                f"should-refuse case(s) score at or above the lowest answerable "
+                f"score, so NO threshold excludes them without losing a real "
+                f"answer:"
+            )
+            for case_id in choice.irreducible_false_positives:
+                log(f"       {case_id}")
+        matrix = confusion(cases, choice.value)
         log(
-            f"    A) reranker threshold {best_rerank['threshold']:.2f} -> "
-            f"precision {best_rerank['precision']}, recall {best_rerank['recall']}, "
-            f"F1 {best_rerank['f1']:.2f}"
+            f"     at {choice.value}: TP={matrix['tp']} FP={matrix['fp']} "
+            f"TN={matrix['tn']} FN={matrix['fn']} "
+            f"precision={matrix['precision']} recall={matrix['recall']}"
         )
-    if best_cosine:
-        log(
-            f"    B) vector floor      {best_cosine['threshold']:.3f} -> "
-            f"precision {best_cosine['precision']}, recall {best_cosine['recall']}, "
-            f"F1 {best_cosine['f1']:.2f}"
-        )
+
+    # ---- STEP 2: end-to-end refusal, gate AND model ----
     log()
-    log("    Nothing has been changed. Both numbers need a human decision:")
-    log("    F1 weights a wrong answer and a wrong refusal equally, and for a")
-    log("    grounded-answers product they are not equal.")
+    log("================ STEP 2: END-TO-END REFUSAL ================")
+    gate_threshold = choices["CONFIDENCE_THRESHOLD"][0].value
+
+    refuse = [
+        r for r in results
+        if not r.should_answer and r.counts_toward_gate and r.error is None
+    ]
+
+    log()
+    log("  Each should-refuse case, at the chosen threshold.")
+    log("  'gate' = would the confidence gate let it through?")
+    log("  'final' = what the USER ends up with end to end.")
+    log("  'model alone' = what the LLM does with the gate forced open,")
+    log("                  which is the only way to tell whether the gate")
+    log("                  is carrying the refusal or the model is.")
+    log()
+    log(
+        f"    {'case':34} {'score':>7}  {'gate':6} {'final':9} {'model alone':12} why"
+    )
+
+    correct_end_to_end = 0
+    model_declined = 0
+    for r in sorted(refuse, key=lambda x: -(x.top_rerank_score or 0)):
+        passes_gate = (
+            r.top_rerank_score is not None and r.top_rerank_score >= gate_threshold
+        )
+        # End to end: a blocked case gets the canned refusal, so it
+        # declines by construction. A case that passes the gate ends up
+        # with whatever the model said -- which is exactly the forced
+        # answer, since the gate was the only thing in the way.
+        if passes_gate:
+            final_declined = r.forced_verdict == "DECLINED"
+        else:
+            final_declined = True
+        correct_end_to_end += 1 if final_declined else 0
+        model_declined += 1 if r.forced_verdict == "DECLINED" else 0
+
+        log(
+            f"    {r.id:34} {r.top_rerank_score or 0:>7.4f}  "
+            f"{'PASS' if passes_gate else 'block':6} "
+            f"{'declines' if final_declined else 'ASSERTS':9} "
+            f"{(r.forced_verdict or '-'):12} {(r.forced_verdict_reason or '')[:60]}"
+        )
+
+    log()
+    log(
+        f"  end-to-end correct refusal: {correct_end_to_end}/{len(refuse)} "
+        f"({correct_end_to_end / len(refuse) * 100:.0f}%)"
+        if refuse else "  no should-refuse cases"
+    )
+    log(
+        f"  model alone (gate forced open): {model_declined}/{len(refuse)} declined"
+    )
+
+    # The two cases that motivated this step.
+    log()
+    log("  --- the two cases no threshold can catch ---")
+    for case_id in ("acme-rollback-migrations-how", "acme-deploy-friday"):
+        row = next((r for r in results if r.id == case_id), None)
+        if row is None:
+            continue
+        passes_gate = (
+            row.top_rerank_score is not None
+            and row.top_rerank_score >= gate_threshold
+        )
+        log(
+            f"    {case_id}: rerank={row.top_rerank_score:.4f} "
+            f"-> gate {'PASSES it through' if passes_gate else 'blocks it'}"
+        )
+        log(f"      model alone: {row.forced_verdict} ({row.forced_verdict_reason})")
+        if row.forced_answer:
+            log(f"      answer: {row.forced_answer.strip()[:220]}")
+
+    unparseable = [r for r in refuse if r.forced_verdict == "UNPARSEABLE"]
+    if unparseable:
+        log()
+        log(f"  WARNING: the judge returned no usable verdict for "
+            f"{len(unparseable)} case(s); read them by hand:")
+        for r in unparseable:
+            log(f"    {r.id}")
+
+    log()
+    log("    Nothing in app/ has been changed by this run. The chosen")
+    log("    values above are written to docs/eval-baseline.md and applied")
+    log("    to Settings in a separate, reviewable commit.")
+
+    return choices
 
 
 def main() -> int:
@@ -972,6 +1242,12 @@ def main() -> int:
         type=float,
         default=DEFAULT_RERANK_TIMEOUT,
         help="Reranker budget for the EVAL (not production's 3s user budget).",
+    )
+    parser.add_argument(
+        "--rerank-interval",
+        type=float,
+        default=DEFAULT_RERANK_MIN_INTERVAL,
+        help="Minimum seconds between rerank CALLS (a trial key is 10/min).",
     )
     parser.add_argument(
         "--pace",

@@ -58,6 +58,13 @@ class Candidate:
     rrf_score: float
     vector_rank: int | None
     text_rank: int | None
+    # Cosine similarity from the vector leg, or None when only the
+    # keyword leg returned this chunk. Carried because it is the ONLY
+    # calibrated relevance signal that survives the reranker being
+    # down: RRF scores are rank reciprocals, so the confidence gate has
+    # nothing else to threshold in that regime. Free to collect -- the
+    # vector leg already computes this distance to order by.
+    vector_similarity: float | None = None
 
 
 def apply_search_settings(db: Session) -> None:
@@ -124,7 +131,13 @@ def apply_search_settings(db: Session) -> None:
 # planner can prove the partial index applies.
 _VECTOR_SQL = text(
     """
-    SELECT id
+    SELECT id,
+           -- `<=>` is cosine DISTANCE under vector_cosine_ops, so
+           -- similarity is 1 - distance. Selected rather than
+           -- recomputed in Python: this is the exact number the index
+           -- ordered by, and a second computation could disagree with
+           -- it through float rounding.
+           1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
     FROM document_chunks
     WHERE org_id = :org_id
       AND parent_id IS NOT NULL
@@ -232,17 +245,19 @@ def retrieve_candidates(
     # session has pgvector's type adapters registered.
     vector_literal = "[" + ",".join(repr(float(v)) for v in query_embedding) + "]"
 
-    vector_ids = [
-        row[0]
-        for row in db.execute(
-            _VECTOR_SQL,
-            {
-                "org_id": str(org_id),
-                "query_embedding": vector_literal,
-                "per_leg": per_leg,
-            },
-        ).all()
-    ]
+    vector_rows = db.execute(
+        _VECTOR_SQL,
+        {
+            "org_id": str(org_id),
+            "query_embedding": vector_literal,
+            "per_leg": per_leg,
+        },
+    ).all()
+    vector_ids = [row[0] for row in vector_rows]
+    # Keyed by chunk id so a chunk the keyword leg also returned keeps
+    # its similarity, and one only the keyword leg found stays None
+    # rather than being given a number the vector leg never produced.
+    vector_similarity = {row[0]: float(row[1]) for row in vector_rows}
 
     text_ids: list[uuid.UUID] = []
     if query_text and query_text.strip():
@@ -292,6 +307,7 @@ def retrieve_candidates(
                 rrf_score=scores[chunk_id],
                 vector_rank=vector_rank.get(chunk_id),
                 text_rank=text_rank.get(chunk_id),
+                vector_similarity=vector_similarity.get(chunk_id),
             )
         )
     return candidates
