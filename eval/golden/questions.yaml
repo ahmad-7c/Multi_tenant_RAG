@@ -91,7 +91,7 @@ questions:
     expect_documents: [engineering-runbook.pdf]
     expect_pages: [2]
     expect_phrases: ["acmectl rollback"]
-    category: answerable_direct
+    category: code
     why: >
       The support is inside a fenced CODE BLOCK on page 2 of a 4-page
       PDF. Exercises the chunker's code handling end to end -- a code
@@ -108,7 +108,7 @@ questions:
     expect_documents: [travel-policy.pdf]
     expect_pages: [2]
     expect_phrases: ["95"]
-    category: answerable_needs_rerank
+    category: table
     why: >
       The support is a TABLE ROW, and the three bands are lexically
       near-identical, so a bi-encoder scores all of them alike. This is
@@ -123,7 +123,7 @@ questions:
     expect_documents: [engineering-runbook.pdf]
     expect_pages: [3]
     expect_phrases: ["two engineers"]
-    category: answerable_needs_rerank
+    category: table
     why: >
       Two passages compete: page 1 says "a second engineer must approve
       the release checklist", page 3's table says production needs "two
@@ -293,7 +293,8 @@ questions:
     should_answer: false
     expect_documents: []
     forbid_phrases: ["sixteen weeks", "16 weeks"]
-    category: unanswerable_off_topic
+    forbid_phrases: ["sixteen"]
+    category: cross_org_isolation
     why: >
       Acme's corpus has no HR document. The forbid_phrases are Globex's
       actual answer: if that number ever appears here, the org filter
@@ -437,3 +438,214 @@ questions:
       Paired with acme-lost-phone: both are scope questions about a
       general noun, so they should be judged the same way. Reported
       separately so a gate is never credited or blamed for them.
+
+  # ================================================================
+  # Phase 4 expansion: the four retrieval shapes that had no bucket,
+  # plus the refusals and the acme->globex isolation direction needed
+  # to keep the set balanced at n=40.
+  # ================================================================
+
+  # ---- exact_term: a distinctive token that must survive extraction
+  - id: acme-vsr-form-id
+    org: acme
+    question: Which form do I file to start a vendor security review?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [1]
+    expect_phrases: ["vsr-204"]
+    category: exact_term
+    why: >
+      An alphanumeric identifier with a hyphen is the token most likely
+      to be mangled: tokenizers split it, a paraphrasing model drops the
+      number, and a near miss ("the vendor form") reads as correct prose
+      while being useless to someone who has to file it.
+
+  - id: acme-tier3-label
+    org: acme
+    question: What classification tier covers vendor data that cannot leave the Acme network?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [2]
+    expect_phrases: ["tier 3 restricted"]
+    category: exact_term
+    why: >
+      The label is three tokens that must come back together and in
+      order. "Tier 3" alone or "Restricted" alone is the wrong answer to
+      give someone who then has to look up the handling rules, and both
+      partial forms pass a looser check.
+
+  - id: globex-contractor-expiry
+    org: globex
+    question: After how many days do contractor accounts expire?
+    should_answer: true
+    expect_documents: [security-standards.md]
+    expect_phrases: ["ninety"]
+    category: exact_term
+    why: >
+      The only exact-term case asked by globex, and the answerable twin
+      of acme-asks-contractor-expiry. The number is spelled as a word,
+      so a model that returns "90" is not wrong for a reader but IS
+      wrong for a substring check -- a disagreement worth seeing.
+
+  # ---- table: the answer is a cell, not a sentence
+  - id: acme-tier2-retention
+    org: acme
+    question: How long are records kept for a Tier 2 Internal vendor engagement?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [2]
+    expect_phrases: ["5 years"]
+    category: table
+    why: >
+      Requires reading ACROSS a row: the question names the tier in
+      column one and the answer sits in column three. A chunker that
+      split the table mid-row would retrieve plausibly and answer with
+      the wrong retention period, which is the expensive kind of wrong.
+
+  - id: acme-staging-approval-count
+    org: acme
+    question: How many engineers must approve a staging deploy?
+    should_answer: true
+    expect_documents: [engineering-runbook.pdf]
+    expect_pages: [3]
+    expect_phrases: ["one engineer"]
+    category: table
+    why: >
+      The adjacent row says production needs two engineers, so a
+      row-boundary error here does not fail loudly -- it returns the
+      neighbouring cell. Paired with acme-prod-deploy-approvals, which
+      asks for the other row of the same table.
+
+  # ---- code: the answer is inside a fenced block
+  - id: acme-rollback-cluster-flag
+    org: acme
+    question: Which cluster does the documented rollback command target?
+    should_answer: true
+    expect_documents: [engineering-runbook.pdf]
+    expect_pages: [2]
+    expect_phrases: ["prod-eu"]
+    category: code
+    why: >
+      The flag sits on the continuation line of a backslash-wrapped
+      shell command, so it is the part a chunker is most likely to
+      orphan. "prod-eu" also appears in the page 3 table, which is what
+      makes the page check meaningful: citing page 3 would be a real
+      error that a corpus-wide substring check could not see.
+
+  # ---- spans_two_chunks: no single child carries the whole answer
+  #
+  # Verified, not assumed. Page 3 of vendor-security-review.pdf is ONE
+  # 192-token parent under a single heading, split into children of 124
+  # and 127 tokens. Steps 1-4 live only in child 0; steps 7-10 live only
+  # in child 1. Each case below needs one fact from each side, so the
+  # embedded child that retrieves can never contain the whole answer and
+  # only the parent handed to the LLM can.
+  - id: acme-vsr-sponsor-duties
+    org: acme
+    question: What is the business sponsor responsible for during a vendor security review?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [3]
+    rubric:
+      must_mention: ["vsr-204", "conditions"]
+    category: spans_two_chunks
+    why: >
+      Filing the form is step 1 (child 0 only); tracking conditions to
+      closure is step 9 (child 1 only). This is the case that fails if
+      parent-child chunking is quietly reduced to sending the child --
+      and it fails by producing half an answer, which looks complete.
+
+  - id: acme-vsr-questionnaire-to-decision
+    org: acme
+    question: Once the questionnaire comes back, what must happen before a decision is recorded?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [3]
+    rubric:
+      must_mention: ["five business days", "decision"]
+    category: spans_two_chunks
+    why: >
+      The review window is step 4 (child 0 only) and recording the
+      decision is step 8 (child 1 only), with the remediation steps
+      shared in the overlap. An answer drawn from one child is
+      internally consistent and omits a required stage silently.
+
+  - id: acme-vsr-tier3-extra-evidence
+    org: acme
+    question: What extra evidence does a Tier 3 Restricted engagement need that a Tier 1 one does not?
+    should_answer: true
+    expect_documents: [vendor-security-review.pdf]
+    expect_pages: [2, 3]
+    rubric:
+      must_mention: ["penetration test", "tier 1"]
+    category: spans_two_chunks
+    why: >
+      The hardest shape in the set: the tier definition is on page 2 and
+      the extra evidence requirement on page 3, so the support spans two
+      PARENTS, not two children. Retrieval must return both, and the
+      citation must resolve to two pages.
+
+  # ---- unanswerable_near over the new document
+  - id: acme-vendor-payment-terms
+    org: acme
+    question: What payment terms do we agree with approved vendors?
+    should_answer: false
+    expect_documents: [vendor-security-review.pdf]
+    category: unanswerable_near
+    why: >
+      The strongest near miss available: the document is entirely about
+      vendors, names payment schedules explicitly, and says they are
+      owned by procurement. So the retrieved chunk is maximally relevant
+      AND states that the answer is elsewhere. A gate scoring relevance
+      cannot refuse this; only reading the exclusion can.
+
+  - id: acme-vsr-appeal
+    org: acme
+    question: How does a vendor appeal a declined security review?
+    should_answer: false
+    expect_documents: [vendor-security-review.pdf]
+    category: unanswerable_near
+    why: >
+      "Declined" is one of three documented decisions, so the vocabulary
+      of the question is lifted straight from the corpus. What follows a
+      decline is simply absent. A model that treats "found the decision
+      step" as "can describe the process" invents an appeal route a
+      vendor would then try to use.
+
+  - id: globex-laptop-breakage
+    org: globex
+    question: Can I get my laptop replaced early if it breaks?
+    should_answer: false
+    expect_documents: [handbook.md]
+    category: unanswerable_near
+    why: >
+      The handbook gives a four-year replacement cycle and says nothing
+      about failures inside it. Also the only near miss asked by globex,
+      so the bucket is not an acme-only artefact -- a gate tuned on one
+      tenant documents should be shown working on another.
+
+  # ---- isolation, acme -> globex (the direction that was missing)
+  - id: acme-asks-contractor-expiry
+    org: acme
+    question: After how many days do contractor accounts expire?
+    should_answer: false
+    forbid_phrases: ["ninety"]
+    category: cross_org_isolation
+    why: >
+      The twin of globex-contractor-expiry, asked by the other tenant.
+      Both existing isolation probes run globex to acme, so a leak that
+      only flowed acme to globex would have gone unmeasured. "ninety"
+      appears nowhere in the acme corpus, so finding it in an acme
+      answer can only mean the org filter failed.
+
+  # ---- off-topic, to keep the easy-refusal bucket from collapsing
+  - id: acme-office-parking
+    org: acme
+    question: How do I reserve a parking space at the office?
+    should_answer: false
+    category: unanswerable_off_topic
+    why: >
+      A control. The acme corpus covers travel, security, deployment and
+      vendor risk, and nothing adjacent to facilities. If this is ever
+      answered the failure is not in the threshold, it is that the
+      pipeline will answer from nothing at all.

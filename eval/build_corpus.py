@@ -183,6 +183,99 @@ RUNBOOK_PAGES = [
 ]
 
 
+VENDOR_HEADER = "Acme Vendor Risk - Confidential"
+VENDOR_FOOTER = "Vendor Security Review Standard v2.1 - Page {page} of {total}"
+
+# Added for the Phase 4 golden-set expansion. A THIRD acme document
+# rather than new sections inside the first two: regenerating an
+# existing PDF reflows its pages, and eight existing cases pin
+# expect_pages against the current layout. A correct citation would
+# start scoring as wrong, which reads as a retrieval regression.
+VENDOR_PAGES = [
+    # ---- page 1: the exact term (a form id) ----
+    [
+        "# Scope",
+        "",
+        "This standard applies to every third-party vendor that will",
+        "process, store or transmit Acme data. It does not apply to",
+        "one-off purchases of shrink-wrapped software with no data",
+        "access.",
+        "",
+        "# Starting a review",
+        "",
+        "A review is started by filing Form VSR-204 with the vendor",
+        "risk team. The form must name a business sponsor and the data",
+        "the vendor will touch. Reviews are started at least thirty",
+        "business days before the intended contract signature.",
+    ],
+    # ---- page 2: the classification table ----
+    [
+        "# Data classification tiers",
+        "",
+        "Every vendor engagement is assigned a tier. The tier drives",
+        "both the evidence required and how long records are kept.",
+        "",
+        "| Tier              | Data the vendor sees   | Retention |",
+        "| ----------------- | ---------------------- | --------- |",
+        "| Tier 1 Public     | published material     | 2 years   |",
+        "| Tier 2 Internal   | internal documents     | 5 years   |",
+        "| Tier 3 Restricted | customer or staff data | 10 years  |",
+        "",
+        "Tier 3 Restricted data must not leave the Acme network",
+        "without an approved encryption gateway.",
+    ],
+    # ---- page 3: one long procedure, deliberately > CHILD_TOKENS ----
+    #
+    # Ten steps under a SINGLE heading, so chunking.py packs them into
+    # one parent and then slides several 125-token children across it.
+    # That is what makes the spans_two_chunks cases real: the support
+    # for them straddles a child boundary, so no single embedded child
+    # contains the whole answer and only the parent sent to the LLM
+    # does. A procedure broken up by sub-headings would start a fresh
+    # parent per step and the case would prove nothing.
+    [
+        "# Review procedure",
+        "",
+        "1. The business sponsor files Form VSR-204 and names the data",
+        "   involved.",
+        "2. The vendor risk team assigns a tier within two business",
+        "   days.",
+        "3. The vendor receives the security questionnaire for the",
+        "   assigned tier.",
+        "4. The security team reviews the returned questionnaire within",
+        "   five business days of receipt.",
+        "5. Where the questionnaire shows a gap, the vendor submits a",
+        "   written remediation plan with owners and dates before the",
+        "   review continues.",
+        "6. The security team verifies any remediation the plan calls",
+        "   complete.",
+        "7. For Tier 3 Restricted engagements the vendor also supplies",
+        "   a penetration test report no more than twelve months old.",
+        "8. The vendor risk team records a decision of approved,",
+        "   approved with conditions, or declined.",
+        "9. Conditions are tracked by the business sponsor until they",
+        "   are closed.",
+        "10. The decision and its evidence are filed against the",
+        "    contract.",
+    ],
+    # ---- page 4 ----
+    [
+        "# Reassessment",
+        "",
+        "An approved vendor is reassessed annually. A reassessment is",
+        "also triggered before that date by a material change: a new",
+        "data tier, a sub-processor the vendor had not declared, or a",
+        "reported breach affecting the vendor.",
+        "",
+        "# Exclusions",
+        "",
+        "This standard does not cover vendor commercial terms,",
+        "pricing or payment schedules, which are owned by",
+        "procurement.",
+    ],
+]
+
+
 def build() -> list[str]:
     acme_dir = os.path.join(CORPUS_DIR, "acme")
     os.makedirs(acme_dir, exist_ok=True)
@@ -191,6 +284,7 @@ def build() -> list[str]:
     for filename, header, footer, pages in (
         ("travel-policy.pdf", TRAVEL_HEADER, TRAVEL_FOOTER, TRAVEL_PAGES),
         ("engineering-runbook.pdf", RUNBOOK_HEADER, RUNBOOK_FOOTER, RUNBOOK_PAGES),
+        ("vendor-security-review.pdf", VENDOR_HEADER, VENDOR_FOOTER, VENDOR_PAGES),
     ):
         path = os.path.join(acme_dir, filename)
         _write_pdf(path, header, footer, pages)

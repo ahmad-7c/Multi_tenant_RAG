@@ -1,5 +1,17 @@
 # Gate calibration baseline
 
+> **STALE as of 2026-10-31 — do not quote these thresholds as current.**
+> Everything below was fitted on the 24 gate-scored cases that existed
+> on 2026-10-28. The golden set is now 40 questions / 38 gate-scored,
+> with four new retrieval-shape categories (`exact_term`, `table`,
+> `code`, `spans_two_chunks`) and a third acme document the calibration
+> run never saw. `CONFIDENCE_THRESHOLD = 0.4162` and
+> `VECTOR_SIMILARITY_FLOOR = 0.6175` are still what Settings applies,
+> so the SYSTEM is unchanged — but the evidence for them no longer
+> covers the set they would now be measured on. Re-running the
+> calibration costs live Gemini + Cohere calls and is a decision for
+> the operator, not a side effect of expanding the set.
+
 **Provisional, n=24.** Measured 2026-10-28 against live Gemini
 (`gemini-embedding-001`, `gemini-3.5-flash-lite`) and live Cohere
 (`rerank-v3.5`) over `eval/golden`. Reproduce with:

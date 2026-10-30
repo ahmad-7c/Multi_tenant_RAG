@@ -446,3 +446,197 @@ def test_an_ambiguous_case_without_an_ambiguity_is_rejected(tmp_path):
     body = body.replace("category: answerable_direct", "category: ambiguous")
     with pytest.raises(GoldenSetError, match="must state the 'ambiguity'"):
         _load(tmp_path, body)
+
+
+# ---- set-level rules, added in the Phase 4 expansion -----------------
+#
+# These three were previously asserted only against the real set, which
+# meant an interactive load_golden_set() -- the eval harness included --
+# accepted a set that had rotted. They now live in the loader, so each
+# is tested here the same way as the per-entry rules: by feeding it the
+# broken input it exists to reject.
+
+ANSWERED_TWIN = """\
+  - id: acme-answers-it
+    org: acme
+    question: What is the minimum password length?
+    should_answer: true
+    expect_documents: [security-policy.md]
+    expect_phrases: ["fourteen"]
+    category: answerable_direct
+    why: >
+      The answerable half of the isolation pair, long enough to pass the
+      thinness check applied to every case in the real set.
+"""
+
+PROBE = """\
+  - id: globex-probes-it
+    org: globex
+    question: What is the minimum password length?
+    should_answer: false
+    forbid_phrases: ["fourteen"]
+    category: cross_org_isolation
+    why: >
+      The probe half of the isolation pair, long enough to pass the
+      thinness check applied to every case in the real set.
+"""
+
+
+def test_a_paired_isolation_case_loads(tmp_path):
+    # The positive control. Without it the three rejection tests below
+    # would also pass against a loader that refused every isolation case.
+    golden = _load(tmp_path, ANSWERED_TWIN + PROBE)
+    assert golden.get("globex-probes-it").should_answer is False
+    assert golden.get("acme-answers-it").should_answer is True
+
+
+def test_an_isolation_probe_without_forbid_phrases_is_rejected(tmp_path):
+    body = ANSWERED_TWIN + PROBE.replace('    forbid_phrases: ["fourteen"]\n', "")
+    with pytest.raises(GoldenSetError, match="forbid_phrases"):
+        _load(tmp_path, body)
+
+
+def test_an_isolation_probe_with_no_twin_is_rejected(tmp_path):
+    # The probe alone. "Refuse everything for globex" would score a
+    # perfect isolation result against this set.
+    with pytest.raises(GoldenSetError, match="no twin|exact question"):
+        _load(tmp_path, PROBE)
+
+
+def test_an_isolation_probe_whose_twin_also_refuses_is_rejected(tmp_path):
+    # A twin exists and asks the identical question, but no org ANSWERS
+    # it -- so the pair cannot distinguish a working org filter from a
+    # pipeline that refuses this question for everybody.
+    refusing_twin = ANSWERED_TWIN.replace(
+        "    should_answer: true\n", "    should_answer: false\n"
+    ).replace(
+        '    expect_phrases: ["fourteen"]\n', ""
+    )
+    with pytest.raises(GoldenSetError, match="none ANSWERS"):
+        _load(tmp_path, refusing_twin + PROBE)
+
+
+OFF_TOPIC = """\
+  - id: acme-way-off
+    org: acme
+    question: How do I reserve a parking space at the office?
+    should_answer: false
+    category: unanswerable_off_topic
+    why: >
+      An off-topic refusal, long enough to pass the thinness check that
+      is applied to every case in the real set.
+"""
+
+NEAR_MISS = """\
+  - id: acme-near-{n}
+    org: acme
+    question: What is the mileage reimbursement rate for a motorcycle {n}?
+    should_answer: false
+    expect_documents: [travel-policy.pdf]
+    category: unanswerable_near
+    why: >
+      A near-miss refusal, long enough to pass the thinness check that
+      is applied to every case in the real set.
+"""
+
+
+def test_off_topic_refusals_outnumbering_near_misses_are_rejected(tmp_path):
+    # One off-topic case and one near miss: 1 < 2 * 1. A set weighted
+    # towards off-topic refusals certifies a gate that is broken, since
+    # any threshold at all refuses an off-topic question.
+    with pytest.raises(GoldenSetError, match="at least twice"):
+        _load(tmp_path, OFF_TOPIC + NEAR_MISS.format(n=1))
+
+
+def test_the_ratio_rule_accepts_twice_as_many_near_misses(tmp_path):
+    golden = _load(
+        tmp_path, OFF_TOPIC + NEAR_MISS.format(n=1) + NEAR_MISS.format(n=2)
+    )
+    assert len(golden.questions) == 3
+
+
+def test_the_ratio_rule_does_not_fire_without_off_topic_cases(tmp_path):
+    # A small set with no off-topic bucket is not malformed, it is just
+    # small. Firing here would make every synthetic fixture carry two
+    # near misses it does not need.
+    golden = _load(tmp_path, VALID_ENTRY)
+    assert len(golden.questions) == 1
+
+
+# ---- the new retrieval-shape categories ------------------------------
+
+
+def test_the_new_retrieval_shapes_are_populated(golden):
+    """Each shape needs enough cases to read as a row in a per-type table.
+
+    The point of splitting these out of answerable_direct was to make a
+    per-type failure visible. A bucket of one case cannot do that: it
+    reports 0% or 100% and nothing in between.
+    """
+    for category in ("exact_term", "table", "code", "spans_two_chunks"):
+        cases = golden.by_category(category)
+        assert len(cases) >= 2, f"{category} has only {len(cases)} case(s)"
+
+
+def test_spans_two_chunks_cases_really_span_two_chunks(golden):
+    """The label must be true of the actual chunker, not merely asserted.
+
+    This is the one new category whose name is a claim about system
+    internals rather than about the question. Verified by chunking the
+    expected documents with the production chunker and checking that no
+    single CHILD carries every must_mention term -- so the embedded
+    chunk that retrieves cannot contain the whole answer, and only the
+    parent handed to the LLM can.
+
+    If chunk sizes change this test fails, which is correct: the label
+    would no longer be true and the case would silently stop testing
+    what it was written for.
+    """
+    from app.services.chunking import chunk_pages
+
+    documents = {(d.org, d.filename): d for d in golden.documents}
+    cases = golden.by_category("spans_two_chunks")
+    assert cases, "no spans_two_chunks cases"
+
+    for case in cases:
+        terms = [t.lower() for t in (case.rubric or {}).get("must_mention", ())]
+        assert len(terms) >= 2, f"{case.id}: needs 2+ must_mention terms to span"
+
+        pages = []
+        for filename in case.expect_documents:
+            pages.extend(documents[(case.org, filename)].pages)
+        children = [
+            child for parent in chunk_pages(pages) for child in parent.children
+        ]
+        assert children, f"{case.id}: expected documents produced no children"
+
+        best = max(
+            sum(term in child.content.lower() for term in terms)
+            for child in children
+        )
+        assert best < len(terms), (
+            f"{case.id}: one child chunk carries all of {terms}, so the case "
+            f"does not span anything -- re-file it or tighten the rubric"
+        )
+
+        # And the terms must be findable at all, or the case is simply
+        # unpassable and would read as a retrieval failure forever.
+        corpus = " ".join(
+            documents[(case.org, f)].content.lower() for f in case.expect_documents
+        )
+        for term in terms:
+            assert term in corpus, f"{case.id}: must_mention {term!r} is not in the corpus"
+
+
+def test_isolation_pairs_cover_both_directions(golden):
+    """A leak that only flows one way would otherwise go unmeasured.
+
+    Both original probes ran globex -> acme. The org filter is one
+    predicate, so that is probably symmetric -- but "probably" is what
+    the eval exists to replace.
+    """
+    asking_orgs = {c.org for c in golden.by_category("cross_org_isolation")}
+    assert len(asking_orgs) >= 2, (
+        f"every isolation probe is asked by {asking_orgs}, so only one "
+        f"direction of leak is measured"
+    )

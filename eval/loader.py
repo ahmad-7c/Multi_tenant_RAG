@@ -36,6 +36,16 @@ QUESTIONS_PATH = os.path.join(GOLDEN_DIR, "questions.yaml")
 GATE_SCORED = {
     "answerable_direct",
     "answerable_needs_rerank",
+    # Added alongside the original categories rather than replacing
+    # them. These four name the RETRIEVAL shape a case exercises --
+    # a distinctive token, a table row, a code fence, support that
+    # straddles a child boundary -- which `answerable_direct` hid.
+    # Without its own bucket a per-type table cannot show that, say,
+    # every table case fails while the prose cases pass.
+    "exact_term",
+    "table",
+    "code",
+    "spans_two_chunks",
     "synthesis",
     "unanswerable_near",
     "unanswerable_off_topic",
@@ -386,6 +396,50 @@ def load_golden_set(
                 rubric=rubric,
                 history=history,
             )
+        )
+
+    # ---- set-level rules -------------------------------------------
+    #
+    # These three cannot live in the loop above: each is a property of
+    # the SET, not of one entry. They were previously asserted only in
+    # tests/test_golden_set.py, which catches them in CI but lets every
+    # interactive `load_golden_set()` -- the eval harness included --
+    # run happily on a set that has quietly rotted.
+
+    isolation = [q for q in questions if q.category == "cross_org_isolation"]
+    for case in isolation:
+        _require(
+            case.forbid_phrases,
+            f"{case.id}: an isolation probe needs forbid_phrases -- without "
+            f"them a cross-tenant answer is indistinguishable from any other "
+            f"answer and the leak is undetectable",
+        )
+        twins = [
+            q for q in questions
+            if q.question == case.question and q.org != case.org
+        ]
+        _require(
+            twins,
+            f"{case.id}: no other org asks this exact question, so the probe "
+            f"has no twin. 'Refuse everything for this org' would score a "
+            f"perfect isolation result",
+        )
+        _require(
+            any(t.should_answer for t in twins),
+            f"{case.id}: another org asks this question but none ANSWERS it, "
+            f"so refusing it proves nothing about the org filter",
+        )
+
+    near = sum(1 for q in questions if q.category == "unanswerable_near")
+    off_topic = sum(1 for q in questions if q.category == "unanswerable_off_topic")
+    if off_topic:
+        # An off-topic question is refused by any threshold at all, so a
+        # set weighted towards them certifies a gate that is broken.
+        _require(
+            near >= 2 * off_topic,
+            f"near-miss unanswerables ({near}) must be at least twice the "
+            f"off-topic ones ({off_topic}) -- off-topic cases are refused by "
+            f"any threshold, so they cannot discipline one",
         )
 
     return GoldenSet(documents=documents, questions=tuple(questions))
