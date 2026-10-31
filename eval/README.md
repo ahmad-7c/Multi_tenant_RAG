@@ -7,12 +7,66 @@ score looks like — so the gate that turns "nothing relevant here" into
 an honest refusal was tuned by vibes.
 
 ## Layout
-    golden/corpus/<org>/      per-tenant documents (2 generated PDFs + 2 md)
-    golden/questions.yaml     hand-labelled questions
+    golden/corpus/<org>/      per-tenant documents (3 generated PDFs + 3 md)
+    golden/questions.yaml     hand-labelled questions, with a `version`
+    golden/judge_grades.yaml  HAND grades the judge is scored against
     build_corpus.py           regenerates the PDFs from source
     loader.py                 parse + validate (validation is the point)
     scoring.py                phrase / rubric / citation-page checks
+    metrics.py                recall@k, MRR, citation-page correctness
+    judge.py                  the LLM judge: two axes, retries, cache
+    thresholds.py             the fixed threshold-selection rule
+    runs.py                   run files + the config snapshot
+    runs/                     one committed JSON file per run
     calibrate.py              the live run and the threshold curves
+
+## Retrieval is scored separately from generation
+`metrics.py` computes **recall@k** (k = `RERANK_TOP_N`, the number of
+parents actually sent to the model), **MRR**, and **citation-page
+correctness**, from the ranked chunk list and nothing else -- never from
+the answer text.
+
+The harness keeps TWO ranked lists per case, which is what makes a
+failure diagnosable:
+
+| candidate recall | reranked recall | what broke | where to look |
+|---|---|---|---|
+| 1.0 | 1.0 | nothing | - |
+| 1.0 | 0.0 | the cross-encoder demoted the support | reranker, `RERANK_TOP_N` |
+| 0.0 | 0.0 | neither leg found it | embeddings, chunking, the query |
+
+The old single `retrieval_hit` bool could not tell rank 1 from rank 47,
+so a change that moved every right answer from rank 2 to rank 30 moved
+no number at all.
+
+Relevance is labelled as `(document, page)`, not as a chunk id, because
+chunk ids are regenerated on every ingest and by every change to
+`CHILD_TOKENS` -- a set pinned to them would go stale *silently*, reading
+as a retrieval collapse. The cost is stated in `metrics.py`: on a page
+that chunks into several children, any child of that page counts.
+
+## The judge is measured, not trusted
+`JUDGE_MODEL` is its own setting. A judge that is the answering model
+grades its own output, and the claims it is least likely to flag as
+unsupported are exactly the ones it would have inferred itself.
+
+Verdicts are cached on a sha256 of (judge model, grading prompt,
+question, context, answer) -- **not** on the case id, since the id is
+stable across runs while the answer is not, and an id-keyed cache would
+serve a verdict about text the model no longer produces. An
+`UNPARSEABLE` reply is retried once with the failure fed back, and is
+never cached.
+
+`golden/judge_grades.yaml` holds HAND grades. The report prints the
+agreement rate, refuses to conclude below 10 grades (UNKNOWN, not
+"unreliable"), and warns when the grades cover only one kind of outcome.
+
+## Runs are files, not one overwritten file
+Every run writes `runs/<timestamp>-<label>.json` with a config snapshot:
+golden-set version, model names, chunk sizes, thresholds, prompt content
+hashes, git commit and dirtiness, and the eval's own flags. See
+`runs/README.md`. `--smoke` runs nine representative cases and records
+`sufficient_for_calibration: false`.
 
 Two orgs on purpose: `acme` holds the policies, `globex` an unrelated
 handbook. That is what makes cross-tenant isolation measurable rather
@@ -33,9 +87,23 @@ headers/footers that `cleaning.py` must remove.
 ## Running it
     python -m eval.build_corpus                 # regenerate the PDFs
     python -m eval.loader                       # validate + counts
-    python -m pytest tests/test_golden_set.py tests/test_eval_scoring.py
+    python -m pytest tests/test_golden_set.py tests/test_eval_scoring.py \
+                     tests/test_eval_metrics.py tests/test_eval_judge.py \
+                     tests/test_eval_runs.py
+    python -m eval.calibrate --smoke            # 9 cases, harness check
     python -m eval.calibrate --no-generate      # scores and curves only
     python -m eval.calibrate                    # + answers, cache, leaks
+
+The harness itself can be exercised with no network and no spend:
+
+    EMBEDDING_PROVIDER=fake RERANKER_PROVIDER=fake LLM_PROVIDER=fake \
+      python -m eval.calibrate --smoke --no-generate --pace 0
+
+Every number that comes out of that is meaningless -- fake embeddings
+are not a retrieval system -- and the run file records
+`EMBEDDING_PROVIDER: fake` so it cannot later be mistaken for data. What
+it proves is that the pipeline, the metrics and the run writer all
+execute.
 
 `calibrate.py` needs a live configuration (`EMBEDDING_PROVIDER=gemini`,
 `RERANKER_PROVIDER=hosted`) and warns loudly if it does not have one.

@@ -118,6 +118,38 @@ class Settings(BaseSettings):
     REWRITE_MAX_TOKENS: int = 128
     REWRITE_HISTORY_TURNS: int = 4
 
+    # The LLM judge used by the eval harness, kept as its OWN setting
+    # rather than reusing LLM_MODEL. A judge that is the same model as
+    # the answerer grades its own output: it recognises its own phrasing
+    # and its blind spots are correlated with the thing being measured,
+    # so the one failure mode it is least likely to catch is the one it
+    # shares with the answerer. Pointing this at a different (ideally
+    # stronger) model is the only way the number means anything -- and
+    # a separate setting is what makes that a config change rather than
+    # a code change.
+    #
+    # Defaults to the same model as LLM_MODEL, because an eval that
+    # cannot run without a second provider configured does not get run.
+    # The harness prints whether the two are identical, so a reader
+    # knows which regime produced the agreement rate.
+    JUDGE_MODEL: str = "gemini-3.5-flash-lite"
+    # Temperature 0, not LLM_TEMPERATURE's 0.1: a verdict is a
+    # classification and must be reproducible from the cache key, and
+    # sampling a grade is how the same answer gets two labels in two
+    # runs.
+    JUDGE_TEMPERATURE: float = 0.0
+    JUDGE_MAX_TOKENS: int = 200
+    # One retry, on an UNPARSEABLE response only. The judge is asked for
+    # strict JSON and sometimes emits prose; a single retry with the
+    # failure fed back recovers most of those. More than one retry on a
+    # model that has decided to write an essay is just paying twice.
+    JUDGE_MAX_RETRIES: int = 1
+    # Verdicts are cached on a content hash of (model, prompt, question,
+    # context, answer). Reruns of a 40-case set would otherwise re-pay
+    # for every unchanged case, which on a free-tier key is the
+    # difference between re-running the eval and not bothering.
+    JUDGE_CACHE_ENABLED: bool = True
+
     RERANKER_PROVIDER: Literal["hosted", "passthrough", "fake"] = "passthrough"
     RERANKER_MODEL: str = "rerank-v3.5"
     # Reads COHERE_API_KEY too. The canonical name stays provider-neutral

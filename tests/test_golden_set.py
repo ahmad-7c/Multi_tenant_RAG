@@ -167,7 +167,15 @@ def test_summarise_runs(golden):
 
 # ---- the validator catches the ways this file rots -------------------
 
-HEADER = "questions:\n"
+# A version is now mandatory, so the shared header carries one. The
+# three tests that police the rule itself write their own header.
+HEADER = 'version: "test"\nquestions:\n'
+
+
+def _write_raw(tmp_path, text):
+    path = tmp_path / "questions.yaml"
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 VALID_ENTRY = """\
   - id: good-one
@@ -196,6 +204,38 @@ def _load(tmp_path, body):
 def test_a_valid_entry_loads(tmp_path):
     golden = _load(tmp_path, VALID_ENTRY)
     assert golden.get("good-one").should_answer is True
+
+
+def test_the_version_is_loaded_and_is_a_string(tmp_path):
+    golden = _load(tmp_path, VALID_ENTRY)
+    # A string, not an int: YAML reads `version: 2` as an integer and
+    # `version: 2.0` as a float that compares equal to it, so two
+    # different sets could record the same version.
+    assert golden.version == "test"
+    assert isinstance(golden.version, str)
+
+
+def test_a_set_with_no_version_is_rejected(tmp_path):
+    # Every run file records the version. Without one, two runs over
+    # different sets are indistinguishable, and the change in the
+    # denominator reads as a regression in the system.
+    path = _write_raw(tmp_path, "questions:\n" + textwrap.dedent(VALID_ENTRY))
+    with pytest.raises(GoldenSetError, match="top-level 'version'"):
+        load_golden_set(questions_path=path)
+
+
+def test_a_blank_version_is_rejected(tmp_path):
+    path = _write_raw(
+        tmp_path,
+        'version: "  "\nquestions:\n' + textwrap.dedent(VALID_ENTRY),
+    )
+    with pytest.raises(GoldenSetError, match="must not be blank"):
+        load_golden_set(questions_path=path)
+
+
+def test_the_real_set_declares_a_clean_version(golden):
+    assert golden.version
+    assert golden.version.strip() == golden.version
 
 
 def test_a_duplicate_id_is_rejected(tmp_path):

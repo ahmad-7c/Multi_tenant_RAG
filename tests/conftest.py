@@ -65,6 +65,7 @@ def _no_live_providers():
         embedding.get_embedding_provider,
         llm.get_llm,
         llm.get_rewrite_llm,
+        llm.get_judge_llm,
         reranker.get_reranker,
     ):
         factory.cache_clear()
@@ -80,6 +81,7 @@ def _no_live_providers():
         embedding.get_embedding_provider,
         llm.get_llm,
         llm.get_rewrite_llm,
+        llm.get_judge_llm,
         reranker.get_reranker,
     ):
         factory.cache_clear()
@@ -175,6 +177,34 @@ def client(db_session, monkeypatch, tmp_path):
     # ingestion task has its own tests; here the enqueue is a no-op so the
     # HTTP-layer tests need no running worker.
     monkeypatch.setattr(document_service.ingest_document, "delay", lambda *a, **k: None)
+
+    # The lifespan builds its OWN session -- `db = SessionLocal()` in
+    # app/main.py -- which is not covered by the get_db override above.
+    # Left alone, every startup check in the suite reads the DEV
+    # database, so suite behaviour depends on whatever is sitting in a
+    # developer's local Postgres.
+    #
+    # That is not hypothetical. Running the eval harness with
+    # EMBEDDING_PROVIDER=fake writes chunks tagged `fake-embedding` into
+    # the dev DB; the embedding-model guard then read them at startup,
+    # set `embedding_model_error`, and four SSE tests plus the /health
+    # test began failing with no change to any code they exercise. The
+    # suite was green or red according to a database it does not own.
+    #
+    # `close` is swallowed because the session's lifecycle belongs to
+    # the db_session fixture, which rolls the whole test back.
+    import app.main as main_module
+
+    class _SuiteSession:
+        """The test session, minus the right to close it."""
+
+        def __getattr__(self, name):
+            return getattr(db_session, name)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(main_module, "SessionLocal", lambda: _SuiteSession())
 
     with TestClient(fastapi_app) as test_client:
         yield test_client

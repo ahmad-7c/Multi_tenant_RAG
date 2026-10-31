@@ -147,6 +147,14 @@ class GoldenQuestion:
 class GoldenSet:
     documents: tuple[GoldenDocument, ...]
     questions: tuple[GoldenQuestion, ...]
+    # Bumped by hand whenever a label, a question or the corpus changes.
+    # Stored in every run file, because the alternative is comparing two
+    # runs whose denominators differ and calling the difference a
+    # regression. The git commit is recorded too, but a commit does not
+    # say whether the SET moved -- most commits do not touch it, and the
+    # one that adds fourteen questions looks identical in a diff stat to
+    # one that fixes a typo.
+    version: str = "0"
 
     def orgs(self) -> tuple[str, ...]:
         return tuple(sorted({d.org for d in self.documents}))
@@ -237,6 +245,20 @@ def load_golden_set(
 
     _require(isinstance(raw, dict) and "questions" in raw,
              f"{questions_path} must be a mapping with a 'questions' key")
+
+    # A run file that cannot name the set it scored is not comparable to
+    # anything, so a missing version is an error rather than a default.
+    _require(
+        "version" in raw,
+        f"{questions_path} must declare a top-level 'version'; every eval run "
+        f"records it, and two runs with different sets and no version look "
+        f"like one run that regressed",
+    )
+    version = str(raw["version"])
+    _require(
+        bool(version.strip()),
+        f"{questions_path}: 'version' must not be blank",
+    )
 
     by_org: dict[str, dict[str, GoldenDocument]] = {}
     for document in documents:
@@ -442,12 +464,16 @@ def load_golden_set(
             f"any threshold, so they cannot discipline one",
         )
 
-    return GoldenSet(documents=documents, questions=tuple(questions))
+    return GoldenSet(
+        documents=documents, questions=tuple(questions), version=version
+    )
 
 
 def summarise(golden: GoldenSet) -> str:
     lines: list[str] = []
 
+    lines.append(f"golden set version {golden.version}")
+    lines.append("")
     lines.append("corpus")
     for org in golden.orgs():
         docs = golden.documents_for(org)

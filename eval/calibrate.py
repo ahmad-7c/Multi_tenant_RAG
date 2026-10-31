@@ -29,7 +29,7 @@ import statistics
 import sys
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -49,7 +49,7 @@ from app.services.chunking import chunk_pages
 from app.services.cleaning import clean_pages
 from app.services.embedding import EmbeddingTask, get_embedding_provider
 from app.services.extraction import Page, extract_pages
-from app.services.llm import get_llm, get_rewrite_llm
+from app.services.llm import get_judge_llm, get_llm, get_rewrite_llm
 from app.services.reranker import (
     Reranker,
     get_reranker,
@@ -58,7 +58,23 @@ from app.services.reranker import (
 )
 from app.services.retrieval import retrieve_candidates
 from eval.loader import GATE_EXCLUDED, load_golden_set, summarise
-from eval.judge import judge_answer
+from eval.judge import (
+    JudgeCache,
+    judge_answer,
+    load_hand_grades,
+    score_agreement,
+)
+from eval.metrics import (
+    CaseRetrieval,
+    RankedItem,
+    RetrievalTarget,
+    citation_pages_correct,
+    first_relevant_rank,
+    recall_at_k,
+    reciprocal_rank,
+    summarise_retrieval,
+)
+from eval.runs import config_snapshot, write_run
 from eval.scoring import check_citation_pages, check_phrases, check_rubric
 from eval.thresholds import (
     ScoredCase,
@@ -67,7 +83,13 @@ from eval.thresholds import (
 )
 from eval.thresholds import score_table as sorted_score_table
 
-RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results.json")
+# The old single-file dump. Kept only as a name for the legacy file so
+# `eval/runs.py`'s loader can still read a pre-snapshot run; nothing
+# writes it any more. See the module docstring in eval/runs.py for why
+# one fixed filename holding a bare list was unusable.
+LEGACY_RESULTS_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "results.json"
+)
 
 # A Cohere TRIAL key allows 10 rerank requests per minute. 26 cases fired
 # back to back would mostly 429, fall back to RRF order, and report
@@ -76,6 +98,40 @@ RESULTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results
 # request path: this is a batch job where wall-clock is free, whereas a
 # user's query has a 3-second budget.
 DEFAULT_PACE_SECONDS = 7.0
+
+# `--smoke`: one case per RETRIEVAL SHAPE and one per gate regime, nine
+# in all, chosen so that a smoke run exercises every code path a full
+# run does rather than nine cases of the same kind.
+#
+#   expense-window        a plain fact on a PDF page, and the twin for
+#                         the isolation probe below -- an isolation
+#                         case whose twin is absent proves nothing
+#   perdiem-international  a table row
+#   rollback-command       a fenced code block
+#   vsr-sponsor-duties     support straddling a child boundary, so the
+#                          parent-child promotion has to work
+#   approval-7000          the only path through check_rubric; without
+#                          it --smoke never runs the negation scorer
+#   mileage-motorcycle     a NEAR MISS: the gate's real job
+#   vpn-setup              off-topic, the easy control
+#   globex-asks-expense-window  the isolation direction globex -> acme
+#   followup-above-that    history, so the query rewriter runs
+#
+# Deliberately NOT covered, and a --smoke report says so: exact_term,
+# the acme -> globex isolation direction, and the ambiguous bucket. A
+# smoke run is for "is the harness working and roughly right", never
+# for a threshold.
+SMOKE_IDS = (
+    "acme-expense-window",
+    "acme-perdiem-international",
+    "acme-rollback-command",
+    "acme-vsr-sponsor-duties",
+    "acme-approval-7000",
+    "acme-mileage-motorcycle",
+    "acme-vpn-setup",
+    "globex-asks-expense-window",
+    "acme-followup-above-that",
+)
 
 # RERANKER_TIMEOUT_SECONDS is 3s because that is a USER's budget: past
 # it, RRF order now beats waiting. The eval has the opposite need -- a
@@ -89,6 +145,11 @@ DEFAULT_RERANK_TIMEOUT = 25.0
 # little headroom; sitting exactly on a published limit turns every
 # jitter spike into a 429.
 DEFAULT_RERANK_MIN_INTERVAL = 6.5
+
+# One cache for the whole run. Keyed on the ANSWER's content, so a rerun
+# that produces the same answers pays nothing and a rerun that produces
+# different ones is judged again -- see eval/judge.py.
+JUDGE_CACHE = JudgeCache()
 
 
 @dataclass
@@ -108,6 +169,23 @@ class CaseResult:
     retrieved_pages: list[int] = field(default_factory=list)
     retrieval_hit: bool | None = None
     rewritten_question: str | None = None
+
+    # --- ranked lists, IN RANK ORDER (the sets above lose the order) ---
+    # Two of them, because they answer different questions. The
+    # candidate list says whether retrieval found the support at all;
+    # the reranked list says whether it survived into the prompt. A
+    # single list cannot distinguish "the vector leg missed it" from
+    # "the cross-encoder buried it", and those have different fixes.
+    candidate_ranking: list[dict] = field(default_factory=list)
+    reranked_ranking: list[dict] = field(default_factory=list)
+
+    # --- retrieval metrics (None when the case labels no support) ---
+    recall_at_k: float | None = None
+    reciprocal_rank: float | None = None
+    first_relevant_rank: int | None = None
+    candidate_recall: float | None = None
+    candidate_first_rank: int | None = None
+    citation_pages_ok: bool | None = None
 
     # --- generation (only where an answer is scored) ---
     answered: bool | None = None
@@ -132,6 +210,8 @@ class CaseResult:
     forced_verdict: str | None = None
     forced_verdict_reason: str | None = None
     forced_verdict_deterministic: bool | None = None
+    forced_verdict_cached: bool | None = None
+    forced_verdict_model_calls: int = 0
     context_sent: str | None = None
 
     error: str | None = None
@@ -379,6 +459,70 @@ def measure_similarity(db, org_id, query_vector, candidates) -> float | None:
     return float(row.sim) if row and row.sim is not None else None
 
 
+def _ranked_items(rows) -> list[RankedItem]:
+    """Children in rank order -> RankedItem, preserving the order.
+
+    Takes anything with `.filename` / `.page_number` / `.chunk_id`,
+    which covers a `Candidate` (pre-rerank) and a `RankedCandidate`'s
+    `.candidate` (post-rerank). The order is the whole point: the
+    existing `retrieved_documents` field is a sorted SET, and a sorted
+    set cannot tell rank 1 from rank 47.
+    """
+    items = []
+    for row in rows:
+        candidate = getattr(row, "candidate", row)
+        items.append(
+            RankedItem(
+                document=candidate.filename,
+                page=candidate.page_number,
+                chunk_id=str(candidate.chunk_id),
+            )
+        )
+    return items
+
+
+def _measure_retrieval(result, question, candidates, ranked) -> None:
+    """Fill in recall@k, MRR and the two rank positions.
+
+    k is `RERANK_TOP_N`, because that is how many parents are actually
+    sent to the model. Measuring recall at 50 would report that the
+    support was "retrieved" when the prompt never contained it.
+
+    Both lists are measured. When candidate recall is 1.0 and reranked
+    recall is 0.0, the cross-encoder demoted the right chunk -- a
+    reranker problem. When both are 0.0, neither leg found it -- an
+    embedding, chunking or query problem. One number cannot say which.
+    """
+    target = RetrievalTarget(
+        documents=tuple(question.expect_documents),
+        pages=tuple(question.expect_pages),
+    )
+
+    result.candidate_ranking = [
+        {"document": i.document, "page": i.page, "chunk_id": i.chunk_id}
+        for i in _ranked_items(candidates)
+    ]
+    result.reranked_ranking = [
+        {"document": i.document, "page": i.page, "chunk_id": i.chunk_id}
+        for i in _ranked_items(ranked)
+    ]
+
+    reranked_items = _ranked_items(ranked)
+    candidate_items = _ranked_items(candidates)
+
+    k = settings.RERANK_TOP_N
+    result.recall_at_k = recall_at_k(reranked_items, target, k=k)
+    result.reciprocal_rank = reciprocal_rank(reranked_items, target)
+    result.first_relevant_rank = first_relevant_rank(reranked_items, target)
+    # No k cap on the candidate list: the question it answers is "did
+    # either retrieval leg see it at all", and capping would fold a
+    # ranking question back into a retrieval one.
+    result.candidate_recall = recall_at_k(
+        candidate_items, target, k=len(candidate_items) or 1
+    )
+    result.candidate_first_rank = first_relevant_rank(candidate_items, target)
+
+
 async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResult:
     org_id = handles[question.org]["org_id"]
 
@@ -424,6 +568,12 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
         parents = map_to_parents(db, ranked, org_id=org_id)
         result.retrieved_documents = sorted({p.filename for p in parents})
         result.retrieved_pages = sorted({p.page_number for p in parents})
+
+        # Measured on the CHILD rankings, not on the parents: children
+        # are what the vector index and the cross-encoder actually
+        # ranked, and parent promotion deduplicates, so a parent list
+        # has already collapsed the ranks the metric is about.
+        _measure_retrieval(result, question, candidates, ranked)
 
         if question.expect_documents:
             result.retrieval_hit = any(
@@ -473,6 +623,12 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
                 pages = check_citation_pages(citations, question.expect_pages)
                 result.pages_ok = pages.passed
                 result.notes.extend(pages.notes)
+            # Same question, computed from the citation pages alone so
+            # the aggregate in the retrieval table and the per-case
+            # check above cannot drift apart.
+            result.citation_pages_ok = citation_pages_correct(
+                [c.get("page") for c in citations], question.expect_pages
+            )
 
             if question.is_isolation_case:
                 leak = check_phrases(answer, forbid_phrases=question.forbid_phrases)
@@ -498,11 +654,18 @@ async def run_case(db, golden, handles, question, *, generate: bool) -> CaseResu
                     question=question.question,
                     context=forced_context or result.context_sent or "",
                     answer=forced,
-                    llm=get_llm(),
+                    # The JUDGE model, not the answering one. Same name
+                    # by default and a different factory on purpose:
+                    # pointing JUDGE_MODEL elsewhere must not require a
+                    # code change.
+                    llm=get_judge_llm(),
+                    cache=JUDGE_CACHE,
                 )
                 result.forced_verdict = verdict.verdict
                 result.forced_verdict_reason = verdict.reason
                 result.forced_verdict_deterministic = verdict.deterministic
+                result.forced_verdict_cached = verdict.cached
+                result.forced_verdict_model_calls = verdict.model_calls
 
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
@@ -811,6 +974,13 @@ async def main_async(args) -> int:
     golden = load_golden_set()
     log(summarise(golden))
 
+    # Captured BEFORE the first case, and before anything else mutates
+    # Settings. `settings.RERANKER_TIMEOUT_SECONDS` was already raised
+    # to the eval's budget above, which is exactly what must be
+    # recorded -- a snapshot taken at the end would show production's
+    # 3s and silently misdescribe every score in the file.
+    snapshot = config_snapshot(golden=golden, settings=settings, args=args)
+
     log()
     log("=== providers ===")
     log(f"  embedding: {settings.EMBEDDING_PROVIDER} / {settings.EMBEDDING_MODEL}")
@@ -834,10 +1004,19 @@ async def main_async(args) -> int:
 
         log()
         log(f"=== cases (pacing {args.pace:.1f}s between cases) ===")
-        selected = [
-            q for q in golden.questions
-            if not args.only or q.id in args.only
-        ]
+        if args.smoke:
+            selected = [q for q in golden.questions if q.id in SMOKE_IDS]
+            missing = sorted(set(SMOKE_IDS) - {q.id for q in selected})
+            if missing:
+                # A renamed case silently shrinks the smoke set, and a
+                # smoke run that quietly covers six shapes instead of
+                # nine is worse than one that complains.
+                log(f"  WARNING: smoke ids not in the golden set: {missing}")
+        else:
+            selected = [
+                q for q in golden.questions
+                if not args.only or q.id in args.only
+            ]
         for position, question in enumerate(selected):
             if position:
                 time.sleep(args.pace)
@@ -891,23 +1070,200 @@ async def main_async(args) -> int:
         db.close()
         await aclose_async_client()
 
-    # Written first, on purpose: see the note in main_async.
-    if not args.only:
-        with open(RESULTS_PATH, "w", encoding="utf-8") as handle:
-            json.dump([asdict(r) for r in results], handle, indent=2)
-        log()
-        log(f"raw results written to {RESULTS_PATH} (before reporting, so a")
-        log("reporting bug cannot discard the run)")
+    # Written BEFORE the report, on purpose: a reporting bug must not
+    # discard a run that has already paid for live API calls.
+    #
+    # Every run gets its own file now, including partial ones. The old
+    # code skipped writing for `--only` to protect the single shared
+    # results.json from being replaced by two cases -- a real hazard
+    # that a timestamped filename removes outright. A partial run is
+    # still data, and throwing it away to protect a filename was the
+    # wrong trade.
+    label = "smoke" if args.smoke else ("partial" if args.only else "full")
+    snapshot["selection"] = {
+        "label": label,
+        "case_ids": [r.id for r in results],
+        "n_selected": len(results),
+        "n_in_set": len(golden.questions),
+        # A partial run cannot support a threshold. Recorded in the file
+        # rather than only printed, so a reader who finds the file later
+        # does not have to infer it from the case count.
+        "sufficient_for_calibration": label == "full",
+    }
+    snapshot["judge_cache"] = {
+        "hits": JUDGE_CACHE.hits,
+        "misses": JUDGE_CACHE.misses,
+        "enabled": JUDGE_CACHE.enabled,
+    }
+    snapshot["api_calls"] = {
+        "judge_model_calls": sum(r.forced_verdict_model_calls for r in results),
+    }
+
+    run_path = write_run(config=snapshot, cases=results, label=label)
+    log()
+    log(f"run written to {run_path}")
+    log(f"  golden set version {snapshot['golden_set_version']}, "
+        f"{len(results)} case(s), label '{label}'")
+    if label != "full":
+        log("  NOT a calibration run: a threshold fitted to this subset")
+        log("  would be fitted to the cases that happened to be selected.")
 
     choices = report(golden, results, args)
-    if args.only:
-        # A partial run must not overwrite the full dataset: the
-        # threshold choice and docs/eval-baseline.md are derived from
-        # it, and silently replacing 26 cases with 2 would make both
-        # wrong while still looking like data.
-        log()
-        log("partial run (--only): results.json left untouched")
     return 0
+
+
+def _case_retrieval(results) -> list[CaseRetrieval]:
+    return [
+        CaseRetrieval(
+            id=r.id,
+            recall=r.recall_at_k,
+            reciprocal_rank=r.reciprocal_rank,
+            first_rank=r.first_relevant_rank,
+            citation_pages_ok=r.citation_pages_ok,
+        )
+        for r in results
+        if r.error is None
+    ]
+
+
+def _fmt(value, width=6, places=3):
+    return f"{value:>{width}.{places}f}" if value is not None else f"{'-':>{width}}"
+
+
+def retrieval_report(results) -> None:
+    """Recall@k, MRR and citation pages -- overall, per type, per org.
+
+    Three tables rather than one blended score. A single retrieval
+    number averages a shape that always works with one that never does,
+    and the whole reason the four retrieval-shape types were added to
+    the golden set was so that "every table case fails while the prose
+    cases pass" is a visible row rather than a dip in an average.
+
+    k is RERANK_TOP_N: the number of parents actually sent to the
+    model. Recall measured at the candidate count would report support
+    as found when the prompt never contained it.
+    """
+    k = settings.RERANK_TOP_N
+    log()
+    log("--- RETRIEVAL METRICS (recall@k, MRR) ---")
+    log(f"    k = RERANK_TOP_N = {k} (what the prompt actually receives)")
+    log("    recall is the fraction of LABELLED (document, page) units found;")
+    log("    MRR is over the first relevant rank. Cases labelling no support")
+    log("    (off-topic, isolation probes) are excluded, not scored zero.")
+
+    usable = [r for r in results if r.error is None]
+    overall = summarise_retrieval(_case_retrieval(usable), k=k)
+    log()
+    log(f"    overall       n={overall.n:3} scored={overall.n_scored:3}  "
+        f"recall@{k}={_fmt(overall.recall_at_k)}  MRR={_fmt(overall.mrr)}  "
+        f"cited-page={_fmt(overall.citation_pages_ok)} "
+        f"(n={overall.n_citation_scored})")
+
+    for heading, key in (("per type", "category"), ("per org", "org")):
+        log()
+        log(f"    {heading}")
+        log(f"      {'bucket':24} {'n':>3} {'scored':>6}  {'recall':>6}  "
+            f"{'MRR':>6}  {'pages':>6}")
+        for bucket in sorted({getattr(r, key) for r in usable}):
+            rows = [r for r in usable if getattr(r, key) == bucket]
+            summary = summarise_retrieval(_case_retrieval(rows), k=k)
+            flag = "  << small n, do not conclude" if summary.small_n else ""
+            log(
+                f"      {bucket:24} {summary.n:>3} {summary.n_scored:>6}  "
+                f"{_fmt(summary.recall_at_k)}  {_fmt(summary.mrr)}  "
+                f"{_fmt(summary.citation_pages_ok)}{flag}"
+            )
+
+    # A miss and a below-k are different failures with different fixes,
+    # so they are listed apart rather than counted together.
+    if overall.missed:
+        log()
+        log("    NEVER RETRIEVED (no leg found the support at any rank):")
+        for case_id in overall.missed:
+            row = next(r for r in usable if r.id == case_id)
+            log(f"      {case_id:34} candidate_rank="
+                f"{row.candidate_first_rank or 'none'}")
+    if overall.below_k:
+        log()
+        log(f"    RETRIEVED BUT BELOW k={k} (the model never saw it):")
+        for case_id in overall.below_k:
+            row = next(r for r in usable if r.id == case_id)
+            log(f"      {case_id:34} rank={row.first_relevant_rank}")
+
+    # The diagnostic split the two ranked lists exist for.
+    demoted = [
+        r for r in usable
+        if r.candidate_recall and r.candidate_recall > 0
+        and (r.recall_at_k or 0) < r.candidate_recall
+    ]
+    if demoted:
+        log()
+        log("    DEMOTED BY THE RERANKER (retrieval found it, ranking lost it):")
+        log("      a reranker problem, not an embedding or chunking one")
+        for row in demoted:
+            log(
+                f"      {row.id:34} candidate_rank={row.candidate_first_rank} "
+                f"-> reranked_rank={row.first_relevant_rank or 'none'}"
+            )
+
+
+def judge_agreement_report(results) -> None:
+    """How often the judge matched a HAND grade.
+
+    An unmeasured judge is an opinion. The rule is the skill's: at least
+    10 hand grades covering BOTH refusals and assertions, and below 80%
+    the judge prompt gets fixed before anything downstream of it is
+    believed.
+    """
+    log()
+    log("--- JUDGE RELIABILITY ---")
+    judged = {
+        r.id: r.forced_verdict
+        for r in results
+        if r.forced_verdict is not None
+        # Deterministic verdicts (the system's own refusal text) are
+        # excluded: they are a string match, not a judgement, and
+        # counting them would inflate agreement with cases no model
+        # ever looked at.
+        and not r.forced_verdict_deterministic
+    }
+    hand = load_hand_grades()
+    if not hand:
+        log("    agreement UNMEASURED -- no hand grades in "
+            "eval/golden/judge_grades.yaml")
+        log("    Write at least 10 by hand, including cases the judge PASSED")
+        log("    and cases it FAILED, then re-run. Until then every number")
+        log("    derived from the judge is unvalidated.")
+        return
+
+    agreement = score_agreement(judged, hand)
+    rate = agreement.rate
+    log(f"    {agreement.agreed}/{agreement.n} hand grades matched"
+        + (f" ({rate * 100:.0f}%)" if rate is not None else ""))
+    if agreement.meets_bar is None:
+        log(f"    VERDICT: UNKNOWN -- {agreement.n} grades is fewer than 10.")
+        log("    Not 'the judge is unreliable': there is not enough evidence")
+        log("    to say either way.")
+    elif agreement.meets_bar:
+        log("    VERDICT: at or above the 80% bar.")
+    else:
+        log("    VERDICT: BELOW the 80% bar. Fix the judge prompt before")
+        log("    trusting the refusal measurement above.")
+    if not agreement.covers_both_outcomes:
+        log("    WARNING: the hand grades cover only one kind of outcome, so")
+        log("    this rate says nothing about the other. Grade some cases")
+        log("    where the judge said the answer ASSERTED something.")
+    for row in agreement.disagreements:
+        log(f"    DISAGREED {row['id']:30} judge={row['judge']:12} "
+            f"hand={row['hand']}")
+    if agreement.unmatched_grades:
+        log(f"    hand grades with no matching case (renamed?): "
+            f"{agreement.unmatched_grades}")
+
+    cached = sum(1 for r in results if r.forced_verdict_cached)
+    calls = sum(r.forced_verdict_model_calls for r in results)
+    log(f"    judge cost this run: {calls} model call(s), {cached} served "
+        f"from cache")
 
 
 def report(golden, results, args):
@@ -953,6 +1309,8 @@ def report(golden, results, args):
         for r in page_checked:
             if not r.pages_ok:
                 log(f"    WRONG PAGE {r.id}: cited {r.retrieved_pages}")
+
+    retrieval_report(results)
 
     # ---- score distributions and the two curves ----
     score_table("reranker score distribution (gate-scored only)", results,
@@ -1216,6 +1574,8 @@ def report(golden, results, args):
         for r in unparseable:
             log(f"    {r.id}")
 
+    judge_agreement_report(results)
+
     log()
     log("    Nothing in app/ has been changed by this run. The chosen")
     log("    values above are written to docs/eval-baseline.md and applied")
@@ -1259,6 +1619,12 @@ def main() -> int:
         "--no-generate",
         action="store_true",
         help="Collect scores and curves only; skip every model call for answers.",
+    )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Nine representative cases, one per retrieval shape and gate "
+        "regime. For checking the harness, never for choosing a threshold.",
     )
     args = parser.parse_args()
     return asyncio.run(main_async(args))

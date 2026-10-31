@@ -274,6 +274,31 @@ def _classify_http(exc: BaseException) -> LLMError:
     return LLMUpstreamError(f"provider call failed: {type(exc).__name__}")
 
 
+def _visible_text(candidate: dict) -> str:
+    """The parts of one candidate a user is meant to read.
+
+    Gemini marks reasoning parts with `"thought": true`. It only sends
+    them when `thinkingConfig.includeThoughts` is set, which this client
+    never sets -- so today this filter removes nothing, and that is the
+    reason to have it: `gemini-3.5-flash-lite` reports
+    `"thinking": true`, rejects `thinkingBudget: 0` with a 400, and the
+    day anyone turns includeThoughts on, an unfiltered concatenation
+    splices the model's private reasoning into the cited answer and into
+    the stored Message row. A filter that costs nothing now is cheaper
+    than finding that in production.
+
+    The test is `part.get("thought") is True`, not truthiness: an absent
+    key and an explicit false both mean "visible", and a part is kept
+    unless it says otherwise.
+    """
+    parts = (candidate.get("content") or {}).get("parts") or []
+    return "".join(
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and part.get("thought") is not True
+    )
+
+
 class GeminiLLM(LLMProvider):
     """Google Gemini over the REST API.
 
@@ -598,8 +623,7 @@ class GeminiLLM(LLMProvider):
 
         pieces = []
         for candidate in frame.get("candidates") or []:
-            parts = (candidate.get("content") or {}).get("parts") or []
-            text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+            text = _visible_text(candidate)
             if text:
                 pieces.append(text)
         return pieces, 0
@@ -649,8 +673,7 @@ class GeminiLLM(LLMProvider):
 
         text = ""
         for candidate in body.get("candidates") or []:
-            parts = (candidate.get("content") or {}).get("parts") or []
-            text += "".join(p.get("text", "") for p in parts if isinstance(p, dict))
+            text += _visible_text(candidate)
 
         if not text:
             raise LLMEmptyResponseError(f"{self._model} returned no text")
@@ -774,6 +797,34 @@ def get_llm() -> LLMProvider:
     if not settings.ANTHROPIC_API_KEY:
         raise RuntimeError("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
     return AnthropicLLM(api_key=settings.ANTHROPIC_API_KEY, model=settings.LLM_MODEL)
+
+
+@lru_cache(maxsize=1)
+def get_judge_llm() -> LLMProvider:
+    """The model that GRADES answers, never the one that writes them.
+
+    Separate from `get_llm()` on purpose, even when both resolve to the
+    same model name today. A judge sharing the answerer's weights shares
+    its blind spots: the claims it is least likely to flag as
+    unsupported are exactly the ones it would itself have inferred, and
+    those are the interesting failures. Pointing JUDGE_MODEL at a
+    different model is therefore a real improvement in the measurement
+    -- and keeping it behind its own factory makes that a one-line
+    config change instead of a code change under time pressure.
+
+    Lives in app/ rather than in eval/ because it is a provider, and
+    every other provider in this system is constructed in one place with
+    one set of timeout, pool and error-classification rules. An eval-only
+    copy would be the one client that does not share the connection pool
+    and does not map a 429 onto LLMRateLimitError.
+    """
+    if settings.LLM_PROVIDER == "fake":
+        return FakeLLM()
+    if settings.LLM_PROVIDER == "gemini":
+        return _gemini(settings.JUDGE_MODEL)
+    if not settings.ANTHROPIC_API_KEY:
+        raise RuntimeError("LLM_PROVIDER=anthropic requires ANTHROPIC_API_KEY")
+    return AnthropicLLM(api_key=settings.ANTHROPIC_API_KEY, model=settings.JUDGE_MODEL)
 
 
 @lru_cache(maxsize=1)

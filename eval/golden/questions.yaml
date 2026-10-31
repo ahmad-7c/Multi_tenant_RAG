@@ -28,6 +28,14 @@
 #   category        see eval/README.md
 #   why             why this case is here; the reason to keep or cut it
 
+# Bump this by hand on ANY change to a label, a question or the corpus.
+# Every eval run records it, so two runs scored against different sets
+# can be told apart instead of silently compared.
+#   1  26 questions, 24 gate-scored (the n=24 calibration)
+#   2  40 questions, 38 gate-scored; four retrieval-shape types added,
+#      a third acme document, the acme -> globex isolation direction
+version: "2"
+
 questions:
 
   # ================================================================

@@ -232,6 +232,59 @@ def test_query_endpoint_refuses_when_the_guard_tripped(
     assert "text-embedding-3-small" not in detail
 
 
+def test_the_startup_guard_reads_the_TEST_database(
+    db_session, document, monkeypatch, tmp_path
+):
+    """The lifespan must see the suite's data, not a developer's.
+
+    `app/main.py` opens its own session (`db = SessionLocal()`) for the
+    startup checks, which the `get_db` dependency override does not
+    cover. For a while that session pointed at the DEV database, so the
+    suite's startup state was whatever happened to be in a local
+    Postgres -- and running the eval harness with
+    EMBEDDING_PROVIDER=fake (which writes chunks tagged
+    `fake-embedding`) turned four SSE tests and the /health test red
+    without touching a line of the code they exercise.
+
+    This test builds its own TestClient, so it runs the lifespan AFTER
+    inserting a mismatched chunk into the test database. If the guard
+    read any other database it would find nothing and the assertion
+    below would fail.
+    """
+    from fastapi.testclient import TestClient
+
+    import app.main as main_module
+    from app.core.config import settings
+    from app.main import app as fastapi_app
+    from app.api.deps import get_db
+
+    _insert_chunk(
+        db_session,
+        org_id=document.org_id,
+        document_id=document.id,
+        model="a-model-that-is-not-configured",
+    )
+    db_session.flush()
+
+    class _SuiteSession:
+        def __getattr__(self, name):
+            return getattr(db_session, name)
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(main_module, "SessionLocal", lambda: _SuiteSession())
+    fastapi_app.dependency_overrides[get_db] = lambda: iter([db_session])
+    try:
+        with TestClient(fastapi_app) as fresh:
+            body = fresh.get("/health").json()
+    finally:
+        fastapi_app.dependency_overrides.clear()
+
+    assert body["status"] == "ok"
+    assert "embedding_model_mismatch" in body.get("degraded", [])
+
+
 def test_other_endpoints_still_work_when_the_guard_tripped(
     client, org_factory, user_factory, auth_headers
 ):
