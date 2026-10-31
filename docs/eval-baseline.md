@@ -282,35 +282,85 @@ the TTL.
 
 ---
 
-## Judge reliability: UNMEASURED
+## Judge reliability: 3/3 against hand grades, and still UNKNOWN
 
-`eval/golden/judge_grades.yaml` does not exist, so the agreement rate is
-**unknown** — not "good", not "bad". The harness prints
-`agreement UNMEASURED` and refuses to conclude.
+Hand grades are in `eval/golden/judge_grades.yaml`. Agreement is **3 of
+3**, and the harness reports **UNKNOWN**, not "good" —
+`Agreement.meets_bar` returns `None` below 10 grades. Three perfect
+grades is not evidence the judge works.
 
-Every verdict in the end-to-end section above is therefore an
-unvalidated judgement by `gemini-3.5-flash-lite`, including the two
-SUPPORTED verdicts on the disputed cases. Those two were read by hand
-and the answers are quoted in full above precisely because the judge
-cannot yet be taken on trust.
+### Why there are only three grades, and why more runs will not help
 
-**What is needed:** at least 10 hand grades covering both DECLINED and
-asserting outcomes. Below 10, `Agreement.meets_bar` returns `None`
-rather than `False`.
+The judge is almost never invoked. `canned_refusal()` matches the
+system's own refusal strings before any model call — correctly, since
+recognising fixed text with a language model costs money and can be
+wrong about something certain. **In this run that shortcut handled 16 of
+19 verdicts, leaving 3 actual model calls.**
 
-Note also that `JUDGE_MODEL` currently equals `LLM_MODEL`, so the judge
-is grading its own output. It has its own setting for exactly this
-reason; pointing it at a stronger model is a config change, not a code
-change.
+So agreement cannot reach n=10 from a normal run however often it is
+repeated: the cases the judge decides are exactly the cases where the
+model asserted something instead of declining, and there were three.
 
----
+**What would fix it, and is deliberately not built:** also judge the
+forced-open answers for *answerable* cases, where the model asserts by
+design. That is ~21 more judgeable verdicts per run and ~21 more model
+calls — a real cost on a free tier, and a decision rather than a detail.
+
+### The judge failed its own worked example
+
+The first hand grading found a genuine defect, not a borderline
+reading. On `acme-deploy-friday` the judge called
+
+> "No, production deploys run Tuesday through Thursday, 09:00 to 16:00
+> UTC [1]."
+
+**SUPPORTED**. The judge's prompt had told it, in as many words, that
+*"Deploys run Tuesday to Thursday" does not state what happens on
+Friday* — and it answered the other way.
+
+The diagnosis was placement, not wording. The rule sat in a trailing
+`Rules:` list while the *definition* of `supported` said "is every claim
+STATED in the CONTEXT", and a leading "No" does not read as a claim. The
+model applied the definition and skipped the rule.
+
+The prompt now puts the rule inside the definition of `supported`, says
+outright that a leading yes/no **is** a claim, and works the example
+through to its verdict. Verified with three targeted re-judges (3 live
+calls, not a run):
+
+| case | before | after | hand |
+|---|---|---|---|
+| `acme-deploy-friday` | SUPPORTED | **UNSUPPORTED** | UNSUPPORTED |
+| `acme-rollback-migrations-how` | SUPPORTED | SUPPORTED | SUPPORTED |
+| `acme-lost-phone` | SUPPORTED | SUPPORTED | SUPPORTED |
+
+The fixed judge's reasoning on the case it had got wrong: *"The context
+states when deploys run but does not explicitly forbid Friday afternoon
+deployments."*
+
+Because `cache_key()` includes the prompt text, the fix correctly
+invalidated every stored verdict — which is what that design was for.
+
+**This changes a number elsewhere in this document.** The end-to-end
+refusal section reports `acme-deploy-friday` as the model asserting an
+answer, judged SUPPORTED. Under the fixed judge it is **UNSUPPORTED** —
+an unsupported inference, which is the stricter and more useful reading.
+The end-to-end refusal count (15/17) is unchanged, because that count is
+about whether the model *declined*, not about whether its assertion was
+grounded.
+
+### Still outstanding
+
+`JUDGE_MODEL` currently equals `LLM_MODEL`, so the judge is grading its
+own output. It has its own setting for exactly this reason; pointing it
+at a stronger model is a config change, not a code change.
 
 ## Not verified
 
 - **Retrieval at scale.** recall@8 = 1.000 over 40 children per tenant.
   A real tenant has thousands, and the planner's choice of the HNSW path
   changes with tenant share (see CLAUDE.md's measured finding).
-- **Judge agreement.** No hand grades exist.
+- **Judge agreement beyond n=3.** Three hand grades, three agreements, which is not enough to conclude. The shortcut that makes the judge cheap is what makes it hard to measure.
 - **These thresholds under any other provider.** Both are tied to
   `rerank-v3.5` and `gemini-embedding-001`.
 - **The degraded (reranker-down) regime end to end.** The cosine floor

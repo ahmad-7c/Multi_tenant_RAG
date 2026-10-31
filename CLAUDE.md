@@ -100,9 +100,25 @@ Full data in `docs/eval-baseline.md`; raw run in
   It now passes the gate and nothing has measured what the model does
   with it. Every generated answer in the baseline was produced at
   0.4162, which is why the run file records the thresholds in force.
-- **Judge agreement is UNMEASURED** and reported as such, not as "good".
-  `eval/golden/judge_grades.yaml` does not exist yet; below 10 hand
-  grades `Agreement.meets_bar` returns None, not False.
+- **Hand grading found a real judge defect, and the judge is still
+  UNKNOWN.** On `acme-deploy-friday` it called "No, production deploys
+  run Tuesday through Thursday" SUPPORTED, after being told in as many
+  words that *"Deploys run Tuesday to Thursday" does not state what
+  happens on Friday*. Diagnosis was PLACEMENT, not wording: the rule sat
+  in a trailing `Rules:` list while the definition of `supported` said
+  "is every claim STATED in the CONTEXT", and a leading "No" does not
+  read as a claim. The rule now lives inside that definition and the
+  example is worked through to its verdict. Verified with 3 targeted
+  re-judges: 3/3 against hand grades, and the fixed judge's own reason
+  is "the context states when deploys run but does not explicitly forbid
+  Friday afternoon deployments".
+- **Agreement is 3/3 and reported as UNKNOWN**, because
+  `Agreement.meets_bar` returns None below 10 grades. Three perfect
+  grades is not evidence. **And more runs will not help**: the
+  canned-refusal shortcut handled 16 of 19 verdicts, so only 3 were
+  model calls. Reaching n=10 needs judging the forced-open answers for
+  ANSWERABLE cases too -- ~21 more model calls per run, which is a
+  decision, not a detail.
 
 #### Harness (Part 2)
 - `eval/metrics.py` -- recall@k, MRR, citation-page correctness as pure
@@ -221,10 +237,11 @@ not evidence that it exercises that failure mode.**
 - **`eval/calibrate.py` has no unit tests.** It is driven by live runs
   and a mutation in it would survive; its output is reviewed by hand
   against the run file.
-- **Judge agreement unmeasured** -- needs 10+ hand grades in
-  `eval/golden/judge_grades.yaml` covering both DECLINED and asserting
-  outcomes. `JUDGE_MODEL` currently equals `LLM_MODEL`, so the judge
-  grades its own output.
+- **Judge agreement is n=3.** 3/3 after the prompt fix, which is not
+  enough to conclude; `meets_bar` is None below 10. The shortcut that
+  makes the judge cheap is what makes it hard to measure.
+  `JUDGE_MODEL` still equals `LLM_MODEL`, so the judge grades its own
+  output -- a config change away from not doing so.
 - **Nothing has been measured at the newly applied 0.3230.** Every
   generated answer in the baseline ran at 0.4162.
 - **Answer completeness over a parent is unproven** (the

@@ -1,0 +1,79 @@
+# HAND grades for the LLM judge. Never generated.
+#
+# The judge grades answers; this file grades the judge. Generating it
+# with a model would check the judge against itself, which is the same
+# mistake as letting a model write `should_answer` in questions.yaml.
+#
+# Keys are case ids from eval/golden/questions.yaml. Values are the
+# verdict a careful human reaches looking ONLY at the context the model
+# was given -- the same constraint the judge is under.
+#
+# The grade is about GROUNDEDNESS, not about whether the golden label is
+# right. `acme-lost-phone` is labelled `ambiguous` because it is unclear
+# whether a phone falls under a laptop-scoped heading; that is a
+# labelling question. The judge is only asked whether the answer's
+# claims are stated in the context, and they are.
+#
+# ---------------------------------------------------------------------
+# Why there are only three grades, and not the ten the playbook wants
+# ---------------------------------------------------------------------
+# The judge is almost never invoked. `canned_refusal()` matches the
+# system's own refusal strings before any model call -- correctly, since
+# recognising fixed text with a language model costs money and can be
+# wrong about something certain. In the n=38 run that shortcut handled
+# 16 of 19 verdicts, leaving THREE actual model calls.
+#
+# So agreement cannot reach n=10 from a normal run, however many times
+# it is repeated: the cases the judge decides are exactly the cases
+# where the model asserted something instead of declining, and there
+# were three. `Agreement.meets_bar` therefore returns None (UNKNOWN) and
+# the harness says so rather than reporting 67% as a finding.
+#
+# What would fix it, and is NOT built: also judge the forced-open answers
+# for ANSWERABLE cases, where the model asserts by design. That is ~21
+# more judgeable verdicts per run and ~21 more model calls -- a real
+# cost on a free tier, and a decision rather than a detail.
+# ---------------------------------------------------------------------
+
+grades:
+  # "No, production deploys run Tuesday through Thursday, 09:00 to
+  # 16:00 UTC [1]."
+  #
+  # DISAGREES with the judge, which said SUPPORTED.
+  #
+  # The context states the deploy window. It does NOT state what happens
+  # on a Friday, so "No" is an inference from the window rather than a
+  # claim the context makes. That is precisely the case the judge's own
+  # system prompt names, by example:
+  #
+  #   "A yes/no answer derived from a rule that does not mention the
+  #    case asked about is an inference, so supported is false. 'Deploys
+  #    run Tuesday to Thursday' does not state what happens on Friday."
+  #
+  # The judge was told this verbatim and answered the other way. That is
+  # a prompt-following failure, not a judgement call, which is why this
+  # grade is recorded as a disagreement rather than treated as a
+  # borderline reading.
+  acme-deploy-friday: UNSUPPORTED
+
+  # "A rollback does not revert database migrations, and reverting a
+  # migration is a separate, manual change [1]."
+  #
+  # AGREES with the judge (SUPPORTED). Both clauses are stated outright
+  # in the runbook. The answer never says HOW to revert a migration --
+  # which is what was asked -- so it is incomplete, but incompleteness
+  # is not the axis the judge is grading. `asserts_answer` is true (it
+  # responds to the question's premise directly) and every claim it
+  # makes is in the context.
+  acme-rollback-migrations-how: SUPPORTED
+
+  # "Lost or stolen devices must be reported to the security team within
+  # four hours of discovery [1]."
+  #
+  # AGREES with the judge (SUPPORTED). security-policy.md contains that
+  # sentence almost verbatim. The case is labelled `ambiguous` because
+  # the sentence sits under a laptop-scoped heading and it is unclear
+  # whether a phone is covered -- but that is a question about the
+  # LABEL, not about whether the answer is grounded in what it was
+  # shown.
+  acme-lost-phone: SUPPORTED

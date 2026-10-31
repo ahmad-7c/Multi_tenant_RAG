@@ -27,6 +27,28 @@ judge asked for one label answers whichever is easier. So the model now
 reports `asserts_answer` and `supported` separately and the label is
 derived here.
 
+## The judge failed its own worked example, and was fixed
+
+Hand-graded against the n=38 run, the judge got `acme-deploy-friday`
+wrong: it called "No, production deploys run Tuesday through Thursday"
+SUPPORTED. The prompt had told it, in as many words, that *"Deploys run
+Tuesday to Thursday" does not state what happens on Friday* -- and it
+answered the other way.
+
+The diagnosis is placement, not wording. The rule sat in a trailing
+"Rules:" list while the DEFINITION of `supported` said "is every claim
+STATED in the CONTEXT", and a leading "No" does not read as a claim. So
+the model applied the definition and skipped the rule.
+
+The fix moves the rule inside the definition of `supported`, says
+outright that a leading yes/no IS a claim, and works the example
+through to its verdict. Verified with one targeted re-judge: the same
+answer and context now return `supported: false`.
+
+Because the cache key includes this prompt text, the fix correctly
+invalidates every stored verdict -- which is the behaviour
+`cache_key()` was written for.
+
 Four guards keep it honest:
 
   * It never sees the golden label. If it were told the expected
@@ -101,17 +123,38 @@ asserts_answer
 supported
     Only meaningful when asserts_answer is true. Is every claim in the
     asserted answer STATED in the CONTEXT?
-    true  - yes, stated outright.
+    true  - every claim is stated outright.
     false - some claim is not stated: an inference the context merely
             implies, outside knowledge, or a rule carried over from a
             different subject in the context.
 
+    A LEADING "yes" OR "no" IS A CLAIM. Grade it like any other.
+    Ask: does the context contain a sentence that states this yes or
+    this no about the exact thing asked about? If the context states a
+    rule and the answer applies that rule to a case the rule does not
+    mention, the yes/no is an INFERENCE and supported is false -- no
+    matter how reasonable the inference is, and no matter that the rest
+    of the answer quotes the context correctly.
+
+    Worked example. Question: "Can I deploy on a Friday afternoon?"
+    Context: "Production deploys run Tuesday through Thursday, 09:00 to
+    16:00 UTC." Answer: "No, production deploys run Tuesday through
+    Thursday, 09:00 to 16:00 UTC."
+      -> asserts_answer: true
+      -> supported: FALSE
+    The quoted window is stated. The "No" is not: the context describes
+    when deploys run and never says what happens outside that window --
+    it does not say Friday deploys are forbidden, nor that an exception
+    process exists, nor that one does not. An answer that said only
+    "deploys run Tuesday through Thursday" with no yes/no would be
+    supported.
+
 Rules:
   - Judge only against the CONTEXT, never outside knowledge, even when
     the answer is true in the real world.
-  - A yes/no answer derived from a rule that does not mention the case
-    asked about is an inference, so supported is false. "Deploys run
-    Tuesday to Thursday" does not state what happens on Friday.
+  - Grade what the answer CLAIMS, not whether it is complete. An answer
+    that is correct as far as it goes and stops early is still
+    supported.
   - Citation markers like [1] are formatting; ignore them.
   - "reason" must be one sentence, under 25 words.
 """
