@@ -45,17 +45,199 @@ not "# stores the org id"
 3. Then write the code
 
 ## Current Phase
-**PHASES 1-3 COMPLETE. Free-provider migration COMPLETE (all 7 steps,
-verified against the real APIs including a full end-to-end HTTP run).
-PHASE 4 IN PROGRESS: the gate is now CALIBRATED from measurement, and
-the refusal behaviour is measured end to end.** 554 tests green against
-real Postgres + pgvector with no network (the suite is pinned offline by
-construction). Dev DB at migration 0007.
+**PHASES 1-3 COMPLETE. Free-provider migration COMPLETE. PHASE 4
+COMPLETE: golden set of 40 (38 gate-scored), retrieval and generation
+scored separately, thresholds re-calibrated at n=38 from a live run and
+applied, rate limiting + stream slots + budget guard, usage metering,
+and 12 mutations proving the tests bite.** 709 tests green against real
+Postgres + pgvector with no network (the suite is pinned offline by
+construction). Dev DB at migration 0008.
 
 `.env` is LIVE: `EMBEDDING_PROVIDER=gemini`, `LLM_PROVIDER=gemini`,
 `RERANKER_PROVIDER=hosted`. Backup at `.env.backup-pre-live`. The test
 suite is unaffected either way -- see the offline guard in
 `tests/conftest.py`.
+
+**Next: UI.**
+
+### Phase 4 completion (2026-10-31)
+
+#### Applied thresholds, from the n=38 live run
+`CONFIDENCE_THRESHOLD = 0.3230`, `VECTOR_SIMILARITY_FLOOR = 0.5594`.
+Full data in `docs/eval-baseline.md`; raw run in
+`eval/runs/20261031T053310Z-full.json`; the n=24 baseline archived at
+`docs/eval-baseline-n24.md`. The run was clean -- 0 reranker fallbacks,
+0 rate limits, 0 errors -- so every score is a real cross-encoder score.
+
+- **The selection rule disagreed with itself.** At n=24 one gap
+  qualified, so "widest gap below the lowest answerable score" did no
+  work. At n=38 THREE qualified and all three hold recall at 1.000:
+  0.1324 (FP=11), 0.2653 (FP=6), 0.3230 (FP=4). The rule returns the
+  widest, which spends precision on margin without being asked.
+  Operator chose the highest: 7 fewer false answers, margin 0.0165
+  instead of 0.207. `select_threshold` now reports every qualifying gap
+  with its confusion matrix. The old 0.4162 is strictly WORSE than
+  0.3230 here (same 4 FPs, one fewer TP).
+- **The overlap is unchanged and irreducible.** Worst answerable 0.3395
+  < best refusable 0.8730. Four should-refuse cases sit above the lowest
+  answerable score at any threshold. A cross-encoder scores relevance,
+  not sufficiency.
+- **The prompt refuses, not the gate.** End-to-end 15/17; with the gate
+  forced open the model declined the same 15. The two failures are the
+  two long-standing disputed cases. No sufficiency check built -- the
+  measured gain is at most 2 of 17, both arguable.
+- **Retrieval is not the bottleneck, and the number is weak anyway.**
+  recall@8 = 1.000, MRR 0.985 over 33 scored cases. Stated with its
+  limit: 40 children per tenant means the top 8 is a fifth of the
+  corpus. This proves wiring, not scale.
+- **The strongest new finding: 2 of 3 `spans_two_chunks` cases answered
+  HALF the span.** The parent sent to the model contained both halves
+  (the chunker test guarantees it); the answer used the part nearest the
+  retrieved child, and both read as good answers. Parent-child chunking
+  is this architecture's central retrieval decision and this is the
+  first evidence the model does not always use what it is given.
+- `acme-rollback-cluster-flag` (0.3395) was a FALSE REFUSAL at 0.4162.
+  It now passes the gate and nothing has measured what the model does
+  with it. Every generated answer in the baseline was produced at
+  0.4162, which is why the run file records the thresholds in force.
+- **Judge agreement is UNMEASURED** and reported as such, not as "good".
+  `eval/golden/judge_grades.yaml` does not exist yet; below 10 hand
+  grades `Agreement.meets_bar` returns None, not False.
+
+#### Harness (Part 2)
+- `eval/metrics.py` -- recall@k, MRR, citation-page correctness as pure
+  functions over a ranked list. The old `retrieval_hit` bool could not
+  tell rank 1 from rank 47. TWO ranked lists per case, because one
+  cannot diagnose: candidate recall 1.0 + reranked 0.0 means the
+  cross-encoder demoted it; both 0.0 means neither leg found it.
+  Relevance is labelled `(document, page)`, never chunk id -- ids are
+  regenerated on every ingest and by any `CHILD_TOKENS` change, so an
+  id-pinned set would go stale SILENTLY and read as a retrieval
+  collapse. "No support labelled" is None, never 0.0.
+- `eval/runs.py` -- `eval/runs/<timestamp>-<label>.json` with a config
+  snapshot. The old code dumped a bare list to one GITIGNORED
+  `eval/results.json`, so each run erased the last and the evidence for
+  a live threshold existed nowhere. Secrets excluded by an ALLOW-LIST.
+  The first redaction rule matched "token" as a substring and silently
+  dropped CHILD_TOKENS/PARENT_TOKENS/LLM_MAX_TOKENS/CONTEXT_TOKEN_BUDGET
+  -- the four settings that decide what a recall figure means. Caught by
+  its own test.
+- Golden set has a `version` (now "2"); absent or blank is a load error.
+- Judge: own `JUDGE_MODEL`/`JUDGE_TEMPERATURE`(0.0)/`JUDGE_MAX_RETRIES`
+  and `get_judge_llm()`. One retry on invalid JSON WITH THE FAILURE FED
+  BACK -- a verbatim resend at temperature 0 reproduces the same
+  unparseable reply. Cached on sha256(judge model, grading prompt,
+  question, context, answer), NOT on case id: the id is stable across
+  runs while the answer is not. UNPARSEABLE is never cached.
+- `--smoke`: nine cases, one per retrieval shape and gate regime,
+  including the isolation twin and the only path through `check_rubric`.
+  Records `sufficient_for_calibration: false`.
+
+#### Protection (Parts 4-5)
+- `app/services/rate_limit.py` -- Redis token bucket in Lua, per org.
+  Token bucket over fixed window (300 at 11:59:59 + 300 at 12:00:00
+  never exceeds a fixed window) and over sliding-window-log (one member
+  per request to answer what one float answers). ONE script per
+  decision: the read-modify-write version allows more than the capacity
+  whenever two requests interleave, so it fails open under load, which
+  is when it is needed. Time from Redis `TIME` inside the script --
+  several API processes mean several clocks.
+- Stream slots are a TIMESTAMPED SORTED SET, not INCR/DECR. A worker
+  killed mid-stream never runs its release; with a counter that slot is
+  gone until someone deletes a key by hand. Expiring members self-heal.
+- 30/min answers, 300/min other, 3 concurrent streams; per-IP on
+  login/register (a per-ACCOUNT limit cannot see credential stuffing).
+  429 carries `Retry-After` rounded UP; the body names no limit, key or
+  org. X-Forwarded-For ignored unless `TRUST_FORWARDED_FOR` -- a
+  spoofable client IP is worse than none.
+- Redis down is ASYMMETRIC: auth and reads fail OPEN, the answer
+  endpoint fails CLOSED onto a per-process bucket. `/health` reports
+  `rate_limiter_degraded`.
+- The SSE slot is released in a `finally` around the generator, covering
+  completion, exception, and `GeneratorExit`/cancellation.
+- `usage_events` (migration 0008), composite index (org_id, created_at)
+  with org_id LEADING. Token columns NULLABLE because unknown and zero
+  are different facts. Counts come from Gemini's own `usageMetadata` via
+  a CALLER-SUPPLIED `usage_sink` dict -- not tiktoken (not Gemini's
+  tokenizer) and not an attribute on the provider (a singleton would mix
+  two tenants' tokens). The sink is cleared per retry attempt.
+- `usage_service.record()` NEVER raises: a usage row is a byproduct of
+  work the user already received. 429s are deliberately NOT metered --
+  an attacker's rejected requests would each buy a DB write, making the
+  limiter a DoS amplifier. Budget rejections ARE. Cache hits do not
+  count against the budget: counting them would make the thing that
+  saves quota consume it.
+- `GET /api/v1/usage` -- admin only, org-scoped by the TOKEN. There is
+  no `org_id` parameter at all, so "usage for another org" is not a
+  request this API can express.
+
+#### Mutations (Part 7)
+12 applied one at a time on a throwaway branch, 12 caught, 0 survivors
+-- after ONE REAL GAP was found and closed. See
+`docs/mutation-testing.md` and `scripts/mutate.py`.
+
+The gap: `leak-slot-on-disconnect` was reported CAUGHT by the first
+sweep, but the catch was a false comfort -- the failing test was the
+persistence one, while `test_..._when_the_client_disconnects`, written
+for exactly this, PASSED with the mutation in place. `TestClient`
+buffers the whole response, so abandoning its iterator never cancels
+anything server-side. A real server calls `aclose()` on the body
+iterator, raising `GeneratorExit` at the suspended yield; a `finally`
+runs, a trailing statement does not.
+`test_closing_the_body_iterator_still_releases_the_slot` now drives the
+route's own `body_iterator` and was confirmed failing against the
+mutation before being committed. **A test named after a failure mode is
+not evidence that it exercises that failure mode.**
+
+#### Two test-isolation bugs found by this work
+- **The suite's app lifespan read the DEV database.** `app/main.py`
+  opens its own `SessionLocal()`, which the `get_db` override does not
+  cover. Running the harness offline (`EMBEDDING_PROVIDER=fake` writes
+  chunks tagged `fake-embedding`) tripped the embedding-model guard and
+  turned four SSE tests and `/health` red with no change to the code
+  they exercise -- the suite was green or red according to a database it
+  does not own. Fixed in `conftest.py`;
+  `test_the_startup_guard_reads_the_TEST_database` pins it.
+- **The limiter was shared across tests and needed a live Redis.**
+  `get_limiter()` builds a `RedisLimiter`, so 34 route tests silently
+  required Redis; and one shared register bucket (3/min per IP) meant
+  the fourth test that registered a user got a 429 -- which test that
+  was depended on execution order. An autouse fixture installs a fresh
+  `InMemoryLimiter` per test, with limiting still ENABLED. The budget
+  tests fake the UTC day, because the global budget key is one key for
+  the whole deployment by design.
+
+#### Carried-forward gaps closed
+- `llm.py` concatenated every response part with no `thought` filter in
+  two places. Latent (Gemini sends thought parts only under
+  `includeThoughts`, and `thinkingBudget: 0` is a 400 on this model) but
+  it would splice private reasoning into a cited answer, the stored
+  `Message` row and the cache the day anyone enables it.
+- `MessageResponse` now exposes `kind`, so a client can tell an answer
+  from a refusal from an outage instead of pattern-matching prose. NULL
+  stays NULL for user turns and pre-0006 rows.
+
+### Known gaps carried into the UI phase
+- **`eval/calibrate.py` has no unit tests.** It is driven by live runs
+  and a mutation in it would survive; its output is reviewed by hand
+  against the run file.
+- **Judge agreement unmeasured** -- needs 10+ hand grades in
+  `eval/golden/judge_grades.yaml` covering both DECLINED and asserting
+  outcomes. `JUDGE_MODEL` currently equals `LLM_MODEL`, so the judge
+  grades its own output.
+- **Nothing has been measured at the newly applied 0.3230.** Every
+  generated answer in the baseline ran at 0.4162.
+- **Answer completeness over a parent is unproven** (the
+  `spans_two_chunks` finding above).
+- **Retrieval at scale is unmeasured**: recall@8 = 1.000 over 40
+  children per tenant.
+- The reranker breaker clears only on process restart, which is correct
+  for a config fix but means a provider-side 401 later resolved still
+  needs a restart.
+- No live test covers a refusal path or cache-hit behaviour end to end.
+- The in-memory limiter fallback is per PROCESS: with N API processes an
+  org gets N buckets. It bounds the worst case to N x limit instead of
+  infinity, and is not a correct distributed limiter.
 
 ### Phase 4 audit + golden-set expansion (2026-10-31)
 Step 0 audit of the Phase 4 playbook, then Part 1. **564 tests green**

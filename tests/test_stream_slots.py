@@ -322,3 +322,64 @@ def await_sync(coro):
     import asyncio
 
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+# ---- the disconnect path, driven the way the SERVER sees it ------------
+
+
+@pytest.mark.asyncio
+async def test_closing_the_body_iterator_still_releases_the_slot(
+    wired, auth_headers
+):
+    """A disconnect, exercised through the ASGI mechanism it really uses.
+
+    `test_the_slot_is_released_when_the_client_disconnects` above does
+    NOT catch a leak here, and mutation testing is how that was found:
+    moving the release out of the `finally` and onto the line after the
+    loop left that test green. TestClient buffers the whole response, so
+    abandoning its iterator never cancels anything server-side -- the
+    generator had already run to completion before the test stopped
+    reading.
+
+    What a real server does when a client vanishes is call `aclose()` on
+    the response's body iterator, which raises GeneratorExit at the
+    suspended `yield`. A `finally` runs; a statement after the loop does
+    not. So this test drives the route's own body_iterator directly:
+    take one chunk, then close it.
+    """
+    from starlette.requests import Request
+
+    from app.main import app as fastapi_app
+    from app.schemas.conversation import CreateMessageRequest
+
+    org, user, conversation, limiter, route = wired
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "path": f"/api/v1/conversations/{conversation.id}/messages",
+            "headers": [],
+            "query_string": b"",
+            "client": ("127.0.0.1", 1234),
+            "app": fastapi_app,
+        }
+    )
+
+    response = await route.create_message(
+        conversation_id=conversation.id,
+        payload=CreateMessageRequest(content="how long for expenses?"),
+        request=request,
+        current_user=user,
+    )
+
+    assert len(limiter.acquired) == 1
+
+    iterator = response.body_iterator
+    await iterator.__anext__()          # one token reaches the client
+    assert limiter.in_use(org.id) == 1  # the slot is genuinely held
+    await iterator.aclose()             # the client goes away
+
+    assert limiter.in_use(org.id) == 0
+    assert limiter.released == limiter.acquired
