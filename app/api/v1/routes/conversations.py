@@ -20,6 +20,7 @@ the header is necessary but not by itself sufficient.
 """
 import asyncio
 import json
+import time
 import logging
 import uuid
 
@@ -28,11 +29,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.limits import get_limiter, limit_answers, limit_default
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
 from app.models.conversation import MessageKind
 from app.models.organization import Organization
 from app.models.user import User
+from app.models.usage_event import UsageStatus
+from app.services import usage_service
+from app.services.rate_limit import RedisUnavailable
 from app.schemas.conversation import (
     ConversationResponse,
     CreateConversationRequest,
@@ -56,7 +61,12 @@ _NOT_FOUND = HTTPException(
 )
 
 
-@router.post("", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=ConversationResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(limit_default)],
+)
 def create_conversation(
     payload: CreateConversationRequest,
     db: Session = Depends(get_db),
@@ -67,7 +77,11 @@ def create_conversation(
     )
 
 
-@router.get("", response_model=list[ConversationResponse])
+@router.get(
+    "",
+    response_model=list[ConversationResponse],
+    dependencies=[Depends(limit_default)],
+)
 def list_conversations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -77,7 +91,11 @@ def list_conversations(
     )
 
 
-@router.get("/{conversation_id}/messages", response_model=list[MessageResponse])
+@router.get(
+    "/{conversation_id}/messages",
+    response_model=list[MessageResponse],
+    dependencies=[Depends(limit_default)],
+)
 def list_messages(
     conversation_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -102,6 +120,37 @@ def _sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
+def _usage_status(outcome) -> UsageStatus:
+    """Map what the user got onto what was billable.
+
+    Deliberately not the same thing as `messages.kind`, which records
+    what the user was SHOWN. A gate refusal is a refusal to the user and
+    still cost an embedding and a rerank; a provider timeout is an error
+    and cost a partial generation. Both are billable, differently.
+    """
+    if outcome.errored:
+        return UsageStatus.ERROR
+    if outcome.kind == MessageKind.REFUSAL:
+        return UsageStatus.REFUSED
+    return UsageStatus.OK
+
+
+def _output_tokens(usage: dict) -> int | None:
+    """Answer tokens, plus thinking tokens when the provider reports them.
+
+    Thinking tokens are BILLED and are not part of the answer, so a cost
+    figure that omits them is wrong in the expensive direction. Measured
+    absent on gemini-3.5-flash-lite (which also rejects
+    `thinkingBudget: 0` with a 400), so this is normally just
+    candidatesTokenCount -- and is correct the day it is not.
+    """
+    candidates = usage.get("candidatesTokenCount")
+    thoughts = usage.get("thoughtsTokenCount")
+    if candidates is None and thoughts is None:
+        return None
+    return (candidates or 0) + (thoughts or 0)
+
+
 def _citation_payload(citation) -> dict:
     return {
         "marker": citation.marker,
@@ -118,7 +167,12 @@ async def create_message(
     conversation_id: uuid.UUID,
     payload: CreateMessageRequest,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    # limit_answers REPLACES get_current_user rather than sitting beside
+    # it. Two dependencies resolving the same bearer token would decode
+    # it twice, and -- the real reason -- it would be possible to delete
+    # the limit while leaving authentication in place, which looks
+    # correct in a diff.
+    current_user: User = Depends(limit_answers),
 ):
     # Set at startup by the embedding-model guard in main.py. Refusing is
     # the honest response: every stored vector was produced by a different
@@ -194,6 +248,61 @@ async def create_message(
     llm = get_llm()
     cache = get_answer_cache()
 
+    # ---- the concurrency slot --------------------------------------
+    # Acquired here and not in a dependency, because it must be RELEASED
+    # when the stream ends, and a FastAPI dependency's teardown runs
+    # before the StreamingResponse body does. A slot released at that
+    # point is a slot that was never held.
+    #
+    # A cache hit still takes a slot: it is cheap, but it is one more
+    # concurrent response, and a cap that exempts the cheap path is a
+    # cap one tenant can walk straight through.
+    # Measured from here: after auth, the limiter and the model guard,
+    # because what is being metered is the WORK, and a request rejected
+    # by the limiter did none. Those are recorded separately, with
+    # status REJECTED and no latency.
+    started_at = time.monotonic()
+    # One dict per request, owned by this handler. The provider is a
+    # process-wide singleton, so usage recorded on the provider itself
+    # would mix two tenants' tokens under concurrency.
+    usage: dict = {}
+
+    slot: str | None = None
+    slot_degraded = False
+    if settings.RATE_LIMIT_ENABLED:
+        limiter = get_limiter()
+        try:
+            slot = await limiter.acquire_stream_slot(
+                str(org_id), limit=settings.MAX_CONCURRENT_STREAMS_PER_ORG
+            )
+        except RedisUnavailable:
+            # Fail OPEN on the slot specifically, unlike the rate limit.
+            # The per-minute bucket has already failed closed onto a
+            # per-process bucket, so spend is bounded; refusing here as
+            # well would take the product down during a Redis incident
+            # for a second-order protection.
+            slot_degraded = True
+            logger.warning(
+                "stream slot could not be acquired (Redis unavailable); "
+                "serving without a concurrency cap"
+            )
+        if slot is None and not slot_degraded:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=(
+                    "Too many answers are being generated for your "
+                    "organisation at once. Please wait for one to finish."
+                ),
+                # No Retry-After: unlike a token bucket, this one has no
+                # refill rate to compute a wait from -- it clears when
+                # somebody else's answer finishes, which is unknowable
+                # here. A guessed number would be worse than none.
+            )
+
+    async def _release_slot():
+        if slot is not None:
+            await get_limiter().release_stream_slot(str(org_id), slot)
+
     async def event_stream():
         outcome = query_service.AnswerOutcome(
             answer="", citations=[], errored=False, kind=MessageKind.ANSWER
@@ -202,7 +311,9 @@ async def create_message(
             # A cache hit is emitted as a single token event, deliberately:
             # the client parses one format whether the answer took three
             # seconds to generate or came back instantly.
-            async for kind, value in query_service.generate_answer(prepared, llm=llm):
+            async for kind, value in query_service.generate_answer(
+                prepared, llm=llm, usage_sink=usage
+            ):
                 if kind == "token":
                     yield _sse("token", {"text": value})
                 else:
@@ -258,8 +369,82 @@ async def create_message(
 
         await asyncio.to_thread(_persist)
 
+        # ---- metering ------------------------------------------------
+        # After the stream, on a worker thread, in its own short
+        # session: the user is already served, so this costs them
+        # nothing, and it never holds a session across the stream.
+        #
+        # Token counts come from `usage`, which the PROVIDER filled. An
+        # empty dict means no model call happened (a cache hit, or the
+        # gate refused) and the columns stay NULL -- "unknown" and
+        # "zero" are different facts and the table keeps them apart.
+        def _meter():
+            session = SessionLocal()
+            try:
+                usage_service.record(
+                    session,
+                    org_id=org_id,
+                    user_id=user_id,
+                    endpoint=usage_service.ENDPOINT_ANSWER,
+                    status=_usage_status(outcome),
+                    embedding_tokens=None,
+                    llm_input_tokens=usage.get("promptTokenCount"),
+                    llm_output_tokens=_output_tokens(usage),
+                    # One rerank call per answered question, zero when
+                    # the answer came from cache -- the reranker runs
+                    # inside prepare_query, which short-circuits on a
+                    # hit.
+                    rerank_calls=0 if prepared.cache_hit else 1,
+                    cache_hit=prepared.cache_hit,
+                    latency_ms=int((time.monotonic() - started_at) * 1000),
+                )
+            finally:
+                session.close()
+
+        await asyncio.to_thread(_meter)
+
+        # ---- the budget counter --------------------------------------
+        # Counted AFTER the work, checked BEFORE it (in limit_answers).
+        # A cache hit is deliberately NOT counted: the guard exists to
+        # protect a PROVIDER quota, and a cache hit touched no provider.
+        # Counting it would make the cache -- the thing that saves
+        # quota -- consume quota.
+        if settings.RATE_LIMIT_ENABLED and not prepared.cache_hit:
+            consume = getattr(get_limiter(), "consume_budget", None)
+            if consume is not None:
+                try:
+                    await consume(str(org_id), units=1)
+                except Exception:
+                    # Losing a count under-reports spend for the day,
+                    # which is a metering problem. Raising here would
+                    # break a request the user has already received in
+                    # full.
+                    logger.warning("could not count budget usage", exc_info=True)
+
+    async def guarded_stream():
+        """event_stream(), with the slot released on EVERY exit path.
+
+        Three of them, and all three happened in testing:
+          * normal completion,
+          * an exception anywhere in generation or persistence,
+          * CancelledError, which is what a client closing the tab
+            raises -- and the one a naive `await event_stream(); release`
+            misses, because the cancellation propagates out of the
+            await and the release line never runs.
+
+        A leaked slot is not fatal (STREAM_SLOT_LUA expires members
+        older than STREAM_SLOT_TTL_SECONDS) but it is a tenant losing
+        one of three slots for three minutes, repeatedly, for as long as
+        users close tabs.
+        """
+        try:
+            async for chunk in event_stream():
+                yield chunk
+        finally:
+            await _release_slot()
+
     return StreamingResponse(
-        event_stream(),
+        guarded_stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

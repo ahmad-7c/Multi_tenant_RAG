@@ -10,6 +10,7 @@ from app.models.conversation import Conversation, Message, MessageRole
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.models.organization import Organization
+from app.models.usage_event import UsageEvent, UsageStatus
 from app.models.user import User, UserRole
 
 __all__ = [
@@ -19,6 +20,8 @@ __all__ = [
     "Message",
     "MessageRole",
     "Organization",
+    "UsageEvent",
+    "UsageStatus",
     "User",
     "UserRole",
     "Document",

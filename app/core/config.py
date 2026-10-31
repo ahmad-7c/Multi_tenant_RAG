@@ -265,7 +265,7 @@ class Settings(BaseSettings):
     # comment in app/services/reranker.py.
     # MEASURED, not guessed: see docs/eval-baseline.md. Provisional
     # at n=24, and specific to Cohere rerank-v3.5.
-    CONFIDENCE_THRESHOLD: float = 0.4162
+    CONFIDENCE_THRESHOLD: float = 0.3230
     # The gate's other regime. When the reranker falls back, scores are
     # RRF ranks (~0.016 at best) and cannot be compared to the threshold
     # above -- so the gate used to open unconditionally, meaning a dead
@@ -274,10 +274,81 @@ class Settings(BaseSettings):
     # leg, which is unaffected by the reranker being down.
     # Measured on the same 24 cases. 0 disables the floor and keeps
     # the old answer-everything-on-fallback behaviour.
-    VECTOR_SIMILARITY_FLOOR: float = 0.6175
+    VECTOR_SIMILARITY_FLOOR: float = 0.5594
     CONTEXT_TOKEN_BUDGET: int = 6000
 
     # ---- Cache ----------------------------------------------------------
+    # ---------------------------------------------------------------
+    # Rate limiting, stream slots, daily budget
+    # ---------------------------------------------------------------
+    RATE_LIMIT_ENABLED: bool = True
+    # Separate from REDIS_URL so a limiter can be pointed at a different
+    # instance from the answer cache. They have opposite loss profiles:
+    # losing a cached answer costs money, losing a bucket costs
+    # protection, and the operator may well want the second one on its
+    # own box. Falls back to REDIS_URL when unset.
+    RATE_LIMIT_REDIS_URL: Optional[str] = None
+
+    # The answer endpoint, per ORG. Stricter than everything else
+    # because it is the only endpoint that spends provider quota: an
+    # embed, a rerank and a streamed completion per call.
+    #
+    # 30/min is calibrated to the providers, not to a guess. Gemini's
+    # free tier and a Cohere trial key (10 rerank req/min) are the real
+    # ceiling, so a far higher limit would not protect anything -- it
+    # would just move the failure from a clean 429 with a Retry-After
+    # into an upstream provider error the client cannot interpret.
+    RATE_LIMIT_ANSWER_PER_MINUTE: int = 30
+    # Bucket capacity = burst. Three follow-ups in five seconds is a
+    # person thinking; this allows that without allowing 30 at once.
+    RATE_LIMIT_ANSWER_BURST: int = 10
+
+    # Everything else per org: listing documents, reading history,
+    # uploads. Cheap, so an order of magnitude looser.
+    RATE_LIMIT_DEFAULT_PER_MINUTE: int = 300
+    RATE_LIMIT_DEFAULT_BURST: int = 60
+
+    # Login and register are keyed by IP, not by org -- there is no org
+    # yet, and the abuse they attract is credential stuffing from one
+    # source against many accounts, which a per-account limit cannot
+    # see.
+    RATE_LIMIT_LOGIN_PER_MINUTE: int = 10
+    RATE_LIMIT_LOGIN_BURST: int = 5
+    # Tighter still: registering is not something a human does twice.
+    RATE_LIMIT_REGISTER_PER_MINUTE: int = 3
+    RATE_LIMIT_REGISTER_BURST: int = 3
+
+    # X-Forwarded-For is trusted ONLY when this is on. Off by default
+    # because a spoofable client IP is worse than no client IP: an
+    # attacker sets a new value per request and gets a fresh, empty
+    # bucket every time, so the per-IP limit silently stops existing.
+    # Turn it on only when every request passes a proxy that overwrites
+    # the header.
+    TRUST_FORWARDED_FOR: bool = False
+
+    # Concurrent SSE streams per org. Each open stream holds a provider
+    # connection and an LLM generation; the cap is what stops one
+    # tenant's dashboard with ten panels from occupying the whole pool.
+    MAX_CONCURRENT_STREAMS_PER_ORG: int = 3
+    # A slot older than this is reclaimed by the next acquire. It must
+    # exceed LLM_TOTAL_TIMEOUT_SECONDS (120s), or a legitimately slow
+    # answer would have its own slot evicted while still streaming.
+    STREAM_SLOT_TTL_SECONDS: int = 180
+
+    # Daily provider budget, in "units" (one answered question = one
+    # unit by default). 0 disables the guard, which is the default:
+    # a budget invented without measuring real traffic would refuse
+    # service for a number nobody chose.
+    BUDGET_DAILY_GLOBAL_UNITS: int = 0
+    # The per-org share. Both caps apply: a global cap alone lets one
+    # tenant spend the day's quota by lunchtime, and a per-org cap alone
+    # sums to (orgs x share), which grows without bound as tenants are
+    # added.
+    BUDGET_DAILY_ORG_UNITS: int = 0
+    # Two days, so yesterday's counters survive long enough to be read
+    # by an operator asking why the guard tripped.
+    BUDGET_KEY_TTL_SECONDS: int = 172800
+
     CACHE_TTL_SECONDS: int = 3600
     # Defaults to REDIS_URL. Split onto its own Redis database when the
     # broker shares the instance: a FLUSHDB aimed at the cache must not be

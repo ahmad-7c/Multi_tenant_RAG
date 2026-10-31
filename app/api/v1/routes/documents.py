@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile, status
 from sqlalchemy.orm import Session
 
+from app.api.limits import limit_default
 from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
 from app.models.user import User
@@ -22,7 +23,16 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 _NOT_FOUND = HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
 
-@router.post("", response_model=DocumentUploadResponse, status_code=status.HTTP_202_ACCEPTED)
+# Upload is rate limited on the DEFAULT bucket, not the answer one: it
+# costs a write and a Celery enqueue, and the expensive part (embedding)
+# happens in the worker where wall-clock is free and EMBED_REQUESTS_PER_
+# MINUTE already throttles the provider.
+@router.post(
+    "",
+    response_model=DocumentUploadResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(limit_default)],
+)
 async def upload_document(
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -51,7 +61,11 @@ async def upload_document(
     )
 
 
-@router.get("", response_model=list[DocumentListItem])
+@router.get(
+    "",
+    response_model=list[DocumentListItem],
+    dependencies=[Depends(limit_default)],
+)
 def list_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -59,7 +73,11 @@ def list_documents(
     return document_service.list_documents(db, org_id=current_user.org_id)
 
 
-@router.get("/{document_id}", response_model=DocumentDetailResponse)
+@router.get(
+    "/{document_id}",
+    response_model=DocumentDetailResponse,
+    dependencies=[Depends(limit_default)],
+)
 def get_document(
     document_id: UUID,
     db: Session = Depends(get_db),
@@ -78,7 +96,11 @@ def get_document(
     return response
 
 
-@router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(limit_default)],
+)
 def delete_document(
     document_id: UUID,
     db: Session = Depends(get_db),

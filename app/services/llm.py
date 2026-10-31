@@ -163,6 +163,10 @@ class AnthropicLLM(LLMProvider):
         user: str,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        # Accepted and not filled: this provider has never been run
+        # against a real API (the SDK is not even installed), so
+        # claiming token counts from it would be inventing them.
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         # No `tools=` argument. See the module docstring.
         async with self._client.messages.stream(
@@ -396,8 +400,22 @@ class GeminiLLM(LLMProvider):
         user: str,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         """Stream the answer, retrying only BEFORE the first token.
+
+        `usage_sink`, when given, is filled with the provider's own
+        token counts from the final SSE frame's `usageMetadata`. A
+        CALLER-SUPPLIED dict rather than an attribute on self: this
+        provider is a process-wide singleton behind `get_llm()`, and
+        two concurrent answers writing their usage onto the same object
+        would bill one tenant for the other's tokens. The dict is the
+        caller's, so there is one per request by construction.
+
+        Counts come from the provider, never from a local tokenizer.
+        tiktoken is not Gemini's tokenizer, so a local count is an
+        estimate, and an estimate recorded in a metering table is a
+        number someone will later treat as measured.
 
         Retrying after a token has been yielded is not an option: those
         bytes are already on the client's wire and cannot be recalled, so
@@ -421,6 +439,14 @@ class GeminiLLM(LLMProvider):
         while True:
             produced_text = False
             try:
+                # The sink is CLEARED before each attempt, not merged
+                # into. A retry is a second billable call to the
+                # provider, and leaving the first attempt's counts in
+                # place would report the tokens of an answer that was
+                # discarded -- plus, after the retry writes, the sum of
+                # two attempts as though it were one.
+                if usage_sink is not None:
+                    usage_sink.clear()
                 async for piece in self._stream_once(
                     system=system,
                     user=user,
@@ -428,6 +454,7 @@ class GeminiLLM(LLMProvider):
                     temperature=temperature,
                     request_id=request_id,
                     deadline=deadline,
+                    usage_sink=usage_sink,
                 ):
                     produced_text = True
                     yield piece
@@ -513,6 +540,7 @@ class GeminiLLM(LLMProvider):
         temperature,
         request_id: str,
         deadline: float,
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         payload = self._payload(
             system=system, user=user, max_tokens=max_tokens, temperature=temperature
@@ -560,7 +588,9 @@ class GeminiLLM(LLMProvider):
                             raise _classify_http(exc) from exc
 
                     async for line in response.aiter_lines():
-                        pieces, bad = self._pieces_from_line(line)
+                        pieces, bad = self._pieces_from_line(
+                            line, usage_sink=usage_sink
+                        )
                         malformed += bad
                         for piece in pieces:
                             produced_text = True
@@ -600,10 +630,17 @@ class GeminiLLM(LLMProvider):
                 f"{self._model} returned no text (finishReason was not a refusal)"
             )
 
-    def _pieces_from_line(self, line: str) -> tuple[list[str], int]:
+    def _pieces_from_line(
+        self, line: str, *, usage_sink: dict | None = None
+    ) -> tuple[list[str], int]:
         """Parse one SSE line into (text pieces, malformed-frame count).
 
         Raises LLMSafetyBlockedError if the frame says the model refused.
+
+        The return shape is unchanged and the sink is a keyword with a
+        default, so existing callers and tests of this method are
+        unaffected -- a third tuple element would have broken every one
+        of them for a value most of them do not want.
         """
         line = (line or "").strip()
         if not line or not line.startswith("data:"):
@@ -620,6 +657,30 @@ class GeminiLLM(LLMProvider):
             return [], 1
 
         self._raise_if_refused(frame)
+
+        if usage_sink is not None:
+            # Gemini sends usageMetadata on the LAST frame of a stream,
+            # and sometimes on earlier ones with partial counts. The
+            # later frame overwrites the earlier, so what survives is
+            # the final total. Keys are copied one at a time rather than
+            # by update() so that a partial frame carrying only
+            # promptTokenCount cannot delete a candidatesTokenCount an
+            # earlier frame reported.
+            usage = frame.get("usageMetadata")
+            if isinstance(usage, dict):
+                for key in (
+                    "promptTokenCount",
+                    "candidatesTokenCount",
+                    "totalTokenCount",
+                    # Recorded if present: thinking tokens are BILLED
+                    # and are not part of the answer, so a cost figure
+                    # that omits them is wrong in the expensive
+                    # direction. Measured absent on
+                    # gemini-3.5-flash-lite today.
+                    "thoughtsTokenCount",
+                ):
+                    if isinstance(usage.get(key), int):
+                        usage_sink[key] = usage[key]
 
         pieces = []
         for candidate in frame.get("candidates") or []:
@@ -737,6 +798,7 @@ class FakeLLM(LLMProvider):
         user: str,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        usage_sink: dict | None = None,
     ) -> AsyncIterator[str]:
         self.calls.append(
             {

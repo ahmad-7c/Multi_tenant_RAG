@@ -87,6 +87,38 @@ def _no_live_providers():
         factory.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def fresh_rate_limiter():
+    """A clean per-process limiter for every test.
+
+    Two separate problems, one fixture.
+
+    **The suite must not need Redis.** `get_limiter()` builds a
+    `RedisLimiter` by default, which opens a connection on first use.
+    Leaving that in place made 34 route tests depend on a running Redis
+    for a protection none of them is about.
+
+    **Buckets must not leak between tests.** Register is limited to 3
+    per minute per IP, and every test client reports the same IP. With
+    one shared bucket, the fourth test that happens to register a user
+    gets a 429 -- and which test that is depends on execution order, so
+    the failure moves when a test is added anywhere in the suite. That
+    is exactly what happened: `test_same_email_can_register_in_two_orgs`
+    started failing because earlier tests had drained the bucket.
+
+    Limiting stays ENABLED so the dependencies are exercised on every
+    route; it is the STATE that is reset. Tests that assert limiting
+    behaviour install their own limiter with a tiny limit.
+    """
+    from app.api import limits
+
+    limits.set_limiter(limits.InMemoryLimiter())
+    limits.reset_fallback()
+    yield
+    limits.set_limiter(None)
+    limits.reset_fallback()
+
+
 def _require_test_database_url() -> str:
     url = settings.TEST_DATABASE_URL
     if not url:

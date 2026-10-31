@@ -1475,6 +1475,33 @@ def report(golden, results, args):
         log(f"        score; fall back to 0.50 if no gap reaches 0.03")
         log(f"  -> {setting} = {choice.value}")
         log(f"     {choice.reason}")
+        if len(choice.alternatives) > 1:
+            # Printed because the rule's tie-break is "widest", and a
+            # wide gap far below the decision boundary buys margin with
+            # precision without being asked to. At n=38 three gaps
+            # qualified and all three held recall at 1.000, so the
+            # choice between them was a judgement the rule made
+            # silently. Now it is a judgement somebody has to read.
+            log(f"     {len(choice.alternatives)} gaps cleared the minimum "
+                f"width. Recall may be identical at all of them, in which "
+                f"case the rule is spending precision on margin:")
+            log(f"       {'gap':>18}  {'width':>7}  {'midpoint':>8}  "
+                f"{'TP':>3} {'FP':>3} {'TN':>3} {'FN':>3}  {'prec':>5}  recall")
+            for candidate in choice.alternatives:
+                matrix = confusion(cases, candidate.midpoint)
+                mark = "  <- rule" if candidate.midpoint == choice.value else ""
+                log(
+                    f"       {candidate.low:7.4f} -> {candidate.high:7.4f}  "
+                    f"{candidate.width:7.4f}  {candidate.midpoint:8.4f}  "
+                    f"{matrix['tp']:3} {matrix['fp']:3} {matrix['tn']:3} "
+                    f"{matrix['fn']:3}  "
+                    + (f"{matrix['precision']:5.3f}" if matrix['precision'] is not None else "    -")
+                    + "  "
+                    + (f"{matrix['recall']:.3f}" if matrix['recall'] is not None else "-")
+                    + mark
+                )
+            log(f"     The value currently in Settings is "
+                f"{getattr(settings, setting)}.")
         if choice.irreducible_false_positives:
             log(
                 f"     IRREDUCIBLE: {len(choice.irreducible_false_positives)} "

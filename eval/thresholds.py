@@ -19,6 +19,42 @@ the lowest answerable score, no threshold separates the classes and the
 gap search never sees it: that case stays a false positive at any value
 this function can return. That is a property of the signal, not of the
 threshold, and `select_threshold` reports it rather than hiding it.
+
+## WIDEST gap vs HIGHEST gap: what the n=38 run exposed
+
+The rule says *widest*, and at n=24 there was only one qualifying gap so
+the word did no work. At n=38 THREE gaps below the lowest answerable
+score (0.3395) cleared MIN_GAP, and every one of them holds recall at
+1.000 while disagreeing about precision by a factor the rule never sees:
+
+    gap                  width    midpoint   TP FP TN FN  prec  recall
+    0.0816 -> 0.1832     0.1015   0.1324     21 11  6  0  0.656  1.000
+    0.2241 -> 0.3065     0.0823   0.2653     21  6 11  0  0.778  1.000
+    0.3065 -> 0.3395     0.0330   0.3230     21  4 13  0  0.840  1.000
+
+The widest gap maximises MARGIN -- 0.207 of headroom before a real
+answer is lost -- and in exchange lets 11 of 17 refusable questions
+through, including seven near-misses, which are the cases the gate
+exists for. The highest gap keeps a margin of 0.0165 and blocks 13.
+Recall is identical at all three, so the rule's tie-break is spending
+precision on margin without being asked.
+
+`select_threshold` still implements the rule as written, because the
+rule's value is the point of having a rule fixed in advance: a function
+that silently optimised precision would be choosing the number by
+looking at which value flatters the system, which is what the rule
+forbids. The two candidates are REPORTED (`alternatives` below) and the
+choice is the operator's.
+
+The value in Settings today is 0.3230 -- the operator chose the highest
+gap over the widest one, trading margin for 7 fewer false answers at
+identical recall. See docs/eval-baseline.md.
+
+The lesson for a future recalibration: "largest gap" is a proxy for
+"safest threshold", and the proxy breaks when the largest gap is far
+below the decision boundary. A rule cannot be written once and trusted
+forever; what can be written once is the requirement to print the
+alternatives and make somebody look.
 """
 from dataclasses import dataclass, field
 
@@ -35,6 +71,16 @@ class ScoredCase:
 
 
 @dataclass
+class GapCandidate:
+    """One qualifying gap, and the threshold it would produce."""
+
+    low: float
+    high: float
+    width: float
+    midpoint: float
+
+
+@dataclass
 class ThresholdChoice:
     value: float
     reason: str
@@ -42,6 +88,12 @@ class ThresholdChoice:
     gap_high: float | None = None
     gap_width: float | None = None
     lowest_answerable: float | None = None
+    # EVERY gap that cleared min_gap, widest first -- not just the one
+    # the rule picked. At n=24 there was one, so the rule's choice was
+    # the only choice; at n=38 there were two and they differ by 7 false
+    # answers at identical recall. A rule that reports only its own
+    # answer hides the fact that a judgement was available.
+    alternatives: list[GapCandidate] = field(default_factory=list)
     # should-refuse cases scoring at or above the lowest answerable
     # score. No threshold can exclude these while keeping full recall.
     irreducible_false_positives: list[str] = field(default_factory=list)
@@ -74,6 +126,15 @@ def select_threshold(
     # and the most useful one.
     region = sorted({s for s in refusable if s <= lowest_answerable} | {lowest_answerable})
 
+    candidates = [
+        GapCandidate(
+            low=low, high=high, width=high - low, midpoint=round((low + high) / 2, 4)
+        )
+        for low, high in zip(region, region[1:])
+        if high - low >= min_gap
+    ]
+    candidates.sort(key=lambda c: -c.width)
+
     best_width = 0.0
     best_pair: tuple[float, float] | None = None
     for low, high in zip(region, region[1:]):
@@ -92,6 +153,7 @@ def select_threshold(
             ),
             lowest_answerable=lowest_answerable,
             irreducible_false_positives=irreducible,
+            alternatives=candidates,
         )
 
     low, high = best_pair
@@ -107,6 +169,7 @@ def select_threshold(
         gap_width=best_width,
         lowest_answerable=lowest_answerable,
         irreducible_false_positives=irreducible,
+        alternatives=candidates,
     )
 
 

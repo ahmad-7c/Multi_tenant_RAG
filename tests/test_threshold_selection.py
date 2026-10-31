@@ -125,3 +125,59 @@ def test_confusion_counts_a_missing_score_as_a_refusal():
     cases = [case(0.9, True), case(0.1, False)]
     matrix = confusion(cases, 0.5)
     assert (matrix["tp"], matrix["fp"], matrix["tn"], matrix["fn"]) == (1, 0, 1, 0)
+
+
+# ---- every qualifying gap is reported, not only the chosen one ----------
+
+
+def test_all_qualifying_gaps_are_reported():
+    """The n=38 finding, as a test.
+
+    Three gaps cleared MIN_GAP below the lowest answerable score and all
+    three held recall at 1.000, so the rule's "widest" tie-break was
+    spending precision on margin without being asked. A function that
+    returns only its own answer hides that a judgement was available.
+    """
+    cases = [
+        ScoredCase(id="a", category="t", score=0.90, should_answer=True),
+        ScoredCase(id="b", category="t", score=0.34, should_answer=True),
+        ScoredCase(id="r1", category="t", score=0.30, should_answer=False),
+        ScoredCase(id="r2", category="t", score=0.22, should_answer=False),
+        ScoredCase(id="r3", category="t", score=0.08, should_answer=False),
+    ]
+    choice = select_threshold(cases)
+
+    widths = [round(c.width, 4) for c in choice.alternatives]
+    # Widest first: 0.08->0.22 (0.14), 0.22->0.30 (0.08), 0.30->0.34 (0.04)
+    assert widths == [0.14, 0.08, 0.04]
+    # The rule still picks the widest. The point is that the others are
+    # visible beside it.
+    assert choice.value == round((0.08 + 0.22) / 2, 4)
+    assert choice.alternatives[0].midpoint == choice.value
+
+
+def test_a_gap_below_the_minimum_width_is_not_offered():
+    cases = [
+        ScoredCase(id="a", category="t", score=0.50, should_answer=True),
+        ScoredCase(id="r1", category="t", score=0.49, should_answer=False),
+        ScoredCase(id="r2", category="t", score=0.10, should_answer=False),
+    ]
+    choice = select_threshold(cases)
+    # 0.49 -> 0.50 is 0.01 wide. Offering it would propose a threshold
+    # with a margin smaller than the noise between two runs.
+    assert all(c.width >= 0.03 for c in choice.alternatives)
+    assert [round(c.width, 4) for c in choice.alternatives] == [0.39]
+
+
+def test_alternatives_are_reported_even_when_the_rule_falls_back():
+    # No gap qualifies, so the value is FALLBACK -- and the near-miss
+    # gaps are still worth seeing, because "the widest gap was 0.019"
+    # is the fact that explains the fallback.
+    cases = [
+        ScoredCase(id="a", category="t", score=0.50, should_answer=True),
+        ScoredCase(id="r1", category="t", score=0.49, should_answer=False),
+        ScoredCase(id="r2", category="t", score=0.48, should_answer=False),
+    ]
+    choice = select_threshold(cases)
+    assert choice.value == 0.50  # FALLBACK
+    assert choice.alternatives == []

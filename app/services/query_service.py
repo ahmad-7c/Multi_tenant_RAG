@@ -231,10 +231,18 @@ class AnswerOutcome:
     kind: MessageKind
 
 
-async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
+async def generate_answer(
+    prepared: PreparedQuery, *, llm: LLMProvider, usage_sink: dict | None = None
+):
     """Phase 2. Yields ("token", str) then ("done", AnswerOutcome).
 
     No database session is open while this runs.
+
+    `usage_sink` is passed straight through to the provider, which fills
+    it with the provider's OWN token counts. It stays empty on a cache
+    hit or a gated refusal, because no model call was made -- and an
+    empty sink is what makes the usage row record NULL tokens rather
+    than zero, which are different facts.
     """
     if prepared.short_circuit_answer is not None:
         # A cache hit or a gated refusal. Emitted as a single token event
@@ -261,6 +269,7 @@ async def generate_answer(prepared: PreparedQuery, *, llm: LLMProvider):
             user=prepared.prompt.user,
             max_tokens=settings.LLM_MAX_TOKENS,
             temperature=settings.LLM_TEMPERATURE,
+            usage_sink=usage_sink,
         ):
             pieces.append(piece)
             yield "token", piece

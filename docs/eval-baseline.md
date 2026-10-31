@@ -1,211 +1,353 @@
 # Gate calibration baseline
 
-> **STALE as of 2026-10-31 — do not quote these thresholds as current.**
-> Everything below was fitted on the 24 gate-scored cases that existed
-> on 2026-10-28. The golden set is now 40 questions / 38 gate-scored,
-> with four new retrieval-shape categories (`exact_term`, `table`,
-> `code`, `spans_two_chunks`) and a third acme document the calibration
-> run never saw. `CONFIDENCE_THRESHOLD = 0.4162` and
-> `VECTOR_SIMILARITY_FLOOR = 0.6175` are still what Settings applies,
-> so the SYSTEM is unchanged — but the evidence for them no longer
-> covers the set they would now be measured on. Re-running the
-> calibration costs live Gemini + Cohere calls and is a decision for
-> the operator, not a side effect of expanding the set.
-
-**Provisional, n=24.** Measured 2026-10-28 against live Gemini
+**Provisional, n=38.** Measured 2026-10-31 against live Gemini
 (`gemini-embedding-001`, `gemini-3.5-flash-lite`) and live Cohere
-(`rerank-v3.5`) over `eval/golden`. Reproduce with:
+(`rerank-v3.5`) over `eval/golden` at golden-set **version 2**.
 
-    venv/Scripts/python.exe -m eval.calibrate --pace 0 \
-        --rerank-timeout 25 --rerank-interval 6.5
+Raw run: [`eval/runs/20261031T053310Z-full.json`](../eval/runs/20261031T053310Z-full.json)
+— every score, every ranked list and the full config snapshot. Reproduce
+with:
 
-24 gate-scored cases (12 should-answer, 12 should-refuse). Two
-`ambiguous` cases are excluded from every number here. The run was
-clean: 0 reranker fallbacks, 0 rate limits, 0 case errors.
+    venv/Scripts/python.exe -m eval.calibrate
 
-## The selection rule
+40 questions, **38 gate-scored** (21 should-answer, 17 should-refuse).
+The two `ambiguous` cases are excluded from every classification number
+here and reported on their own. The run was clean: **0 reranker
+fallbacks, 0 rate limits, 0 case errors** — so every score below is a
+real cross-encoder relevance score, not an RRF score standing in for
+one.
 
-Fixed in advance, implemented in `eval/thresholds.py`, tested in
-`tests/test_threshold_selection.py`:
+The previous baseline (n=24) is archived at
+[`docs/eval-baseline-n24.md`](./eval-baseline-n24.md).
 
-> Take every score at or below the lowest should-answer score. Find the
-> largest gap between consecutive values. The threshold is that gap's
-> midpoint. If no gap is at least 0.03 wide, use 0.50.
+## Applied values
 
-Searching only *below* the lowest answerable score means the rule
-protects **recall** by construction: it cannot cost a real answer on the
-measured set. Best-F1 would trade one away for a refusal, because F1
-prices those two failures identically and for a grounded-answers product
-they are not.
-
-## Chosen values
-
-| setting | value | rule output |
+| setting | value | previous (n=24) |
 |---|---|---|
-| `CONFIDENCE_THRESHOLD` | **0.4162** | midpoint of 0.3065 to 0.5258 (width 0.2194) |
-| `VECTOR_SIMILARITY_FLOOR` | **0.6175** | midpoint of 0.5966 to 0.6384 (width 0.0417) |
+| `CONFIDENCE_THRESHOLD` | **0.3230** | 0.4162 |
+| `VECTOR_SIMILARITY_FLOOR` | **0.5594** | 0.6175 |
 
-Both are env-overridable Settings. Neither transfers to another
-provider: a Jina or Voyage score of 0.4162 means something else, and a
-local cross-encoder logit is not on the same scale at all.
+Both belong to **`rerank-v3.5`** and **`gemini-embedding-001` at 1536
+dimensions**. Neither transfers to another reranker or embedder; the
+scores are not calibrated probabilities and a different cross-encoder
+puts them on a different scale. Both are env-overridable.
 
-- At `CONFIDENCE_THRESHOLD = 0.4162`: TP 12, FP 3, TN 9, FN 0 =
-  precision 0.80, recall 1.00.
-- At `VECTOR_SIMILARITY_FLOOR = 0.6175`: TP 12, FP 8, TN 4, FN 0 =
-  precision 0.60, recall 1.00.
+---
 
-The floor separates the classes *worse*, which is why it is consulted
-only when the reranker is unavailable.
+## Retrieval, measured separately from generation
 
-## Reranker score, every case
+New this run: `recall@k` and MRR, computed from the ranked chunk list
+rather than from answer text (`eval/metrics.py`). k is `RERANK_TOP_N`
+= 8, the number of parents the prompt actually receives.
 
-### should ANSWER (n=12)
-| score | case | type |
-|---|---|---|
-| 0.9181 | acme-followup-above-that | follow_up |
-| 0.8968 | acme-prod-deploy-approvals | answerable_needs_rerank |
-| 0.8486 | acme-rollback-command | answerable_direct |
-| 0.8396 | acme-expense-window | answerable_direct |
-| 0.8290 | acme-mfa-production | answerable_direct |
-| 0.8128 | globex-parental-leave | answerable_direct |
-| 0.8074 | acme-perdiem-international | answerable_needs_rerank |
-| 0.7865 | acme-receipt-threshold | answerable_direct |
-| 0.6693 | acme-password-rotation | answerable_needs_rerank |
-| 0.6111 | acme-approval-7000 | synthesis |
-| 0.5889 | acme-password-length | answerable_direct |
-| 0.5530 | acme-business-class-6h | synthesis |
+| bucket | n | scored | recall@8 | MRR | cited page |
+|---|---|---|---|---|---|
+| **overall** | 40 | 33 | **1.000** | **0.985** | 0.875 (n=16) |
+| answerable_direct | 5 | 5 | 1.000 | 1.000 | 1.000 |
+| answerable_needs_rerank | 1 | 1 | 1.000 | 1.000 | — |
+| exact_term | 3 | 3 | 1.000 | 1.000 | 1.000 |
+| table | 4 | 4 | 1.000 | 0.875 | 1.000 |
+| code | 2 | 2 | 1.000 | 1.000 | 0.500 |
+| spans_two_chunks | 3 | 3 | 1.000 | 1.000 | 0.667 |
+| synthesis | 2 | 2 | 1.000 | 1.000 | 1.000 |
+| follow_up | 2 | 1 | 1.000 | 1.000 | 1.000 |
+| unanswerable_near | 10 | 10 | 1.000 | 1.000 | — |
+| cross_org_isolation | 4 | 0 | — | — | — |
+| unanswerable_off_topic | 2 | 0 | — | — | — |
+| acme | 35 | 30 | 1.000 | 0.983 | 0.875 |
+| globex | 5 | 3 | 1.000 | 1.000 | — |
 
-### should REFUSE (n=12)
-| score | case | type |
-|---|---|---|
-| 0.8730 | acme-rollback-migrations-how | unanswerable_near |
-| 0.6722 | acme-deploy-friday | unanswerable_near |
-| 0.5258 | acme-perdiem-weekend | unanswerable_near |
-| 0.3065 | acme-mileage-motorcycle | unanswerable_near |
-| 0.3065 | acme-followup-after-refusal | follow_up |
-| 0.2241 | acme-staging-secrets | unanswerable_near |
-| 0.2202 | acme-oncall-weekend-rota | unanswerable_near |
-| 0.1927 | acme-mileage-exact-rate | unanswerable_near |
-| 0.0486 | acme-vpn-setup | unanswerable_off_topic |
-| 0.0257 | globex-asks-expense-window | cross_org_isolation |
-| 0.0235 | acme-parental-leave | unanswerable_off_topic |
-| 0.0195 | globex-asks-password-length | cross_org_isolation |
+Read this carefully, because it is easy to over-read:
 
-## Vector cosine, every case
+**Retrieval is not the bottleneck.** Every case with labelled support
+found it inside the top 8, and MRR 0.985 means it was almost always at
+rank 1. Nothing was demoted by the reranker and nothing was missed. The
+`cross_org_isolation` and `unanswerable_off_topic` rows are blank
+because those cases label no support — `None`, not `0.0`, since a
+question with nothing to retrieve is not a retrieval failure.
 
-### should ANSWER (n=12)
-| score | case |
-|---|---|
-| 0.8094 | acme-followup-above-that |
-| 0.7927 | acme-approval-7000 |
-| 0.7806 | acme-expense-window |
-| 0.7775 | acme-rollback-command |
-| 0.7749 | acme-perdiem-international |
-| 0.7674 | acme-prod-deploy-approvals |
-| 0.7499 | acme-mfa-production |
-| 0.7254 | acme-password-rotation |
-| 0.7069 | acme-password-length |
-| 0.6992 | globex-parental-leave |
-| 0.6938 | acme-receipt-threshold |
-| 0.6868 | acme-business-class-6h |
+**But recall@8 = 1.000 over a 6-document, 40-child corpus is a weak
+claim.** With 40 children per tenant, the top 8 is a fifth of the
+corpus; recall@8 on a real tenant with 50,000 chunks is a different
+measurement entirely. This number says the pipeline is wired correctly
+and the chunking does not destroy the support. It does not say retrieval
+scales.
 
-### should REFUSE (n=12)
-| score | case |
-|---|---|
-| 0.7437 | acme-deploy-friday |
-| 0.7325 | acme-perdiem-weekend |
-| 0.7255 | acme-staging-secrets |
-| 0.7113 | acme-rollback-migrations-how |
-| 0.6631 | acme-mileage-motorcycle |
-| 0.6631 | acme-followup-after-refusal |
-| 0.6547 | acme-oncall-weekend-rota |
-| 0.6384 | acme-mileage-exact-rate |
-| 0.5966 | acme-vpn-setup |
-| 0.5865 | globex-asks-expense-window |
-| 0.5531 | globex-asks-password-length |
-| 0.5387 | acme-parental-leave |
+**Citation pages: 14 of 16.** Both shortfalls turn out to be
+generation findings rather than citation findings, which is what
+measuring retrieval separately was for:
 
-## The finding that outranks both numbers
+- `acme-rollback-cluster-flag` cited **no pages at all**, because the
+  gate blocked it and the user got a refusal. Nothing was mis-cited.
+- `acme-vsr-tier3-extra-evidence` expects pages **2 and 3** and cited
+  only page 3. It is a `spans_two_chunks` case: the answer came from
+  one side of the span, so only one page was cited. The citation is
+  correct for what the answer says and incomplete for what the question
+  asked.
 
-**The classes overlap. No threshold separates them.**
+---
 
-- reranker: worst answerable 0.5530 below best refusable 0.8730 (-0.3199)
-- cosine: worst answerable 0.6868 below best refusable 0.7437 (-0.0570)
+## Generation: 3 of 21 answerable cases failed their content check
 
-Two should-refuse questions score above *every* answerable case:
+Retrieval found the support in all three. These are not retrieval
+failures and they are the most actionable thing in this document.
+
+**Important: the generated answers below were produced under
+`CONFIDENCE_THRESHOLD = 0.4162`**, the value in force during the run
+and recorded in the run file's config snapshot. The newly applied
+0.3230 changes what the gate admits, so the generation column is not a
+prediction of behaviour under the current configuration — this is
+precisely why the snapshot records the thresholds a run executed under.
+
+### 1. `acme-rollback-cluster-flag` — a FALSE REFUSAL by the gate
+
+    rerank 0.3395  (the lowest should-answer score in the set)
+    answer: "I could not find anything in your organization's documents
+             that answers this question."
+
+0.3395 < 0.4162, so the gate blocked a question the corpus answers. The
+model never saw the context. **Under the applied 0.3230 this case now
+passes the gate** — and whether the model then answers it correctly is
+untested, because no run has been made at the new value. It is the case
+to watch on the next run, and it is the case the 0.0165 margin is
+protecting.
+
+### 2 & 3. Two of three `spans_two_chunks` cases answered HALF the span
+
+This is the real finding. The chunker test
+(`test_spans_two_chunks_cases_really_span_two_chunks`) guarantees these
+questions need one fact from each side of a child boundary, so only the
+parent sent to the LLM can contain the whole answer.
+
+`acme-vsr-questionnaire-to-decision` (rubric wanted `five business
+days` and `decision`):
+
+> Once the questionnaire comes back, the security team reviews it within
+> five business days of receipt [1]. If the questionnaire shows a gap,
+> the vendor submits a written remediation plan with owners and dates
+> before the review continues [1]. Finally, the security team verifies
+> any remediation the plan calls complete [1].
+
+Fluent, fully grounded, and it stops one step short: it never reaches
+the decision. The question asked what happens from questionnaire *to
+decision*, and the answer narrates the middle.
+
+`acme-vsr-tier3-extra-evidence` (rubric wanted `penetration test` and
+`tier 1`):
+
+> For Tier 3 Restricted engagements, the vendor must also supply a
+> penetration test report no more than twelve months old [1].
+
+Correct about tier 3, silent on what tier 1 requires — the
+comparison that makes it an "extra" evidence question, and the half
+that lives on page 2.
+
+**Both failures look like good answers.** Neither is wrong; both are
+incomplete in a way no substring check on the asserted content would
+catch, which is why these cases carry a `must_mention` rubric rather
+than `expect_phrases`. Parent-child chunking put the whole answer in
+the context and the model used the part nearest the retrieved child.
+
+n=3 for this bucket, so "2 of 3 failed" is a count and not a rate. It
+is the strongest signal in the run that the next thing to test is
+**answer completeness over a parent**, not retrieval.
+
+---
+
+## The selection rule, and where it stopped being enough
+
+The rule is fixed in `eval/thresholds.py` and tested in
+`tests/test_threshold_selection.py`: take every score at or below the
+lowest should-answer score, find the **widest** gap between consecutive
+values, and use its midpoint; fall back to 0.50 if no gap reaches 0.03.
+
+At n=24 exactly one gap qualified, so "widest" did no work. **At n=38,
+three gaps qualified, and all three hold recall at 1.000:**
+
+| gap | width | midpoint | TP | FP | TN | FN | precision | recall |
+|---|---|---|---|---|---|---|---|---|
+| 0.0816 → 0.1832 | 0.1015 | 0.1324 | 21 | 11 | 6 | 0 | 0.656 | 1.000 |
+| 0.2241 → 0.3065 | 0.0823 | 0.2653 | 21 | 6 | 11 | 0 | 0.778 | 1.000 |
+| 0.3065 → 0.3395 | 0.0330 | **0.3230** | 21 | **4** | 13 | 0 | **0.840** | 1.000 |
+
+The rule as written returns **0.1324**. That is the widest gap, and it
+buys the largest margin (0.207 of headroom before a real answer is
+lost) — but recall is 1.000 at all three, so the tie-break was spending
+precision on margin without being asked to. 0.1324 lets 11 of 17
+refusable questions through, including seven near-misses, which are the
+cases the gate exists for.
+
+**The operator chose 0.3230**, the highest qualifying gap: same recall,
+4 false positives instead of 11, and a margin of 0.0165 below
+`acme-rollback-cluster-flag` (0.3395).
+
+The cost of that choice, stated plainly: **0.0165 is a thin margin.**
+A reranker-side scoring change, or one new answerable case scoring
+below 0.3230, loses a real answer. This is the trade that was made
+knowingly, and it is the first thing to re-check on the next run.
+`select_threshold` now reports every qualifying gap with its confusion
+matrix so the choice is visible rather than implicit.
+
+### For comparison, the full curve
+
+| threshold | TP | FP | TN | FN | precision | recall | answers lost |
+|---|---|---|---|---|---|---|---|
+| 0.1324 (rule) | 21 | 11 | 6 | 0 | 0.656 | 1.000 | — |
+| 0.2653 | 21 | 6 | 11 | 0 | 0.778 | 1.000 | — |
+| **0.3230 (applied)** | 21 | 4 | 13 | 0 | 0.840 | 1.000 | — |
+| 0.4162 (old value) | 20 | 4 | 13 | 1 | 0.833 | 0.952 | rollback-cluster-flag |
+| 0.5533 | 19 | 3 | 14 | 2 | 0.864 | 0.905 | + vsr-questionnaire-to-decision |
+| 0.6722 | 14 | 1 | 16 | 7 | 0.933 | 0.667 | + 5 more |
+
+The **fewer-false-answers** option the playbook requires reporting is
+0.5533: precision 0.864, recall 0.905. It buys one fewer false answer
+by refusing two real ones. That is the right trade only if a wrong
+answer costs much more than a missed one — and in this system it does
+not, because the prompt refuses most of what the gate lets through (see
+below).
+
+Note that the old value **0.4162 is strictly worse than 0.3230** on
+this data: same 4 false positives, one fewer true positive.
+
+---
+
+## The central finding, unchanged and now stronger
+
+**The classes overlap and no threshold separates them.** Worst
+answerable 0.3395 sits far below best refusable 0.8730.
+
+    should ANSWER  (n=21)   min 0.3395   median 0.8059   max 0.9351
+    should REFUSE  (n=17)   min 0.0235   median 0.1952   max 0.8730
+
+Four should-refuse cases score at or above the lowest answerable score
+and are therefore **irreducible** — no value of
+`CONFIDENCE_THRESHOLD` excludes them without losing a real answer:
 
 | case | score | why it scores high |
 |---|---|---|
-| `acme-rollback-migrations-how` | 0.8730 | the runbook says a rollback does not revert migrations and that doing so is "a separate, manual change", then never says how |
-| `acme-deploy-friday` | 0.6722 | the deploy window is Tue-Thu; Friday is never mentioned |
+| `acme-rollback-migrations-how` | 0.8730 | maximally relevant to rollbacks; the corpus just does not say HOW |
+| `acme-deploy-friday` | 0.6722 | the deploy-window passage is exactly on topic |
+| `acme-vsr-appeal` | 0.6573 | the vendor-review section is the right section |
+| `acme-perdiem-weekend` | 0.5258 | the per-diem table is the right table |
 
-A cross-encoder scores **relevance**, and these chunks are maximally
-relevant to a question they do not answer. That is a property of the
-signal, not of the number, so `select_threshold` reports them as
-*irreducible* rather than averaging them into a precision figure that
-would make the gate look merely mis-tuned. Four cases are irreducible
-against the cosine floor for the same reason.
+A cross-encoder scores **relevance**, not **sufficiency**. These four
+questions are maximally relevant to passages that do not answer them.
+That is a property of the signal, not of the threshold, and it is why
+the gate is described as a cheap filter and never as a correctness
+guarantee.
 
-The gate is therefore a **cheap filter, not a correctness guarantee**:
-it saves a generation on the easy two thirds. What declines the hard
-cases is the grounding instruction in the prompt.
+---
 
-## End-to-end refusal
+## What actually refuses the hard cases: the prompt
 
-All 12 should-refuse cases through the full pipeline, and each one again
-with the gate **forced open** (`CONFIDENCE_THRESHOLD` lowered for the
-call), which is the only way to tell whether the gate or the model is
-carrying the refusal.
+End-to-end refusal at 0.3230: **15 of 17 (88%)**. With the gate forced
+fully open, the model declined **the same 15** unaided. The gate and the
+prompt are not additive here — the prompt is doing the work, and the
+gate's contribution is to make the 4 cheapest refusals free.
 
-- **9 blocked by the gate**, which returns the canned refusal.
-- **3 passed the gate** (score >= 0.4162): `acme-perdiem-weekend`,
-  `acme-deploy-friday`, `acme-rollback-migrations-how`.
-- **Model alone, gate forced open: 11 of 12 declined.**
+The two failures are the two that have failed from the start:
 
-The two irreducible cases, verbatim:
+- **`acme-rollback-migrations-how`** (0.8730). Answered: *"A rollback
+  does not revert database migrations, and reverting a migration is a
+  separate, manual change [1]."* Every clause is supported; the judge
+  says SUPPORTED. It is arguably a correct response to an
+  unanswerable question — it states what the corpus does say and stops.
+  Reasonable people disagree about whether this is a failure.
+- **`acme-deploy-friday`** (0.6722). Answered: *"No, production deploys
+  run Tuesday through Thursday, 09:00 to 16:00 UTC [1]."* The judge says
+  SUPPORTED. On the stricter reading this is an inference: "deploys run
+  Tue–Thu" does not state what happens on Friday.
 
-> `acme-rollback-migrations-how`
->
-> "A rollback does not revert database migrations, and reverting a
-> migration is a separate, manual change [1]. **The provided documents
-> do not contain instructions** on how to perform that manual change."
+**No sufficiency check has been built**, and none should be without
+asking: the measured gain is at most 2 of 17 cases, both disputed, and
+the cost is either a second model call per question or a structured
+verdict inside the answering call that changes the prompt every answer
+depends on.
 
-A correct refusal, unaided by the gate.
+---
 
-> `acme-deploy-friday`
->
-> "**No**, production deploys run Tuesday through Thursday, 09:00 to
-> 16:00 UTC [1]."
+## Isolation and cache
 
-Disputed. The judge calls this SUPPORTED, reasoning that a stated window
-answers the question. This document calls it an unsupported inference,
-because the corpus never says Friday is forbidden or whether exceptions
-exist.
+**Cross-tenant isolation: 4/4 clean, both directions.** All four probes
+retrieved only their own tenant's documents and none answered.
+`acme-asks-contractor-expiry` is the direction that was never measured
+before n=38 — both original probes ran globex → acme.
 
-End-to-end correct refusal is therefore **11/12 (92%)** on the stricter
-reading and 12/12 on the judge's. The disagreement is about whether a
-stated window constitutes a stated prohibition, which is the same kind
-of scope question that put `acme-lost-phone` and `acme-mfa-contractors`
-in the `ambiguous` bucket. `acme-deploy-friday` is a candidate to join
-them.
+**Cache: 20/21 hits, 21/21 byte-identical.** The one miss,
+`acme-rollback-cluster-flag`, is correct behaviour and not a cache bug:
+that case was refused (it is also the one case whose answer failed its
+phrase check, missing `prod-eu`), and `should_cache()` declines to cache
+a refusal. A cached refusal would make a transient failure permanent for
+the TTL.
 
-### A note on the judge
+---
 
-`eval/judge.py` originally asked for one verdict and got **both**
-decisive cases wrong, grading `rollback-migrations-how` as SUPPORTED:
-true of every claim in it, and beside the point, because the answer also
-declined. "Is this grounded?" and "did this decline?" are independent
-questions, and a judge asked for a single label answers whichever is
-easier. It now reports `asserts_answer` and `supported` separately and
-derives the label from the pair. After the fix it agrees on
-`rollback-migrations-how` and still disagrees on `deploy-friday`.
+## Judge reliability: UNMEASURED
 
-## Limits of this baseline
+`eval/golden/judge_grades.yaml` does not exist, so the agreement rate is
+**unknown** — not "good", not "bad". The harness prints
+`agreement UNMEASURED` and refuses to conclude.
 
-- **n=24.** One case moving changes precision by roughly 7 points.
-- One corpus, two tenants, one provider pair. Nothing here generalises
-  to another reranker or another document set.
-- `acme-deploy-friday`'s label is disputed, as above.
-- The cosine floor is calibrated on *real* embeddings and is therefore
-  meaningless against `FakeEmbeddings`, which is why
-  `tests/test_conversations.py` disables it explicitly for that fixture.
+Every verdict in the end-to-end section above is therefore an
+unvalidated judgement by `gemini-3.5-flash-lite`, including the two
+SUPPORTED verdicts on the disputed cases. Those two were read by hand
+and the answers are quoted in full above precisely because the judge
+cannot yet be taken on trust.
+
+**What is needed:** at least 10 hand grades covering both DECLINED and
+asserting outcomes. Below 10, `Agreement.meets_bar` returns `None`
+rather than `False`.
+
+Note also that `JUDGE_MODEL` currently equals `LLM_MODEL`, so the judge
+is grading its own output. It has its own setting for exactly this
+reason; pointing it at a stronger model is a config change, not a code
+change.
+
+---
+
+## Not verified
+
+- **Retrieval at scale.** recall@8 = 1.000 over 40 children per tenant.
+  A real tenant has thousands, and the planner's choice of the HNSW path
+  changes with tenant share (see CLAUDE.md's measured finding).
+- **Judge agreement.** No hand grades exist.
+- **These thresholds under any other provider.** Both are tied to
+  `rerank-v3.5` and `gemini-embedding-001`.
+- **The degraded (reranker-down) regime end to end.** The cosine floor
+  was calibrated from scores collected while the reranker was *up*; no
+  case was answered with the breaker actually open.
+- **Behaviour under the newly applied 0.3230.** Every generated answer
+  in this document was produced at 0.4162. `acme-rollback-cluster-flag`
+  (0.3395) was gate-blocked then and is admitted now, and nothing has
+  measured what the model does with it.
+- **Whether the `spans_two_chunks` failures are a prompt problem or a
+  chunking one.** The parent contained the whole answer in both cases;
+  the model used half. Not diagnosed.
+
+## Weakest points
+
+1. **The 0.0165 margin at 0.3230.** One answerable case sits just above
+   the threshold. This is the chosen trade and the first thing to
+   re-examine on the next run.
+2. **n=38 is still small.** Several per-type buckets are n=2 or n=3 and
+   carry a small-n warning in the report. No per-type number here
+   should be read as a rate.
+3. **Answer completeness over a parent is unproven.** Two of three
+   `spans_two_chunks` cases answered from one side of the span while
+   the parent sent to the model contained both. Parent-child chunking
+   is the architecture's central retrieval decision, and this is the
+   first evidence that the model does not always use what it is given.
+4. **The gate is not what produces correct refusals.** 15 of 17 come
+   from the prompt. A prompt edit can therefore undo most of the refusal
+   behaviour without changing any threshold — which is why
+   `eval/runs.py` records the prompt's content hash.
+5. **Labels are one person's judgement.** `should_answer` is
+   hand-written (deliberately — an LLM writing them grades the system
+   against itself), so a systematic misreading of the corpus would move
+   every number here in the same direction.
+6. **`VECTOR_SIMILARITY_FLOOR = 0.5594` barely filters anything**
+   (precision 0.568, 16 false positives). That is honest rather than
+   broken: cosine separates these classes very poorly (worst answerable
+   0.6868 vs best refusable 0.7437), so in the degraded regime the floor
+   blocks only the single most obviously unrelated question. Its job is
+   to stop a dead reranker answering *everything*, not to classify well.

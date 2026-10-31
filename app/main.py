@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api.v1.routes import auth, conversations, documents, users
+from app.api.v1.routes import auth, conversations, documents, usage, users
 from app.core.config import settings
 from app.core.http import aclose_async_client
 from app.db.session import SessionLocal
@@ -70,6 +70,7 @@ app.include_router(auth.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(conversations.router, prefix="/api/v1")
+app.include_router(usage.router, prefix="/api/v1")
 
 
 @app.get("/health")
@@ -97,6 +98,19 @@ def health():
     # getattr: passthrough and fake rerankers have no breaker at all.
     if getattr(get_reranker(), "is_disabled", False):
         degraded.append("reranker_disabled")
+
+    # The rate limiter running on per-process buckets is a degradation
+    # worth naming: the configured limit is no longer the effective one
+    # (N processes means N buckets) and the daily budget guard cannot be
+    # evaluated at all. Without this line the only evidence is a WARNING
+    # that was logged once, which is exactly the gap `degraded` exists
+    # to close for the reranker breaker.
+    from app.api.limits import get_limiter as _get_limiter
+
+    if settings.RATE_LIMIT_ENABLED and getattr(
+        _get_limiter(), "fallback_activations", 0
+    ):
+        degraded.append("rate_limiter_degraded")
 
     body: dict = {"status": "ok"}
     if degraded:
