@@ -25,6 +25,9 @@ venv/
 # Local-disk storage backend writes here in dev; the files themselves are
 # never committed, but the directory must exist for the backend to work.
 uploads/*
+# The end-to-end stack writes here. Same reason as uploads/:
+# these are real uploaded documents, not source.
+uploads-e2e/
 !uploads/.gitkeep
 
 # Eval run artefacts: regenerate with `python -m eval.calibrate`.

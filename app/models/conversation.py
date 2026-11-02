@@ -44,6 +44,17 @@ class MessageKind(str, enum.Enum):
     REFUSAL = "refusal"
     # Infrastructure failed: rate limit, timeout, empty response.
     ERROR = "error"
+    # A conversational turn that was never a retrieval question: a
+    # greeting, "what can you do", "thanks". Answered deterministically
+    # with no model call and no retrieval.
+    #
+    # Its own member rather than reusing ANSWER or REFUSAL, because
+    # both would corrupt a number someone reads. As ANSWER it would be
+    # an uncited "answer" the UI presents as grounded, and it would
+    # enter the rewrite window as context. As REFUSAL it would inflate
+    # the refusal rate on the usage dashboard -- turning "say hello
+    # more often" into "quality is dropping".
+    ASSIST = "assist"
 
 
 class Conversation(Base):

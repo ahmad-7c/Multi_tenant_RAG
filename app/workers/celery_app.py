@@ -19,6 +19,13 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
+    # End-to-end tests only; False everywhere else. See the setting.
+    task_always_eager=settings.CELERY_TASK_ALWAYS_EAGER,
+    # With eager tasks an exception propagates to the CALLER rather
+    # than being captured as a task failure, so an ingestion bug would
+    # surface as a 500 on upload instead of a `failed` document and
+    # the test would be measuring the wrong thing.
+    task_eager_propagates=False,
     task_serializer="json",
     accept_content=["json"],
     result_serializer="json",

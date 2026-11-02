@@ -543,3 +543,113 @@ def test_table_still_exists_after_an_injection_attempt(
     )
 
     assert db_session.execute(text("SELECT count(*) FROM document_chunks")).scalar() >= 1
+
+
+# ------------------------------------- B1b: one test per tenant filter ----
+# There are three tenant filters inside this module -- the vector leg, the
+# keyword leg, and the hydration fetch -- and they are MUTUALLY
+# REDUNDANT. Measured: removing any single one of them left
+# `test_retrieval_never_returns_another_orgs_chunk` (and the end-to-end
+# passage isolation test) still green, because whichever filters remain
+# cover for the one that went. A filter nothing pins is a filter a
+# refactor can delete silently, which is the whole reason these exist:
+# each one executes its OWN statement against another org's data and
+# asserts it comes back empty, so there is no other layer available to
+# pass the test on its behalf.
+
+
+def _cross_org_pair(db_session, org_factory, user_factory, embedder):
+    """Byte-identical content in two orgs. The org_id filter is the only
+    thing that can tell them apart."""
+    org_a, org_b = org_factory(), org_factory()
+    user_a, user_b = user_factory(org_a), user_factory(org_b)
+    shared = "Receipts must be submitted within thirty days of travel."
+    _, _, a_children = _seed(db_session, org_a, user_a, [shared], embedder=embedder)
+    _, _, b_children = _seed(db_session, org_b, user_b, [shared], embedder=embedder)
+    return org_a, org_b, a_children, b_children, shared
+
+
+def test_the_vector_leg_alone_is_org_scoped(
+    db_session, org_factory, user_factory, embedder
+):
+    """Pins the `WHERE org_id = :org_id` in _VECTOR_SQL, and nothing else.
+
+    The statement is executed directly, so the hydration filter -- which
+    is what actually kept the end-to-end test green when this one was
+    removed -- never runs and cannot mask the result.
+    """
+    from app.services.retrieval import _VECTOR_SQL
+
+    org_a, org_b, a_children, b_children, shared = _cross_org_pair(
+        db_session, org_factory, user_factory, embedder
+    )
+    [vector] = embedder.embed([shared])
+
+    rows = db_session.execute(
+        _VECTOR_SQL,
+        {
+            "org_id": str(org_a.id),
+            # Built the same way retrieve_candidates builds it.
+            "query_embedding": "[" + ",".join(repr(float(v)) for v in vector) + "]",
+            "per_leg": 50,
+        },
+    ).all()
+    ids = {row[0] for row in rows}
+
+    assert a_children[0].id in ids, "the leg must still find its own org"
+    assert b_children[0].id not in ids
+
+
+def test_the_keyword_leg_alone_is_org_scoped(
+    db_session, org_factory, user_factory, embedder
+):
+    """Pins the `WHERE org_id = :org_id` in _TEXT_SQL, and nothing else."""
+    from app.services.retrieval import _TEXT_SQL
+
+    org_a, org_b, a_children, b_children, _ = _cross_org_pair(
+        db_session, org_factory, user_factory, embedder
+    )
+
+    rows = db_session.execute(
+        _TEXT_SQL,
+        {
+            "org_id": str(org_a.id),
+            "ts_config": settings.TS_CONFIG,
+            "query_text": "receipts thirty days",
+            "per_leg": 50,
+        },
+    ).all()
+    ids = {row[0] for row in rows}
+
+    assert a_children[0].id in ids, "the leg must still find its own org"
+    assert b_children[0].id not in ids
+
+
+def test_the_hydration_fetch_alone_is_org_scoped(
+    db_session, org_factory, user_factory, embedder
+):
+    """Pins the filter in _HYDRATE_SQL, and nothing else.
+
+    Hydration is asked for another org's chunk id EXPLICITLY -- the
+    situation a broken leg would produce -- so this is the layer's own
+    behaviour under the input it exists to reject, not a scenario the
+    legs can prevent on its behalf.
+    """
+    from app.services.retrieval import _HYDRATE_SQL
+
+    org_a, org_b, a_children, b_children, _ = _cross_org_pair(
+        db_session, org_factory, user_factory, embedder
+    )
+
+    rows = db_session.execute(
+        _HYDRATE_SQL,
+        {
+            "org_id": str(org_a.id),
+            # Both ids handed in together: the only difference between
+            # them is which org owns the row.
+            "ids": [a_children[0].id, b_children[0].id],
+        },
+    ).all()
+    ids = {row[0] for row in rows}
+
+    assert ids == {a_children[0].id}

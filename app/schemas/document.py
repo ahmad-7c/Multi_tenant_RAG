@@ -5,6 +5,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict
 
 from app.models.document import DocumentStatus
+from app.services.document_failures import FailureCode
 
 
 class DocumentUploadResponse(BaseModel):
@@ -37,5 +38,14 @@ class DocumentDetailResponse(BaseModel):
     file_size_bytes: int
     created_at: datetime
     processed_at: Optional[datetime]
-    error_message: Optional[str]
+    # NOT error_message. The raw provider exception stays in the
+    # database and the logs for operators; publishing it put the
+    # embedding provider, the model name and an upstream Google URL on
+    # the Documents page, which is both useless to the uploader and a
+    # disclosure the phase skill forbids.
+    #
+    # A fixed enum instead, so no provider prose can reach a response
+    # through this field by construction. The sentence a person reads
+    # is chosen by the UI, which is where copy belongs.
+    failure_code: Optional[FailureCode] = None
     chunk_count: int = 0

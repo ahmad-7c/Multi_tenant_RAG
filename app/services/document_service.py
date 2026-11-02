@@ -119,6 +119,31 @@ def list_documents(db: Session, *, org_id: uuid.UUID) -> list[Document]:
     )
 
 
+def list_ready_document_names(
+    db: Session, *, org_id: uuid.UUID, limit: int = 50
+) -> list[str]:
+    """Filenames this org can actually be asked about.
+
+    READY only. A document still being processed has no chunks, so
+    naming it in "here is what you can ask me" would invite a question
+    that is guaranteed to come back empty.
+
+    Only the filename column is selected -- this runs on the answer
+    path, and loading whole Document rows to read one string each
+    would be a wasteful query on a request that is meant to be free.
+    The limit is a guard against an org with thousands of documents
+    pulling the lot into a chat reply.
+    """
+    rows = (
+        db.query(Document.filename)
+        .filter(Document.org_id == org_id, Document.status == DocumentStatus.READY)
+        .order_by(Document.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
 def get_document(db: Session, *, org_id: uuid.UUID, document_id: uuid.UUID) -> Document | None:
     # org_id is part of the query itself, not a post-fetch check: a
     # cross-org id simply matches no row, rather than matching a row that

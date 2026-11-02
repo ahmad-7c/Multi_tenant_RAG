@@ -23,6 +23,17 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379/0"
     ENV: str = "development"
 
+    # ---- CORS -----------------------------------------------------------
+    # Comma-separated allowed origins. EMPTY BY DEFAULT, and that default
+    # is the architecture: the browser talks to the Next.js BFF, which
+    # talks to this API server-side, so a normal deployment has no
+    # cross-origin request to permit and wants no CORS header.
+    #
+    # Set it only to reach this API DIRECTLY from a browser -- a test
+    # client, Swagger on another port, a separate dev frontend.
+    # Example: CORS_ALLOW_ORIGINS=http://localhost:3010
+    CORS_ALLOW_ORIGINS: str = ""
+
     # ---- Celery ---------------------------------------------------------
     # Default to REDIS_URL, but overridable so broker, result backend and
     # the answer cache can be split onto separate Redis databases -- a
@@ -34,6 +45,14 @@ class Settings(BaseSettings):
     # MUST exceed CELERY_TASK_TIME_LIMIT; see the comment in celery_app.py.
     CELERY_VISIBILITY_TIMEOUT: int = 1800
     CELERY_RESULT_EXPIRES: int = 3600
+    # Run ingestion INLINE instead of dispatching to a worker.
+    #
+    # For end-to-end tests only: it removes a whole process from the
+    # harness, so an upload is readable the moment the request returns
+    # instead of the test racing a worker. Never set in production --
+    # it would make an upload request block for the whole ingestion,
+    # which is the exact thing the async pipeline exists to avoid.
+    CELERY_TASK_ALWAYS_EAGER: bool = False
     CELERY_MAX_TASKS_PER_CHILD: int = 100
 
     # ---- Auth -----------------------------------------------------------
@@ -354,6 +373,35 @@ class Settings(BaseSettings):
     # broker shares the instance: a FLUSHDB aimed at the cache must not be
     # able to drop queued ingestion tasks.
     CACHE_REDIS_URL: Optional[str] = None
+
+    def cors_allow_origins(self) -> list[str]:
+        """Parse CORS_ALLOW_ORIGINS into an allowlist.
+
+        Raises on a wildcard rather than passing it through. `*` is
+        incompatible with `allow_credentials=True` -- browsers reject
+        the combination outright -- so configuring it does not loosen
+        anything, it just makes every cross-origin call fail with an
+        opaque CORS error. Failing at startup with the word "wildcard"
+        in the message turns an afternoon of debugging into one line.
+
+        A trailing slash is stripped because an `Origin` header never
+        has one, so `http://x/` would match nothing and look like the
+        allowlist was ignored.
+        """
+        raw = (self.CORS_ALLOW_ORIGINS or "").strip()
+        if not raw:
+            return []
+
+        origins = [part.strip().rstrip("/") for part in raw.split(",")]
+        origins = [origin for origin in origins if origin]
+
+        if any(origin == "*" for origin in origins):
+            raise ValueError(
+                "CORS_ALLOW_ORIGINS contains a wildcard '*', which cannot be "
+                "combined with credentialed requests. List each origin "
+                "explicitly, e.g. CORS_ALLOW_ORIGINS=http://localhost:3010"
+            )
+        return origins
 
 
 settings = Settings()

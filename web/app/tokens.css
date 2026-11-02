@@ -1,0 +1,79 @@
+/*
+ * DocuMind design tokens.
+ *
+ * The single source of truth for every colour, radius and easing in the
+ * app. No screen hard-codes a hex value; if a colour is needed that is
+ * not here, the token is missing, not the screen.
+ *
+ * Declared on :root rather than inside a media query or a [data-theme]
+ * block so a light theme can be added later by overriding these same
+ * names. Dark is the only theme built today.
+ */
+:root {
+  /* Surfaces. Depth comes from these four steps plus a 1px border --
+     not from drop shadows, which read as muddy on a warm black.
+     Lifted off pure black: #0B0908 rather than #070605, so the page
+     reads as a warm charcoal with air in it instead of a flat void,
+     and so the surface steps above it stay distinguishable on a dim
+     laptop panel. */
+  --bg: #0b0908;
+  --s1: #12100e;
+  --s2: #191614;
+  --s3: #221d1a;
+
+  /* The living background. Two very low-opacity warm pools drift
+     across --bg on an 18s cycle, which is slow enough to read as
+     depth rather than as movement. Tokens, not literals, so the whole
+     effect retunes from here. */
+  --glow-a: rgba(255, 107, 0, 0.055);
+  --glow-b: rgba(255, 176, 32, 0.04);
+  --bg-drift: 18s;
+
+  --line: rgba(255, 255, 255, 0.08);
+  --line2: rgba(255, 255, 255, 0.14);
+
+  /* Text. Nothing in the UI goes dimmer than --tx3. */
+  --tx: #f5efe8;
+  --tx2: #b8aea4;
+  --tx3: #938981;
+
+  /* One accent. --amber is a secondary highlight for gradients and
+     glows only, never a second brand colour. */
+  --ac: #ff6b00;
+  --ac2: #ff8a3d;
+  --amber: #ffb020;
+  /* Near-black text ON orange: ~6.9:1. White on orange fails AA, so it
+     is never used. */
+  --on-ac: #0a0705;
+
+  /* Status only. Never decoration. */
+  --ok: #34d399;
+  --ok-tx: #6ee7b7;
+  --err: #f87171;
+  --err-tx: #fca5a5;
+
+  --ac-tint: rgba(255, 107, 0, 0.16);
+  --ac-ring: rgba(255, 107, 0, 0.22);
+
+  /* The shaded orange. A three-stop ramp rather than one flat fill, so
+     a button has a light source instead of looking like a swatch. The
+     gradient is 220% wide and its position is animated, which moves
+     the highlight across the surface without repainting geometry --
+     background-position is one of the four exceptions the motion spec
+     allows. */
+  --ac-grad: linear-gradient(
+    110deg,
+    #e85d00 0%,
+    var(--ac) 28%,
+    #ff9436 52%,
+    var(--ac) 76%,
+    #e85d00 100%
+  );
+  --ac-sheen: 9s;
+
+  --r-ctl: 10px;
+  --r-card: 16px;
+  --r-pill: 999px;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}

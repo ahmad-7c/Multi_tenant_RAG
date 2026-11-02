@@ -211,6 +211,135 @@ def _():
     )
 
 
+# ---------------------------------------------------------------- B1 ------
+# The UI's trace chips and source panel. Each of these is a mistake that
+# reads as correct: a flag dropped, a default flipped, a filter removed.
+
+
+# 13. The score gate forgets that a FALLBACK ranking is RRF, not relevance.
+#     The provider still advertises calibrated scores, so this looks right.
+@mutation("b1-expose-score-under-fallback")
+def _():
+    edit(
+        "app/services/reranker.py",
+        "    return reranker.scores_are_calibrated and not used_fallback",
+        "    return reranker.scores_are_calibrated  # MUTATION",
+    )
+
+
+# 14. Site 1 of the score gate: the Citation is built with the score
+#     attached unconditionally.
+@mutation("b1-validate-always-exposes-scores")
+def _():
+    edit(
+        "app/services/citations.py",
+        "    answer: str, blocks: list[ContextBlock], *, expose_scores: bool = False",
+        "    answer: str, blocks: list[ContextBlock], *, expose_scores: bool = True",
+    )
+
+
+# 15. Site 2 of the score gate: the payload serialises whatever it was
+#     given, which publishes a CACHED score on replay.
+@mutation("b1-payload-ignores-score-gate")
+def _():
+    edit(
+        "app/api/v1/routes/conversations.py",
+        '        "score": citation.score if expose_score else None,',
+        '        "score": citation.score,  # MUTATION',
+    )
+
+
+# 16. Every retrieved block ships its passage, not only the cited ones --
+#     the shape of "while we are here, send the sources panel everything".
+@mutation("b1-passages-for-uncited-sources")
+def _():
+    edit(
+        "app/api/v1/routes/conversations.py",
+        """        "citations": [
+            _citation_payload(c, expose_score=expose_scores)
+            for c in outcome.citations
+        ],""",
+        """        "citations": [
+            _citation_payload(c, expose_score=expose_scores)
+            for c in outcome.citations
+        ]
+        + [  # MUTATION: ship every retrieved block, cited or not.
+            {
+                "marker": b.marker,
+                "document": b.filename,
+                "document_id": str(b.document_id),
+                "chunk_id": str(b.parent_id),
+                "page": b.page_number,
+                "snippet": b.content[:300],
+                "passage": b.content[:1200],
+                "matched_chunk_id": None,
+                "score": None,
+            }
+            for b in (prepared.prompt.blocks if prepared.prompt else [])
+            if b.marker not in {c.marker for c in outcome.citations}
+        ],""",
+    )
+
+
+# 17. The passage's own fetch drops the tenant filter. Defence in depth
+#     behind retrieval's filter, which is exactly why it is easy to argue
+#     away in review as redundant.
+@mutation("b1-passage-fetch-drops-org-filter")
+def _():
+    edit(
+        "app/services/reranker.py",
+        "            WHERE c.org_id = :org_id AND c.id = ANY(:ids)",
+        "            WHERE c.id = ANY(:ids)  -- MUTATION",
+    )
+    edit(
+        "app/services/reranker.py",
+        '        {"org_id": str(org_id), "ids": list(best.keys())},',
+        '        {"ids": list(best.keys())},  # MUTATION',
+    )
+
+
+# ------------------------------------------------------------- B1b --------
+# The three tenant filters in retrieval.py, each removable on its own.
+# Before B1b all three were mutually redundant AND individually unpinned:
+# removing any one left the suite green.
+
+
+# 18. The vector leg forgets the tenant.
+@mutation("b1b-vector-leg-drops-org-filter")
+def _():
+    edit(
+        "app/services/retrieval.py",
+        """    WHERE org_id = :org_id
+      AND parent_id IS NOT NULL
+      AND embedding IS NOT NULL""",
+        """    WHERE parent_id IS NOT NULL
+      AND embedding IS NOT NULL""",
+    )
+
+
+# 19. The keyword leg forgets the tenant.
+@mutation("b1b-keyword-leg-drops-org-filter")
+def _():
+    edit(
+        "app/services/retrieval.py",
+        """    WHERE org_id = :org_id
+      AND parent_id IS NOT NULL
+      AND content_tsv @@ websearch_to_tsquery(:ts_config, :query_text)""",
+        """    WHERE parent_id IS NOT NULL
+      AND content_tsv @@ websearch_to_tsquery(:ts_config, :query_text)""",
+    )
+
+
+# 20. Hydration trusts the ids it was handed.
+@mutation("b1b-hydration-drops-org-filter")
+def _():
+    edit(
+        "app/services/retrieval.py",
+        "    WHERE c.org_id = :org_id AND c.id = ANY(:ids)",
+        "    WHERE c.id = ANY(:ids)",
+    )
+
+
 if __name__ == "__main__":
     name = sys.argv[1]
     if name == "--list":

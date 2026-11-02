@@ -39,6 +39,7 @@ from app.models.usage_event import UsageStatus
 from app.services import usage_service
 from app.services.rate_limit import RedisUnavailable
 from app.schemas.conversation import (
+    CitationsEvent,
     ConversationResponse,
     CreateConversationRequest,
     CreateMessageRequest,
@@ -132,6 +133,10 @@ def _usage_status(outcome) -> UsageStatus:
         return UsageStatus.ERROR
     if outcome.kind == MessageKind.REFUSAL:
         return UsageStatus.REFUSED
+    # ASSIST falls through to OK deliberately. It succeeded, and it
+    # cost nothing -- no embedding, no rerank, no generation -- so the
+    # token columns stay NULL and the dashboard's refusal rate is not
+    # inflated by people saying hello.
     return UsageStatus.OK
 
 
@@ -151,7 +156,7 @@ def _output_tokens(usage: dict) -> int | None:
     return (candidates or 0) + (thoughts or 0)
 
 
-def _citation_payload(citation) -> dict:
+def _citation_payload(citation, *, expose_score: bool) -> dict:
     return {
         "marker": citation.marker,
         "document": citation.document,
@@ -159,10 +164,90 @@ def _citation_payload(citation) -> dict:
         "chunk_id": str(citation.chunk_id),
         "page": citation.page,
         "snippet": citation.snippet,
+        "passage": citation.passage,
+        "matched_chunk_id": (
+            str(citation.matched_chunk_id)
+            if citation.matched_chunk_id is not None
+            else None
+        ),
+        # Nulled a SECOND time here, on purpose. validate_citations
+        # already withheld it for a live uncalibrated ranking, but a
+        # citation replayed from the cache carries a score from whatever
+        # reranker configuration filled that key -- which cannot be
+        # verified now. Both gates read the same flag, so neither is
+        # load-bearing alone.
+        "score": citation.score if expose_score else None,
     }
 
 
-@router.post("/{conversation_id}/messages")
+def build_citations_payload(prepared, outcome) -> dict:
+    """The authoritative final event for one turn.
+
+    A function rather than an inline dict because it is the whole
+    contract between the backend and the UI's trace chips and source
+    panel, and it needs testing directly -- driving the full SSE route
+    to assert that one number is null is a slow way to pin a mapping.
+
+    Every value here was MEASURED. Anything the request did not do is
+    null: a cache hit returns early from phase 1, so its counts and
+    timings were never assigned and stay None rather than reading 0.
+    """
+    # On a cache hit this is False because phase 1 returned before
+    # setting it -- which is correct and not incidental: nothing was
+    # scored for THIS request.
+    expose_scores = prepared.scores_calibrated
+    return {
+        "answer": outcome.answer,
+        "citations": [
+            _citation_payload(c, expose_score=expose_scores)
+            for c in outcome.citations
+        ],
+        "cached": prepared.cache_hit,
+        "gated": prepared.gated,
+        # What this turn IS, mirroring messages.kind. The UI needs it
+        # to tell a grounded answer from a refusal from a greeting --
+        # `gated` alone cannot, because an assist turn is neither
+        # gated nor an answer.
+        "kind": outcome.kind.value if outcome.kind else None,
+        "rewritten_question": (
+            prepared.rewritten_question if prepared.was_rewritten else None
+        ),
+        "confidence": prepared.confidence,
+        "scores_calibrated": expose_scores,
+        "used_reranker_fallback": prepared.used_reranker_fallback,
+        "candidate_count": prepared.candidate_count,
+        "parent_count": prepared.parent_count,
+        "retrieve_ms": prepared.retrieve_ms,
+        "rerank_ms": prepared.rerank_ms,
+        "first_token_ms": outcome.first_token_ms,
+    }
+
+
+@router.post(
+    "/{conversation_id}/messages",
+    # `responses`, never `response_model`: a response_model would make
+    # FastAPI validate and serialise a return value, which for a
+    # StreamingResponse means buffering the whole answer and losing the
+    # stream. This is documentation only -- it publishes the contract the
+    # BFF codes against without touching what the route sends.
+    # Without this FastAPI also advertises application/json for 200,
+    # which this route never returns.
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "model": CitationsEvent,
+            "description": (
+                "A `text/event-stream`: zero or more `token` events, then "
+                "exactly one authoritative `citations` event, then `done`. "
+                "The schema shown is the `data` payload of the `citations` "
+                "event. Render citation markers from it rather than from "
+                "the streamed text, which may contain a marker validation "
+                "dropped."
+            ),
+            "content": {"text/event-stream": {}},
+        }
+    },
+)
 async def create_message(
     conversation_id: uuid.UUID,
     payload: CreateMessageRequest,
@@ -330,18 +415,7 @@ async def create_message(
         # streamed text may contain a marker that validation dropped, so
         # the client renders markers from this payload rather than from
         # what it already printed.
-        yield _sse(
-            "citations",
-            {
-                "answer": outcome.answer,
-                "citations": [_citation_payload(c) for c in outcome.citations],
-                "cached": prepared.cache_hit,
-                "gated": prepared.gated,
-                "rewritten_question": (
-                    prepared.rewritten_question if prepared.was_rewritten else None
-                ),
-            },
-        )
+        yield _sse("citations", build_citations_payload(prepared, outcome))
         yield _sse("done", {})
 
         await query_service.maybe_cache_answer(

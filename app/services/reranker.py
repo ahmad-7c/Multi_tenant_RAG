@@ -551,6 +551,12 @@ class RetrievedParent:
     # can quote the specific sentence that matched rather than the whole
     # parent.
     matched_chunk_id: uuid.UUID
+    # The matched child's TEXT, not just its id. A parent routinely
+    # exceeds the passage cap, so the excerpt the UI shows has to be
+    # located relative to the match -- which needs the text to find it
+    # by. Free: the child's content is already on the Candidate, fetched
+    # by the search query itself.
+    matched_content: str = ""
 
 
 def map_to_parents(
@@ -613,15 +619,45 @@ def map_to_parents(
                 best_rank=item.rank,
                 best_score=item.score,
                 matched_chunk_id=item.candidate.chunk_id,
+                matched_content=item.candidate.content,
             )
         )
     return parents
 
 
+# The wording matters more than it looks. The blunt original --
+# "I could not find anything in your organization's documents that
+# answers this question." -- is accurate and reads as a broken
+# product, especially to someone who has just said hello. A refusal
+# is INFORMATION, so it says what happened, why, and what to try.
+#
+# Still one fixed constant rather than a generated sentence: the eval
+# judge short-circuits on it by identity (eval/judge.py CANNED), and
+# the run snapshot records it, so a refusal must be recognisable
+# without string matching on prose.
 NOT_FOUND_ANSWER = (
-    "I could not find anything in your organization's documents that answers "
-    "this question."
+    "I could not find anything about that in your organization's documents, "
+    "so I would rather say so than guess. I can only answer from documents "
+    "that have been uploaded here. Try naming the document or the topic you "
+    "have in mind, or check the Documents page to see what is available."
 )
+
+
+def scores_are_relevance(reranker: Reranker, used_fallback: bool) -> bool:
+    """Is `RankedCandidate.score` a comparable 0..1 relevance?
+
+    Two conditions, and BOTH matter. `scores_are_calibrated` is a
+    property of the PROVIDER; `used_fallback` is a property of THIS
+    CALL. A hosted cross-encoder advertises calibrated scores and still
+    returns RRF order when its call fails -- so the provider flag alone
+    is True at exactly the moment the scores are rank reciprocals.
+
+    One function because three callers need the answer: the gate below,
+    the confidence it publishes, and the per-source relevance bar in the
+    UI. A condition spelled out three times is a condition that drifts
+    in two of them.
+    """
+    return reranker.scores_are_calibrated and not used_fallback
 
 
 def should_answer(
@@ -667,7 +703,7 @@ def should_answer(
     # scores top out around 1/(k+1) ~= 0.016, so testing them against
     # 0.4162 would gate EVERY question -- the system would answer
     # nothing.
-    if used_fallback or not reranker.scores_are_calibrated:
+    if not scores_are_relevance(reranker, used_fallback):
         # But "cannot use the reranker score" is not "have no signal".
         # Cosine similarity from the vector leg is unaffected by the
         # reranker being down, and it is calibrated -- measured over the

@@ -61,6 +61,7 @@ from app.services.cache import (
     answer_cache_key,
     should_cache,
 )
+from app.services.assistance import Intent, classify, reply_for
 from app.services.citations import Citation, validate_citations
 from app.services.embedding import EmbeddingProvider, EmbeddingTask
 from app.models.conversation import MessageKind
@@ -76,8 +77,10 @@ from app.services.reranker import (
     Reranker,
     map_to_parents,
     rerank_with_fallback,
+    scores_are_relevance,
     should_answer,
 )
+from app.services.document_service import list_ready_document_names
 from app.services.retrieval import retrieve_candidates
 
 logger = logging.getLogger(__name__)
@@ -105,10 +108,28 @@ class PreparedQuery:
     short_circuit_answer: str | None = None
     short_circuit_citations: list[Citation] = field(default_factory=list)
     gated: bool = False
+    # A greeting, "what can you do", or "thanks": answered from a
+    # deterministic template with no retrieval and no model call.
+    assisted: bool = False
     cache_hit: bool = False
     used_reranker_fallback: bool = False
-    candidate_count: int = 0
-    parent_count: int = 0
+    # None, not 0. On a cache hit nothing was retrieved and nothing was
+    # mapped, and "candidates 0" is a false statement about the request
+    # rather than an absent measurement -- the same reason the token
+    # columns on usage_events are nullable. The UI hides a null and
+    # would render a 0.
+    candidate_count: int | None = None
+    parent_count: int | None = None
+    # The gate score: exactly the number compared to
+    # CONFIDENCE_THRESHOLD. None unless it is a calibrated relevance.
+    confidence: float | None = None
+    # Whether THIS ranking's scores are relevance. Decided once, here,
+    # because this is the only place that knows both which reranker ran
+    # and whether its call fell back.
+    scores_calibrated: bool = False
+    # Per-stage wall clock, monotonic. None where the stage did not run.
+    retrieve_ms: int | None = None
+    rerank_ms: int | None = None
 
 
 async def prepare_query(
@@ -127,6 +148,46 @@ async def prepare_query(
     run_blocking: RunBlocking = _to_thread,
 ) -> PreparedQuery:
     """Phase 1. Returns plain data; holds no session on return."""
+    # Conversational turns are intercepted FIRST, on the raw question,
+    # before the rewriter, the cache, the embedder and retrieval. Three
+    # reasons, in order of importance:
+    #
+    #   1. "hi" is not a question about a corpus, and answering it with
+    #      "I could not find anything in your documents" reads as a
+    #      broken product. That was a real transcript.
+    #   2. It costs nothing -- no rewrite call, no embedding, no rerank,
+    #      no generation.
+    #   3. On the RAW text, because the rewriter would turn "hi" into
+    #      something else entirely once there is history to rewrite
+    #      against, and then the intent would no longer be visible.
+    intent = classify(question)
+    if intent is not Intent.NONE:
+
+        def _document_names():
+            db = session_factory()
+            try:
+                return list_ready_document_names(db, org_id=org_id)
+            finally:
+                db.close()
+
+        names = await run_blocking(_document_names)
+        return PreparedQuery(
+            org_id=org_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            raw_question=question,
+            # Not rewritten and not cached: the cache key is built from
+            # a rewritten question, and these replies depend on the
+            # org's CURRENT document list, which a cache would staple
+            # to a stale snapshot.
+            rewritten_question=question,
+            was_rewritten=False,
+            index_version=index_version,
+            cache_key="",
+            assisted=True,
+            short_circuit_answer=reply_for(intent, document_names=names),
+        )
+
     # Rewriting runs BEFORE the cache lookup because the cache is keyed on
     # the rewritten question. That means the rewrite model is paid even on
     # a cache hit -- accepted, because keying on the raw text would serve
@@ -183,11 +244,33 @@ async def prepare_query(
         finally:
             db.close()
 
+    retrieve_started = time.monotonic()
     candidates = await run_blocking(_retrieve)
+    prepared.retrieve_ms = int((time.monotonic() - retrieve_started) * 1000)
     prepared.candidate_count = len(candidates)
 
+    rerank_started = time.monotonic()
     ranked, used_fallback = await rerank_with_fallback(reranker, rewritten, candidates)
+    prepared.rerank_ms = int((time.monotonic() - rerank_started) * 1000)
     prepared.used_reranker_fallback = used_fallback
+
+    # `bool(ranked)` is load-bearing, not defensive. The flag answers
+    # "are the scores on this event real relevance values", and with an
+    # empty ranking there are no scores to be calibrated OR
+    # uncalibrated. `scores_are_relevance` can only see the reranker's
+    # config and whether the call fell back; neither of those knows that
+    # nothing came back. Without this an empty corpus reported
+    # scores_calibrated=True alongside a null confidence, contradicting
+    # both the field's documented meaning and the cache-hit path, which
+    # reports False for exactly the same reason.
+    prepared.scores_calibrated = bool(ranked) and scores_are_relevance(
+        reranker, used_fallback
+    )
+    if prepared.scores_calibrated:
+        # Published even when the gate then REFUSES: on a refusal this is
+        # the most informative number available, because it says how
+        # close the best match came to the threshold.
+        prepared.confidence = ranked[0].score
 
     if not should_answer(ranked, reranker=reranker, used_fallback=used_fallback):
         # The gate: no model call at all. Both the cost saving and the
@@ -229,6 +312,11 @@ class AnswerOutcome:
     # What to record on the assistant Message row. Drives whether the
     # turn is visible to the query rewriter later.
     kind: MessageKind
+    # Time to the first streamed token, ms. None when no model call was
+    # made (cache hit, gated refusal) and None when the stream FAILED:
+    # the partial text is discarded, so a timing for it would describe
+    # an answer nobody received.
+    first_token_ms: int | None = None
 
 
 async def generate_answer(
@@ -256,13 +344,21 @@ async def generate_answer(
             # declined on content grounds. Feeding "I could not find
             # anything..." to the rewriter makes the next question
             # retrieve against the phrasing of a non-answer.
-            kind=MessageKind.REFUSAL if prepared.gated else MessageKind.ANSWER,
+            kind=(
+                MessageKind.ASSIST
+                if prepared.assisted
+                else MessageKind.REFUSAL
+                if prepared.gated
+                else MessageKind.ANSWER
+            ),
         )
         return
 
     assert prepared.prompt is not None
     pieces: list[str] = []
     failure: BaseException | None = None
+    first_token_ms: int | None = None
+    stream_started = time.monotonic()
     try:
         async for piece in llm.stream(
             system=prepared.prompt.system,
@@ -271,6 +367,12 @@ async def generate_answer(
             temperature=settings.LLM_TEMPERATURE,
             usage_sink=usage_sink,
         ):
+            if first_token_ms is None:
+                # Measured at the first piece the PROVIDER yielded, so
+                # this is time-to-first-token of the model call and not
+                # of the HTTP response -- the number that explains a
+                # chat UI that feels slow.
+                first_token_ms = int((time.monotonic() - stream_started) * 1000)
             pieces.append(piece)
             yield "token", piece
     except asyncio.CancelledError:
@@ -317,7 +419,14 @@ async def generate_answer(
 
     # Validation runs after streaming on pure text, which is why
     # citations.py needs no database and can run with the session closed.
-    answer, citations = validate_citations(raw_answer, prepared.prompt.blocks)
+    answer, citations = validate_citations(
+        raw_answer,
+        prepared.prompt.blocks,
+        # The scores reach the client only if this ranking's scores are
+        # relevance at all. Decided in phase 1 and carried, not
+        # re-derived here where the reranker is out of scope.
+        expose_scores=prepared.scores_calibrated,
+    )
     if not answer.strip():
         answer = INSUFFICIENT_CONTEXT_ANSWER
     # errored=False: reaching here means the stream completed. Every
@@ -326,11 +435,31 @@ async def generate_answer(
         answer=answer,
         citations=citations,
         errored=False,
+        first_token_ms=first_token_ms,
         # An answer the citation validator emptied is not an answer: the
         # model cited nothing the server built, so INSUFFICIENT_CONTEXT
         # is what the user reads and a refusal is what it is.
         kind=MessageKind.ANSWER if citations else MessageKind.REFUSAL,
     )
+
+
+def _citation_to_json(citation: Citation) -> dict:
+    """A Citation as JSON-safe primitives.
+
+    Every field that may hold a UUID is stringified by ITERATING the
+    dataclass, not by listing ids by hand. The hand-written version
+    named `document_id` and `chunk_id`; B1 added `matched_chunk_id`
+    and every cache write then failed with "Object of type UUID is
+    not JSON serializable". Because the write is deliberately
+    non-fatal, the only symptom was a cache that never stored
+    anything and answers that were always recomputed -- found in a
+    log during end-to-end testing, not by a user.
+    """
+    payload = asdict(citation)
+    for key, value in payload.items():
+        if isinstance(value, uuid.UUID):
+            payload[key] = str(value)
+    return payload
 
 
 async def maybe_cache_answer(
@@ -352,15 +481,8 @@ async def maybe_cache_answer(
         prepared.cache_key,
         CachedAnswer(
             answer=answer,
-            # Serialised to JSON, so the UUIDs have to become strings.
-            citations=[
-                {
-                    **asdict(c),
-                    "document_id": str(c.document_id),
-                    "chunk_id": str(c.chunk_id),
-                }
-                for c in citations
-            ],
+            # Serialised to JSON, so every UUID has to become a string.
+            citations=[_citation_to_json(c) for c in citations],
             model=model,
             cached_at=time.time(),
         ),

@@ -2,6 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.routes import auth, conversations, documents, usage, users
 from app.core.config import settings
@@ -64,7 +65,59 @@ async def lifespan(app: FastAPI):
     await aclose_async_client()
 
 
+def configure_cors(target: FastAPI) -> list[str]:
+    """Add CORS to `target`, but only if an operator asked for it.
+
+    A function taking the app rather than inline module code, so a test
+    can exercise the real wiring on a throwaway FastAPI instance. The
+    alternative -- reloading this module to pick up a new setting --
+    replaces the module-level `app` with a new object while the rest of
+    the suite still holds the old one, which turns one CORS test into
+    unrelated failures elsewhere. (Observed, then fixed this way.)
+
+    Returns the origins configured, for logging and for tests.
+
+    CORS is OPT-IN and off by default. The deployed architecture is a
+    same-origin Next.js BFF: the browser talks to Next, Next talks to
+    this API server-side, so there is no cross-origin request to permit
+    and no header should be advertised. An empty setting therefore adds
+    NO middleware at all rather than adding a permissive default.
+
+    Setting CORS_ALLOW_ORIGINS turns it on for direct browser access --
+    a test client, Swagger on another port, a separate dev frontend.
+    """
+    origins = settings.cors_allow_origins()
+    if not origins:
+        return []
+
+    target.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        # Cookies and Authorization headers. The whole reason to enable
+        # this is authenticated access; without it a caller can only
+        # reach /health.
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["*"],
+        # A cross-origin client cannot READ a response header unless it
+        # is exposed. Retry-After is the one carrying meaning the UI
+        # acts on -- without this a 429 countdown silently reads as
+        # undefined while the header sits on the wire.
+        expose_headers=["Retry-After"],
+    )
+    logger.warning(
+        "CORS is ENABLED for %d origin(s): %s. This is not needed for the "
+        "same-origin BFF deployment; unset CORS_ALLOW_ORIGINS in production "
+        "unless a browser calls this API directly.",
+        len(origins),
+        ", ".join(origins),
+    )
+    return origins
+
+
 app = FastAPI(title="DocuMind", version="0.1.0", lifespan=lifespan)
+
+configure_cors(app)
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")

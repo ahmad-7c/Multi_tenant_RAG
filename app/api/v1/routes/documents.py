@@ -4,6 +4,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFil
 from sqlalchemy.orm import Session
 
 from app.api.limits import limit_default
+from app.models.document import DocumentStatus
+from app.services.document_failures import classify_failure
 from app.api.deps import get_current_user, require_admin
 from app.db.session import get_db
 from app.models.user import User
@@ -93,6 +95,11 @@ def get_document(
     response.chunk_count = document_service.count_searchable_chunks(
         db, org_id=current_user.org_id, document_id=document_id
     )
+    # Classified here rather than stored, so rows that FAILED before
+    # this existed are classified too -- a new column would have left
+    # every historical failure blank.
+    if document.status is DocumentStatus.FAILED:
+        response.failure_code = classify_failure(document.error_message)
     return response
 
 

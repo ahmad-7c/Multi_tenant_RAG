@@ -49,16 +49,1041 @@ not "# stores the org id"
 COMPLETE: golden set of 40 (38 gate-scored), retrieval and generation
 scored separately, thresholds re-calibrated at n=38 from a live run and
 applied, rate limiting + stream slots + budget guard, usage metering,
-and 12 mutations proving the tests bite.** 709 tests green against real
-Postgres + pgvector with no network (the suite is pinned offline by
-construction). Dev DB at migration 0008.
+and 12 mutations proving the tests bite.** Dev DB at migration 0008.
+
+**UI PHASE COMPLETE: Step 0, B1, B1b, U1 through U6.** 833 backend
+tests green against real Postgres + pgvector with no network
+(the suite is pinned offline by construction). The frontend has NO
+tests yet -- Playwright and axe are U6.
 
 `.env` is LIVE: `EMBEDDING_PROVIDER=gemini`, `LLM_PROVIDER=gemini`,
 `RERANKER_PROVIDER=hosted`. Backup at `.env.backup-pre-live`. The test
 suite is unaffected either way -- see the offline guard in
 `tests/conftest.py`.
 
-**Next: UI.**
+**Next: a Vercel preview**, which is the only thing in the definition
+of done that no local run can establish. Lighthouse and the three
+responsive widths are also still unmeasured -- see U6's NOT verified
+list.
+
+### UI phase decisions, locked at C0 (2026-10-31)
+Skills: `documind-ui-phase` (how: architecture, security, tests) and
+`documind-ui-design` (what: visuals). On conflict, security and
+architecture follow the phase skill, visuals follow the design skill.
+NB the design skill's folder on disk is still `documin-ui-design`
+(missing the `d`); the skill name inside it is correct.
+
+- **App shape: Next.js BFF, same origin.** The browser talks only to
+  Next.js; Next.js server code talks to FastAPI. **CORS is deliberately
+  NOT added to the backend** -- there is no `add_middleware` call in
+  `app/main.py` and that is the secure default, not an oversight.
+- **Auth unchanged on the backend**: OAuth2 bearer, header only. The BFF
+  holds the JWT in an httpOnly cookie and attaches
+  `Authorization: Bearer` on each proxied call. The browser never sees
+  the token.
+- **Omitted because the backend does not provide them** (each is in the
+  backlog below): Documents 'Pages' column, stage-by-stage processing
+  progress (use an indeterminate bar plus the status chip), 'Open in
+  document', and the sidebar + Usage budget meters.
+- **'Where the time goes' is replaced by an Average latency card**, from
+  the per-day `avg_latency_ms` that `GET /api/v1/usage` already returns.
+  The three-bar breakdown it replaced would have needed per-stage
+  timings aggregated over a window; B1 added them per REQUEST only.
+- **The `/health` chip shows the overall status word only.** The names in
+  `degraded[]` are operator-level deployment facts and are never
+  rendered to a user.
+- Cap list sizes in the UI; no pagination work this phase. Dark theme
+  only.
+
+### B1: honest backend data for the UI (2026-10-31)
+The UI's trace chips, relevance bars and source passages are now real
+fields. Before B1 none of them reached a client: the gate score was
+computed and discarded (`should_answer` returned a bare bool), no
+per-stage timing was measured anywhere, and `Citation` had no score and
+no passage. **18 new tests in `tests/test_trace_payload.py`.**
+
+- **The `citations` SSE event gained** `confidence`, `scores_calibrated`,
+  `used_reranker_fallback`, `candidate_count`, `parent_count`,
+  `retrieve_ms`, `rerank_ms`, `first_token_ms`. Existing fields
+  (`answer`, `citations`, `cached`, `gated`, `rewritten_question`) keep
+  their meaning, pinned by a test -- the BFF will read these and a
+  silent change of meaning would error nowhere.
+- **Each citation gained** `passage` (the parent text, capped at
+  `PASSAGE_CHARS = 1200`, cut at a sentence boundary), `matched_chunk_id`
+  (the child that retrieved, so the UI can highlight the matched
+  sentence) and `score`.
+- **Absent is null, never 0.** `candidate_count`/`parent_count` changed
+  from `int = 0` to `int | None = None`. On a cache hit phase 1 returns
+  before measuring anything, so counts and timings stay None; the design
+  skill's rule is to hide a null element, and `candidates 0` /
+  `rerank 0 ms` are false statements about the request rather than
+  absent measurements. Same reasoning as the nullable token columns on
+  `usage_events`. NB `parent_count` IS 0 when parents were genuinely
+  mapped and none came back -- a real measurement of zero, deliberately
+  distinguishable from the gate having refused first.
+- **`passage` comes from `ContextBlock.content`, already in memory.**
+  Alternative NOT taken: a new DB fetch of parent text at citation time.
+  Rejected because it would (a) add a SECOND place the tenant filter has
+  to be right, for no gain, and (b) reopen a session after phase 1 --
+  the one thing query_service's three-phase split exists to prevent.
+  `ContextBlock` gained `score` and `matched_chunk_id`, both defaulted,
+  carried from `RetrievedParent`.
+- **Passages are attached inside validate_citations' cited-markers
+  loop**, which makes "only cited sources" structural rather than a
+  filter someone has to remember. Uncited blocks are the model's
+  rejected context: the user never saw them, and shipping them would
+  quietly widen what one question discloses.
+- **One predicate decides whether a score is relevance.**
+  `reranker.scores_are_relevance(reranker, used_fallback)` =
+  `scores_are_calibrated and not used_fallback`, and `should_answer` now
+  branches on the same call. Both conditions matter and the second is
+  the subtle one: `scores_are_calibrated` is a property of the PROVIDER,
+  so a hosted cross-encoder advertises calibrated scores and still
+  returns RRF order when its call fails -- the provider flag alone is
+  True at exactly the moment the scores are rank reciprocals. An RRF
+  score rendered in a 0..1 bar reads as "almost no match" for every
+  source of every answer.
+- **The score is nulled TWICE**, where the Citation is built
+  (`expose_scores`, default False) and where the payload is serialised
+  (`expose_score`). The second catches a score replayed from the cache,
+  written under a reranker configuration that can no longer be verified.
+  Because the two are redundant, **each is pinned by its own unit test**
+  -- a single-site mutation is otherwise invisible and the defence is
+  one layer deep without anyone knowing which layer.
+- **Backward compatibility was a real hazard.** The cache read path is
+  `Citation(**cached_dict)`, so a required new field would have raised
+  TypeError on every key written before B1 -- a deploy-time outage
+  lasting one TTL. All three new fields default to None, pinned by
+  `test_citations_cached_before_b1_still_load`.
+- `first_token_ms` is time-to-first-token of the MODEL call, measured in
+  `generate_answer`. Null on a cache hit and a gated refusal (no model
+  call) and null when the stream FAILED: partial text is already
+  discarded on failure, so a timing for it would describe an answer
+  nobody received.
+- A gated refusal keeps real `retrieve_ms`, `rerank_ms`,
+  `candidate_count` and `confidence`. On a refusal the gate score is the
+  most informative number available, because it says how close the best
+  match came.
+
+#### B1 mutation checks: 5 applied one at a time, 5 caught
+`scripts/mutate.py` mutations 13-17. Each was confirmed to make a NAMED
+test fail, then reverted.
+
+| mutation | caught by |
+|---|---|
+| `b1-expose-score-under-fallback` | `test_no_scores_under_reranker_fallback_...` |
+| `b1-validate-always-exposes-scores` | `test_validate_citations_withholds_the_score_unless_asked` |
+| `b1-payload-ignores-score-gate` | `test_the_citation_payload_withholds_the_score_unless_exposed` |
+| `b1-passages-for-uncited-sources` | `test_passage_is_sent_only_for_cited_sources` |
+| `b1-passage-fetch-drops-org-filter` | `test_reranker.py::test_parent_mapping_is_org_scoped` |
+
+#### B1b: every tenant filter on the passage path is now individually pinned (2026-11-01)
+B1's end-to-end isolation test was measured rather than trusted, and on
+its own it proved almost nothing. There are FOUR tenant filters between
+org B's question and a passage -- the vector leg, the keyword leg,
+retrieval's hydration fetch, and `map_to_parents` -- and they are
+mutually redundant. Removing any ONE left the whole suite green,
+including `test_retrieval_never_returns_another_orgs_chunk`, because
+whichever filters remained covered for the one that went. **A filter
+nothing pins is a filter a refactor can delete silently.**
+
+Three new tests in `test_retrieval.py` each execute THAT LAYER'S OWN
+statement (`_VECTOR_SQL`, `_TEXT_SQL`, `_HYDRATE_SQL`) against another
+org's data, so no other layer runs and none can pass the test on its
+behalf. Hydration is handed a foreign chunk id explicitly -- the input a
+broken leg would produce.
+
+Mutations 18-20 in `scripts/mutate.py`, each applied alone and reverted:
+
+| filter removed | vec test | kw test | hyd test | old e2e | B1 e2e |
+|---|---|---|---|---|---|
+| vector leg | **FAIL** | pass | pass | pass | pass |
+| keyword leg | pass | **FAIL** | pass | pass | pass |
+| hydration fetch | pass | pass | **FAIL** | pass | pass |
+
+A clean diagonal: one test per filter, no overlap, nothing else
+disturbed. `map_to_parents` was already pinned this way by
+`test_reranker.py::test_parent_mapping_is_org_scoped`.
+
+**NO LEAK WAS FOUND.** Every filter was present and correct; the entire
+gap was in what the suite pinned. The B1 end-to-end test is kept as a
+backstop and its docstring now names the four per-layer tests, so it
+cannot be mistaken for covering them. Same lesson as Phase 4's
+`leak-slot-on-disconnect`, found a second time by looking: **a test named
+for a failure mode is not evidence that it exercises that failure mode.**
+
+#### Fixed: the passage window excluded the matched chunk (2026-11-01)
+A real bug in B1 as first written, found by asking the question rather
+than assuming. `_passage` returned the parent's FIRST 1200 characters.
+A parent runs to ~500 tokens, well over that, so for any match in the
+back half the reader was shown the wrong part of the right page: the
+`matched_chunk_id` highlight resolved to nothing and the excerpt visibly
+failed to contain the answer printed above it. **The reader's conclusion
+would be that the citation is wrong** -- the exact opposite of what the
+passage exists to establish. Confirmed with a test that places the
+matched child past the cap, which failed against the original code.
+
+- `_window_start` now anchors the window on the match when the match
+  falls past the cap, placing it about a third of the way in so there is
+  leading context, and snapping to a preceding sentence boundary.
+- A moved window is prefixed `...` so the reader knows text precedes it.
+- The returned string INCLUDING its ellipses stays within
+  `PASSAGE_CHARS`, because the cap is what the UI lays out against.
+- A child's text does not always appear verbatim in its parent (children
+  are overlapping token windows and may split mid-sentence), so the
+  lookup falls back to the child's first 120 characters, then to a
+  start-anchored window. Never guesses.
+- This needed the matched child's TEXT, not just its id:
+  `RetrievedParent.matched_content` and `ContextBlock.matched_content`,
+  carried from `Candidate.content`, which the search query already
+  fetched. Never rendered into the prompt -- the model has the whole
+  parent already.
+
+#### Cached passages and document deletion (2026-11-01)
+Cache invalidation became a DISCLOSURE boundary, not just a freshness
+one: a cache entry now holds up to 1200 characters of document text per
+citation, so "the corpus changed" and "this text may no longer be shown"
+are the same question. `delete_document` already bumped
+`index_version` in the same transaction as the delete, and the cache key
+hashes org_id + question + index_version -- so the key a cached passage
+lives under can no longer be COMPUTED by any later request. The entry is
+unreachable, not merely stale, which is the property that matters when
+the payload is document text. Pinned end to end by
+`test_deleting_a_document_makes_its_cached_passage_unreachable`
+(`test_documents.py::test_delete_increments_index_version` pins the bump
+itself).
+
+#### The `citations` event has a published contract (2026-11-01)
+`CitationsEvent` / `CitationPayload` in `app/schemas/conversation.py`,
+wired to the SSE route via `responses=`, **never `response_model`** -- a
+response_model would make FastAPI validate and serialise a return value,
+which for a StreamingResponse means buffering the whole answer and
+losing the stream. Documentation only, so it can drift into fiction:
+`test_the_openapi_schema_matches_what_the_route_actually_emits` asserts
+the documented field names equal the emitted keys, at both levels.
+
+`first_token_ms` is documented as **MODEL time-to-first-token** -- from
+opening the provider stream to its first text chunk -- and the
+description says in as many words that it is NOT user-perceived time to
+first text, because it excludes auth, rate limiting, retrieval and
+rerank (all reported separately on the same event) plus all network time
+to the browser. The UI labels it "model first token" and measures
+perceived latency client-side. A test pins that wording, since a chip
+sitting next to two other timings is easy to mislabel.
+
+Known wart: FastAPI advertises `application/json` alongside
+`text/event-stream` for the 200 response even with
+`response_class=StreamingResponse`. Cosmetic, and not worth hand-writing
+`openapi_extra` (which shallow-replaces the whole `responses` object) to
+remove.
+
+#### B1 verified live, once (2026-11-01)
+One real question against the dev corpus (`Acme-0d2624ff`,
+`travel-policy.md`), through the real pipeline with live Gemini + live
+Cohere: one embedding call, one rerank, one LLM call. Zero DB writes --
+`persist_turn` was not called. The full payload:
+
+    answer         "Expense reports must be submitted within thirty days
+                    of the end of travel [1]."
+    confidence     0.8668671      scores_calibrated  true
+    score          0.8668671      used_fallback      false
+    candidate_count 5             parent_count       5
+    retrieve_ms    289            rerank_ms          3001
+    first_token_ms 894            cached/gated       false/false
+    passage        the full parent (219 chars, under both caps, so
+                   snippet == passage -- correct, not a bug)
+
+- Every new field carried a real measured value, and `confidence`
+  equalled the cited source's `score` as it should when there is one
+  parent at rank 1.
+- **`rerank_ms` was 3001 ms against `RERANKER_TIMEOUT_SECONDS = 3.0`.**
+  The call SUCCEEDED (`used_reranker_fallback` false, and 0.8669 is a
+  real cross-encoder score -- RRF tops out near 0.016), so this is not a
+  fallback. But it finished within a millisecond of the budget, meaning
+  this deployment is one hair from degrading to RRF order on every query,
+  with the confidence gate opening as a consequence. Likely a cold TLS
+  handshake plus a cold Cohere model on the session's first call, which
+  is exactly the condition a user's first question hits. **This is the
+  first time that was visible at all** -- it is precisely the signal B1's
+  timings were added to surface, found on the first live call. Not
+  changed here: raising the budget is a latency/quality tradeoff and an
+  operator decision.
+
+#### Not touched by B1
+Nothing parses the `citations` event in `eval/` or `scripts/`, and the
+SSE route has no `response_model`, so there were no OpenAPI examples or
+harness readers to update. Eval results are unchanged: `expose_scores`
+defaults False and `eval/calibrate.py` carries its own
+`candidate_count` on its own dataclass.
+
+### U1: scaffold, tokens, components, BFF, streaming spike (2026-11-01)
+Frontend lives in `web/` -- the repo root already has `app/` (the Python
+package), so a Next project at root would collide. Next 16.4.3, React
+19.3, Tailwind 4.3.3, TypeScript 5.9.3. Every dependency pinned EXACTLY
+(no `^`). `npm audit`: 0 critical, 0 high, 16 moderate -- all in the
+eslint toolchain, all dev-only, all rooted at one advisory for
+`minimatch`. Nothing moderate reaches the browser bundle.
+
+#### Three things that were wrong and are worth remembering
+- **Tailwind never ran, and the build went GREEN anyway.**
+  `create-next-app` installed `@tailwindcss/turbopack` but did not add
+  the `turbopack.rules` entry that activates it, so `next build` emitted
+  the raw stylesheet with one warning -- `Unknown at rule: @theme` --
+  and ZERO utility classes. Every `bg-s1` and `rounded-card` in the app
+  resolved to nothing. Caught by grepping the built CSS for
+  `box-sizing` and `bg-s1` rather than by trusting the build summary:
+  14 KB of CSS with no preflight and no `--tw-` anywhere. After the fix,
+  33 KB with every token utility present. **A green build is not
+  evidence that the CSS pipeline ran.**
+- **Every page was statically rendered, which a nonce CSP silently
+  breaks.** Next injects the CSP nonce during server-side rendering by
+  reading the header off the incoming request; a prerendered page was
+  built when no request existed, so it ships script tags with no nonce
+  and the CSP blocks them. Blank screen in production, nothing wrong in
+  development. Fixed with `force-dynamic` in the root layout; the build
+  now reports every route as dynamic. Costs nothing real -- every screen
+  behind /login is per-user and per-tenant and was never cacheable.
+- **The BFF smoke test passed against the WRONG BACKEND.** `/api/health`
+  returned 200 and `{"status":"healthy"}` -- from *Memoir App API*,
+  another project holding host port 8000 (a collision CLAUDE.md already
+  documented). DocuMind returns `{"status":"ok"}`. Every proxy assertion
+  up to that point was meaningless. DocuMind now runs on **8001** for UI
+  work and `web/.env.local.example` says so. **A 200 from a proxy proves
+  something answered, not that the right thing answered.**
+
+#### Next 16 renamed middleware
+`middleware.ts` is deprecated in Next 16.0.0 and renamed to `proxy.ts`
+with the function renamed to match (`export function proxy`). It defaults
+to the Node.js runtime. The phase skill says "middleware.ts"; that
+wording predates Next 16. A codemod exists
+(`npx @next/codemod middleware-to-proxy`).
+
+#### The BFF
+- `app/api/[...path]/route.ts` -- the only path from browser to FastAPI.
+  Reads the httpOnly cookie server-side and mints
+  `Authorization: Bearer`. The browser never holds the JWT.
+- **The allowlist excludes `auth` on purpose.** The backend's
+  `/auth/login` responds `{access_token}`, so a generic passthrough
+  would hand the token to the browser and undo the whole design in one
+  word. Login, register and logout have their own handlers. Verified:
+  `GET /api/auth/login` is 405 (the dedicated handler wins over the
+  catch-all), not a proxied 200.
+- Login is TWO upstream calls and register is THREE, because the backend
+  returns a token but no profile from login, and no token at all from
+  register. The body the browser gets is always the profile.
+- `cookie` and `authorization` are in the hop-by-hop strip list.
+  Forwarding the browser's cookie jar to FastAPI would send the session
+  cookie to a service that authenticates by header -- ignored at best,
+  logged upstream at worst.
+- `signal: request.signal` is passed to the upstream fetch. That one line
+  is what will make Stop work: a browser abort aborts the upstream
+  request, the backend sees the disconnect and stops paying for tokens.
+- Redis-style asymmetry is preserved: upstream 401 CLEARS the cookie, so
+  a dead token does not loop through requests that will 401 again.
+- CSRF is two independent checks: a required custom header (a
+  cross-origin form cannot set one, and setting it from JS forces a CORS
+  preflight this app never answers) plus an Origin-vs-Host comparison.
+  Compared against the request's own Host rather than a configured site
+  URL, so it keeps working on every Vercel preview with no per-
+  environment variable to forget. The header's value is not a secret --
+  its PRESENCE is the signal.
+- Security headers in `next.config.ts` (nosniff, Referrer-Policy,
+  Permissions-Policy, X-Frame-Options, no X-Powered-By); the CSP is in
+  `proxy.ts` because it carries a per-request nonce.
+- `server-only` on `lib/backend.ts`, `lib/session.ts`, `lib/csrf.ts`, so
+  an accidental client import is a BUILD error rather than a bundle that
+  ships `BACKEND_URL`. The CSRF constants are split into
+  `lib/csrf-shared.ts` because the client legitimately needs the header
+  name while the check itself must not ship.
+- `next.config.ts` has no `eslint` key: Next 16 removed it from
+  `NextConfig` along with `next lint`.
+
+#### Design system (D0)
+`app/tokens.css` is the only place a colour, radius or easing is
+defined; `globals.css` maps them into the Tailwind 4 theme with
+`@theme inline` so utilities emit `var(--ac)` rather than copying hex,
+which is what will let a light theme be added by overriding tokens
+alone. Fonts are Sora / Inter / JetBrains Mono via `next/font/google`,
+self-hosted at build -- which is why `font-src 'self'` needs no external
+host and first paint makes no third-party request. Only the weights the
+spec names are loaded.
+
+Components: Button (primary/ghost/danger + IconButton), Input,
+StatusChip, CitationChip, SourcePill, TraceChip, StatusDot, Avatar,
+Card, NavItem, ProgressBar, Segmented, Sparkline, EmptyState,
+InlineBanner, Toast, Skeleton. `/design` renders every one in every
+state and **404s in production** via a runtime check, not a build flag:
+a flag that must be set correctly at deploy time will one day be wrong,
+and that page renders sample numbers.
+
+- **`TraceChip` cannot accept a null value.** `value: string`, required.
+  The caller must omit the chip when the backend sent null rather than
+  the component rendering a dash or a zero. The data-honesty rule made
+  structural instead of remembered.
+- **`ProgressBar`'s `value` is optional, and undefined means
+  indeterminate.** `DocumentStatus` has no percentage, so a processing
+  document genuinely has no number and a fake 60% would be invented.
+- **`BudgetMeter` and `Ring` were NOT built**, per C0: the daily budget
+  has no endpoint. `/design` lists them under "Not built" with the
+  reason, so the gap is visible to the fidelity reviewer rather than
+  looking like an oversight.
+- Everything is a real `<button>`/`<a>`: `NavItem` is a `Link` with
+  `aria-current`, `Segmented` is a `radiogroup`, `Input` has a real
+  `<label for>` (a placeholder is not a label), icon buttons are 44px on
+  touch and labelled. `StatusChip` is always icon AND text -- colour
+  alone is exactly what a red/green deficiency loses.
+
+#### Streaming spike: PASSES locally, UNVERIFIED on Vercel
+`/api/spike/stream` (throwaway, 404s in production) delivered ten events
+~250 ms apart -- inter-arrival 137, 71, 266, 256, 259, 274, 256, 279,
+234, 245 ms -- so Next 16 does not buffer SSE locally. Then the same
+confirmed through the REAL proxy against the REAL backend: `token`,
+`citations` with the full B1 payload, `done`, with
+`content-type: text/event-stream`, `cache-control: no-cache, no-transform`
+and `x-accel-buffering: no`. **No Vercel preview exists, so every
+platform claim is from documentation, not observation.**
+
+Verified against vercel.com/docs/functions/limitations (updated
+2026-08-24): request AND response bodies cap at **4.5 MB** (413
+FUNCTION_PAYLOAD_TOO_LARGE); max duration Hobby 300s, Pro 800s
+(1800s beta); **streamed responses count against max duration**. The UI
+cap is 4 MB; the backend's 25 MB is deliberately unchanged because it is
+correct for a self-hosted deployment. See ADR 0003.
+
+#### A B1 defect the live U1 run found
+`scores_calibrated` was reporting **true on an empty corpus**, where
+nothing was scored at all. `scores_are_relevance` can only see the
+reranker's config and whether the call fell back; neither knows that the
+ranking came back empty. Nothing false was displayed -- confidence was
+null and there were no citations, so the UI had nothing to render --
+which is precisely why it needed a test rather than a bug report: the
+flag contradicted its own documented meaning while every visible value
+stayed honest. It also disagreed with the cache-hit path, which reports
+false for the same reason. Now `bool(ranked) and
+scores_are_relevance(...)`, pinned by
+`test_scores_are_not_called_calibrated_when_nothing_was_scored` and
+re-confirmed live. **735 tests green.**
+
+Noted, not changed: a gated question with zero candidates reports
+`rerank_ms: 0`, which is a true measurement of a step that had nothing to
+send. The UI should suppress trace chips entirely when
+`candidate_count` is 0 rather than render "rerank 0 ms".
+
+#### ADRs written
+`docs/adr/0001-bff-with-httponly-cookie.md`,
+`0002-nonce-csp-forces-dynamic-rendering.md`,
+`0003-upload-size-limit-and-fetch-streaming.md`. Markdown sanitisation
+and the honest-data rules get theirs when the code exists (U4/U5).
+
+#### Local dev for the UI -- PORTS
+**Backend 8010, frontend 3010.** Host 8000 is held by Docker and
+another project answers there, and 3000 collides with everything else;
+both were moved so neither can silently hit the wrong service.
+
+    docker compose up -d db test-db redis
+    .env\Scripts\python.exe -m uvicorn app.main:app --port 8010 --reload
+    cd web ; npm run dev                  # http://localhost:3010/design
+
+One number per place, all agreeing: `web/.env.local`
+(`BACKEND_URL=http://127.0.0.1:8010`), `web/.env.local.example`, the
+fallback in `web/lib/backend.ts`, and `-p 3010` in both the `dev` and
+`start` scripts in `web/package.json`. **A wrong BACKEND_URL does not
+fail loudly -- it proxies to whatever answers**, which is how the first
+BFF smoke test passed against another project's API.
+
+Placeholder pages exist at `/login` and `/chat` so the proxy's redirect
+target is not a 404 during review; both are replaced in U2/U4. The real
+thing to look at today is `/design`.
+
+### U2: public site, auth screens, CORS (2026-11-01)
+**749 backend tests green.** Frontend lint and typecheck clean, build
+clean. New pages: `/` (landing), `/how-it-works`, `/how-its-built`,
+`/login`, `/register`. Sign-in verified end to end through the real
+form: cookie set, redirect to `/chat`.
+
+#### CORS -- added on request, and it REVERSES a C0 decision
+C0 locked "BFF, same-origin, do NOT add CORS", and the phase skill
+locks it too. The operator asked for it directly, so it exists, built
+so the locked decision still holds by default:
+
+- `CORS_ALLOW_ORIGINS`, comma-separated, **empty by default**. Empty
+  adds NO middleware at all rather than a permissive default.
+- `allow_credentials=True` with explicit origins. A wildcard **raises
+  at startup** -- `*` cannot be combined with credentials, so browsers
+  reject it outright and configuring it would break every call rather
+  than loosen anything. Failing with the word "wildcard" in the message
+  beats an afternoon of opaque CORS errors.
+- `expose_headers=["Retry-After"]`. A cross-origin client cannot READ a
+  response header unless it is exposed, so without this a 429 countdown
+  silently reads undefined while the header sits on the wire.
+- Local `.env` sets `http://localhost:3010`; `.env.example` ships empty.
+
+**Test pollution, found by running the whole suite.** The first version
+of `tests/test_cors.py` used `importlib.reload(app.main)` to pick up a
+new setting. That replaces the module-level `app` with a NEW FastAPI
+object while the rest of the suite still holds the old one -- and broke
+`test_reranker_cohere::test_health_is_clean_when_nothing_is_degraded`
+and `test_stream_slots::test_closing_the_body_iterator_still_releases_the_slot`,
+two tests with nothing to do with CORS. Both passed in isolation. Fixed
+by extracting `configure_cors(app)` so tests run the real wiring on a
+throwaway app, plus one read-only test asserting `app.main` actually
+calls it -- a helper can be perfect and never invoked.
+
+#### Theme: animated light-black, animated shaded orange
+- Surfaces lifted off pure black (`--bg` `#070605` -> `#0B0908`) so the
+  page reads as warm charcoal with air in it, and the surface steps
+  stay distinguishable on a dim panel.
+- A living background: two very low-opacity warm pools on
+  `body::before`, drifting on an 18s cycle. A `::before` with a
+  TRANSFORM animation, not a background-position on `body` -- one
+  composited layer costs nothing per frame, animating the page
+  background repaints the whole document every tick.
+- `.ac-surface` / `.ac-text`: a three-stop orange ramp at 220% width
+  with its background-position animated, so buttons have a light source
+  travelling across them instead of a flat swatch.
+- Reduced motion stops the travel but KEEPS the shading and the
+  background pools -- they are depth, not movement, and removing them
+  would change the page's colour rather than its motion.
+
+#### No hardcoded content
+`web/lib/site.ts` holds every string the public pages render: nav,
+trust points, features, the seven plain-language steps, six
+architecture sections with their rejected alternatives, the stack, and
+the payment roadmap. Pages are layout; content decisions sit in one
+reviewable list.
+
+#### Payments: roadmap only
+Stripe and PayPal are listed with `available: false` and render as
+"Not yet". No prices, because none are set. Usage is already metered
+per org per day, so billing turns an existing meter into an invoice --
+a checkout button that did not work would be a lie.
+
+#### Honesty on the marketing pages
+The hero demo card is labelled **"Illustration"** in the card itself.
+Its timings are script values, not measurements. The data-honesty rule
+governs numbers the BACKEND produced; these pages call no API, and the
+one place a figure appears it is a configured constant of the system,
+not a metric.
+
+#### React 19 lint caught three real re-render bugs
+`react-hooks/set-state-in-effect` flagged `AnswerDemo`, `Reveal` and
+`TopBar`. Fixed properly, not suppressed:
+- `lib/hooks.ts` -- `usePrefersReducedMotion` and `useScrolledPast` via
+  `useSyncExternalStore`, which reads during render instead of syncing
+  with an effect. The effect version re-renders twice on mount; on a
+  page of twenty revealing sections that is twenty cascading passes
+  before anything is visible. It also gives a defined SERVER snapshot,
+  which these server-rendered components need.
+- `useScrolledPast` returns a BOOLEAN, not the offset: the snapshot is
+  compared by identity on every scroll event, so returning the offset
+  would re-render the header once per pixel.
+- The mobile menu now closes on the click that navigates rather than an
+  effect watching `pathname`. The click is the cause; the pathname
+  change is a consequence.
+
+#### Still placeholders
+`/chat` and the Documents/Usage screens. The app shell with the
+sidebar, and the authenticated screens, are the next block (U3-U5).
+
+### U3-U5: the signed-in product (2026-11-01)
+Documents, Chat and Usage, behind an app shell. **749 backend tests
+green**; frontend lint, typecheck and build clean. Verified end to end
+in the browser against live Gemini + Cohere: upload -> Celery ingest ->
+ready -> ask -> cited streamed answer -> metered usage.
+
+#### The shell
+`app/(app)/layout.tsx` is a route GROUP, so "(app)" never appears in a
+URL. It exists to put the real auth check in ONE place: `requireUser()`
+asks the backend, because a cookie's presence says nothing about
+whether its token is valid, expired, or belongs to a deleted user.
+`proxy.ts` also redirects, but that is UX.
+
+- Sidebar 256px, slide-over below `lg`. Usage is admin-only and hidden
+  for members -- hiding a link is a courtesy, so the page ALSO checks
+  (`notFound()` for a member) and the backend returns 403. Three layers
+  for one rule.
+- The status chip shows the overall word only. `degraded[]` is dropped
+  in `lib/server-api.ts`, server-side, so no component ever holds it
+  and no later edit can render it.
+- **No budget meter.** Omitted at C0; there is still no endpoint.
+
+#### U3 Documents
+The dropzone is both a drop target AND a real `<input type="file">`,
+because drag-and-drop is unavailable to a keyboard or a touch screen.
+Rejected files are listed with WHY (type, size, empty) above the zone
+rather than vanishing.
+
+- **Polling is conditional**: `refetchInterval` returns 3000 only while
+  a row is pending or processing, and `false` otherwise. A fixed
+  interval keeps a tab talking to the API forever on a page where
+  nothing can change.
+- Progress bars are INDETERMINATE. `DocumentStatus` is a four-value
+  enum with no percentage, so a number would be invented.
+- `CHIP_STATUS` maps backend `pending` to chip `queued` as an explicit
+  `Record`, so adding a backend status is a type error here rather
+  than a chip rendering nothing.
+- A failed row fetches its own `error_message` from the detail
+  endpoint -- the list response does not carry one, and "failed" with
+  no reason is not actionable.
+
+#### U4 Chat
+`lib/stream.ts` reads the SSE body with `fetch` + a ReadableStream.
+Frames are buffered across chunk boundaries (a network chunk can end
+mid-frame) and the decoder runs with `stream: true` (it can also end
+mid-UTF-8-character). Exactly one leading space is stripped after
+`data:`, not trimmed -- trimming would eat the spaces between words in
+a streamed answer.
+
+- **Trace chips are built only from non-null fields.** `TraceChip`
+  requires a string, so there is no way to pass it "missing". A cache
+  hit shows "from cache" and no timings. `rerank_ms` is additionally
+  suppressed when `candidate_count` is 0: "rerank 0 ms" is true but
+  reads as an impossibly fast rerank rather than as nothing to rerank.
+- Confidence and the relevance bar render only when
+  `scores_calibrated` is true.
+- The `citations` event REPLACES the streamed text, because a marker
+  the validator dropped is still on screen until it lands.
+- Only markers present in the citations payload become chips; an
+  unresolved one stays plain text rather than becoming a control that
+  leads nowhere.
+- Stop aborts the fetch; the signal reaches FastAPI through the proxy,
+  which raises CancelledError and stops paying for tokens.
+- **Markdown is sanitised and images are REMOVED ENTIRELY.** An
+  `<img src>` is a GET to an arbitrary host the moment an answer
+  renders -- a prompt injection writing an image URL exfiltrates on
+  sight, with no click. Links are limited to http/https/mailto, open
+  with `noopener noreferrer`, and SHOW THEIR DOMAIN.
+  `dangerouslySetInnerHTML` appears nowhere in the file.
+- The Sources panel highlights the matched child inside the parent
+  passage by plain substring search -- no regex, because the needle is
+  document text and a mis-escaped pattern is a crash on somebody's
+  PDF. If the child does not appear verbatim (children are overlapping
+  token windows) the passage renders unhighlighted rather than
+  guessing.
+- **"Open in document" is absent**: it needs the signed-URL endpoint
+  in the backlog, and a link that 404s is worse than no link.
+
+#### U5 Usage
+Four metric cards, a stacked bar chart, and an **Average latency** card
+replacing the design's "Where the time goes" -- that needed per-stage
+timings aggregated over a window, and the backend stores per-request
+timings on the answer event plus an end-to-end daily mean. One real
+number beats three invented ones.
+
+- Deltas request DOUBLE the window in one call and compare halves.
+  Null when there is no full prior period or the base is zero: a "+0%"
+  would claim a comparison nobody made.
+- Rates return null when the denominator is zero and render as an
+  em dash.
+- Below two days a sparkline is replaced by "Not enough days to show a
+  trend" -- a one-point trend is not a trend.
+
+#### Four bugs found by driving the real UI
+- **The answer rendered TWICE.** After a stream ends the history query
+  refetches and contains both new rows, so the live turn and the
+  persisted turn were both on screen -- with the stored copy sorting
+  ABOVE the question that produced it. Fixed with `Live.baseline`, a
+  snapshot of the message ids that existed before the turn.
+- **That snapshot could be empty.** Asking within a second of a page
+  load means `history` is still undefined, and snapshotting it hid
+  every earlier turn. `ask()` now resolves the history query first via
+  `fetchQuery`, which returns the cache when it is already warm.
+- **The bar chart rendered blank.** Bars size themselves with a
+  percentage height, and a percentage against an auto-height parent
+  resolves to zero. The column needed `h-full`.
+- **One day of data filled the chart with solid orange**, because
+  `flex-1` on a single bar takes the whole row. Capped with `max-w`.
+
+Plus two React 19 lint errors fixed rather than suppressed: the
+conversation id is now DERIVED (`chosenId ?? conversations?.[0]?.id`)
+instead of copied into state by an effect, which also stopped it
+fighting the user's own choice on every refetch.
+
+#### Measured on the live run
+An 823-byte Markdown policy went pending to ready inside the 3s poll.
+Two questions against it: `retrieve 124 ms / rerank 1777 ms / model
+first token 967 ms / candidates 5 / confidence 0.94`, then `retrieve
+66 ms / rerank 618 ms / model first token 867 ms / candidates 5 /
+confidence 0.81`. Usage then showed 4 questions, 1.1k tokens, 0% cache
+hits, 50% refusals (the two earlier empty-corpus questions, correctly
+counted) and 589 ms average latency.
+
+**Rerank was 1777 ms and 618 ms here against the 3000 ms budget**, so
+the 3001 ms measured in the B1 smoke was a cold-connection effect
+rather than the steady state. Still worth watching; still not changed.
+
+#### Known gaps
+- A persisted answer renders its `[1]` markers as plain text, because
+  the marker-to-source mapping is not stored (only `cited_chunk_ids`).
+  Honest, but inconsistent with how a live turn looks.
+- No conversation list UI: the most recent conversation is adopted and
+  "New conversation" starts another. Switching between them has no
+  control yet.
+- Still no frontend tests. Playwright, axe and the mutation table are
+  U6.
+
+### Conversational turns, and warmer refusals (2026-11-01)
+From a real transcript: "hey how are you", "how can u hlp me" and
+"what is this document about" each answered "I could not find anything
+in your organization's documents that answers this question." The
+grounding was correct; the product read as broken. **809 backend tests
+green** (+60).
+
+**The strictness is unchanged.** Nothing was loosened in the system
+prompt and no path now answers from training data. The fix sits in
+FRONT of retrieval, not inside it.
+
+#### `app/services/assistance.py` -- intercept before retrieval
+A greeting is not a question about a corpus. `classify()` recognises
+GREETING / CAPABILITY / THANKS and `prepare_query` short-circuits
+before the rewriter, the cache, the embedder, the reranker and the
+model. Measured in a test: zero embedder calls, zero rerank calls,
+zero LLM calls.
+
+- **Deterministic, not a model call.** Replies are templates filled
+  from the org's own document list, so there is nothing to
+  hallucinate. The alternative -- letting the system prompt chat when
+  retrieval comes back empty -- would hand the model licence to answer
+  from training data, which is the exact failure the pipeline exists
+  to prevent.
+- **Anchored matching, never substring.** A false positive is far
+  worse than a false negative: missing a greeting costs a cold reply,
+  but intercepting "what is the refund policy" replaces a correct
+  grounded answer with small talk. Every pattern matches the WHOLE
+  normalised message, backed by an 8-word cap checked first.
+  `test_real_questions_are_never_intercepted` pins thirteen phrases
+  that look conversational and must still reach retrieval -- "hello
+  world program in the onboarding guide", "what documents do you have
+  about parental leave", "who are the approvers for expenses over 500".
+- **Classified on the RAW question**, before the rewriter. Once there
+  is history to rewrite against, "hi" becomes something else entirely
+  and the intent is no longer visible.
+- The capability reply NAMES the org's ready documents, which turns
+  "what can you do" from a dead end into a starting point. READY only:
+  naming a document still being processed invites a question
+  guaranteed to come back empty. Capped at ten with the remainder
+  counted, never silently dropped.
+- `list_ready_document_names` selects the filename COLUMN, not whole
+  Document rows -- this runs on the answer path.
+
+#### `MessageKind.ASSIST` (migration 0009)
+Its own enum member, because both alternatives corrupt a number
+someone reads. As ANSWER it would be an uncited "answer" the UI
+presents as grounded, and it would enter the rewrite window as
+context. As REFUSAL it would inflate the refusal rate on the usage
+dashboard -- turning "people say hello more" into "quality is
+dropping".
+
+Metered as `UsageStatus.OK` with NULL tokens: it succeeded and it cost
+nothing. `downgrade()` raises rather than pretending -- Postgres
+cannot drop an enum value, and a downgrade that silently did nothing
+would leave the schema and the migration history disagreeing.
+
+#### Both refusal sentences reworded
+A refusal is INFORMATION, not an error, and the blunt originals read
+as a malfunction. Both remain single constants, because
+`eval/judge.py` short-circuits on them by identity and `eval/runs.py`
+records them in the run snapshot -- so a refusal stays recognisable
+without string-matching prose.
+
+**`INSUFFICIENT_CONTEXT_ANSWER` is now interpolated INTO
+`SYSTEM_PROMPT`.** They were two separate literals that happened to
+agree; the day someone softened one, the model would have emitted a
+sentence the rest of the system no longer recognised as a refusal.
+
+#### UI
+- `kind` is now on the `citations` SSE event. `gated` alone cannot
+  distinguish an assist turn -- it is neither gated nor an answer.
+- An assist turn renders as plain prose with NO trace chips: nothing
+  ran, so there is nothing to report. Wrapping a greeting in a banner
+  would make saying hello look like a warning.
+- `RefusalCard` replaces the generic info banner: amber (not red --
+  styling careful behaviour as an error teaches people it is a
+  malfunction), the backend's sentence, then the org's actual document
+  names as chips. When nothing is READY it says so instead, because
+  "try rephrasing" when there is nothing to search is a loop with no
+  exit.
+- `refused` now reads `kind === "refusal" || gated`, so a model-side
+  refusal (safety block, zero valid citations) renders as a refusal
+  too, not as an empty answer.
+
+#### Verified live
+"hey how are you" -> a greeting reply naming both uploaded documents,
+no trace chips, no retrieval. "what is the capital of France" -> the
+new refusal at confidence 0.02 with the document chips. "what can the
+owner do on the dashboard" -> unchanged: rewritten, retrieve 62 ms,
+rerank 348 ms, confidence 0.76, five cited bullets and a Sources panel
+at relevance 0.76.
+
+#### Operational note
+Restarting uvicorn on Windows left an ORPHANED CHILD holding the
+listen socket: the parent PID was gone, `netstat` still showed 8010
+LISTENING against it, and the replacement silently failed to bind and
+exited -- so the browser kept talking to the OLD code and the fix
+looked broken. Found by checking the live `/openapi.json` for the new
+enum value rather than trusting that a restart restarted anything.
+Kill the child (`Get-CimInstance Win32_Process` by ParentProcessId),
+not just the parent.
+
+### U6: the verification checkpoint (2026-11-01)
+Playwright + axe end to end, a frontend mutation table, an npm audit, a
+bundle secret scan, and the two remaining ADRs. **810 backend tests and
+26 end-to-end tests**; frontend lint, typecheck and build clean.
+
+#### The harness
+A SEPARATE stack, because the dev one cannot be used for this. The e2e
+API runs on 8020 against its own `documind_e2e` database with fake
+providers; the dev database holds Gemini vectors, and the startup guard
+correctly refuses to serve queries when stored vectors came from a
+different embedding model than the configured one. Tests here also
+delete documents.
+
+- `scripts/e2e_env.sh` + `scripts/e2e_api.sh`. Playwright owns the web
+  server; the API is started by hand because it needs migrations first,
+  and a failed run should not leave a half-migrated database.
+- `CELERY_TASK_ALWAYS_EAGER` added as a SETTING (default False, e2e
+  only). Ingestion runs inline, so an upload is readable the moment the
+  request returns rather than the test racing a worker process. Never
+  set in production -- it would make an upload block for the whole
+  ingestion, which is what the async pipeline exists to avoid.
+- `EMBEDDING_MODEL=fake-embedding` is as load-bearing as
+  `EMBEDDING_PROVIDER=fake`. Setting only the provider left the guard
+  comparing stored `fake-embedding` against configured
+  `gemini-embedding-001`, so `/health` reported
+  `embedding_model_mismatch` and every query returned 503 -- which
+  surfaced as chat tests timing out, not as a config error.
+- Burst limits matter as much as per-minute rates: the defaults are 3
+  for register and 5 for login, so a suite registering six orgs tripped
+  them on the fourth and the failures looked like broken auth.
+- `CONFIDENCE_THRESHOLD=0.4` for e2e. FakeReranker scores by word
+  overlap, so the threshold has to sit between an off-topic question
+  (~0.2, shared stopwords) and an on-topic one (~0.6+). At 0.05 nothing
+  was ever refused and the refusal test could not pass.
+
+#### Four real bugs the tests found
+- **A 401 from the LOGIN endpoint said "Your session has ended. Sign in
+  again."** `apiFetch` treated every 401 as an expired session and
+  discarded the server's message. On a login form that is both wrong
+  and baffling -- the user has no session to have ended. Now auth
+  attempts keep the server's message ("Those details did not match an
+  account"). Caught by test 1b.
+- **Pressing Stop showed a raw `DOMException`.** The abort fires during
+  `fetch`, BEFORE the first byte, which is most of the wait -- and that
+  rejection happened outside the try/catch that maps aborts to
+  `StreamAborted`. Caught by test 7d, which itself only worked after
+  the mock stopped COMPLETING the response: `route.fulfill` with a body
+  ends the stream, so the first version of that test was asserting
+  against an already-finished turn.
+- **Every answer-cache write had been failing silently since B1.**
+  `Object of type UUID is not JSON serializable` -- B1 added
+  `matched_chunk_id` and the hand-written serialiser stringified only
+  `document_id` and `chunk_id`. The write is deliberately non-fatal, so
+  the only symptom was a cache that never stored anything and answers
+  that were always recomputed. Found in an e2e API log, not by a user.
+  `_citation_to_json` now iterates the dataclass instead of naming
+  fields, and `test_an_answer_with_a_passage_can_actually_be_cached`
+  pins it.
+- **`EmptyState` rendered its title as a styled `<p>`.** An empty state
+  is the only thing on screen when it shows, so it is that region's
+  title, and a screen-reader user navigating by headings skipped
+  straight past the one piece of text explaining why the page was
+  blank. Now an `<h2>`.
+
+#### axe: one real finding, one instructive false positive
+- **Real**: inline prose links were distinguished by COLOUR ALONE
+  (orange, underline on hover only). `serious` under WCAG 1.4.1, and
+  invisible as links to anyone with a colour-vision deficiency --
+  permanently so on a touch screen, which never hovers. Now always
+  underlined.
+- **False positive**: `how-its-built` reported a contrast failure on a
+  near-white heading. `Reveal` holds content at `opacity-0` until it
+  scrolls into view, and axe computed the contrast of a transparent
+  element. Scans now run with `prefers-reduced-motion` emulated, which
+  renders the resting state -- the colours a reader actually sees --
+  and checks the reduced-motion path at the same time.
+
+Zero `serious` or `critical` across landing, how-it-works,
+how-its-built, login, register, `/design`, documents, chat (empty),
+chat (answered, sources panel open) and usage. `minor`/`moderate` are
+reported but not gated: axe counts decorative contrast among them, and
+a gate that fires on those gets switched off within a week.
+
+#### Frontend mutation table: 9 of 9 caught
+`web/e2e/mutate.mjs`, same discipline as `scripts/mutate.py`.
+
+| mutation | caught by |
+|---|---|
+| u1 cookie not httpOnly | auth 2 |
+| u2 no sanitisation | app 8 |
+| u3 allow markdown images | app 8 |
+| u4 forward the browser cookie upstream | bff U4 |
+| u5 remove the proxy allowlist | bff U5 |
+| u6 CSRF check always passes | auth 10a/10b |
+| u7 logout stops clearing the query cache | **auth 11b** |
+| u8 render Usage for members | roles 4 |
+| u9 draw the score bar when uncalibrated | app 12 |
+
+**u7 SURVIVED the first time**, and the reason is the interesting part.
+Test 11 checked the cookie and the redirect; removing
+`queryClient.clear()` left it green because query keys are namespaced
+by org and user, so a different user never reads the previous one's
+entries anyway. The namespacing HID the bug. Test 11b observes the
+clear directly: the same user signs back in while the documents request
+is delayed five seconds, so a surviving cache would put the previous
+session's document on screen immediately. With the clear, nothing
+appears until the real response lands.
+
+**u4 and u5 had no test at all** when the table was first written --
+neither has a visible surface, so neither is reachable from a browser.
+Rather than skip them, the pure proxy rules moved out of the
+`server-only` module into `lib/proxy-rules.ts`: they hold no URL, no
+secret and read no environment, so they are importable and directly
+testable. `lib/backend.ts` re-exports them, so no call site changed.
+
+#### Supply chain and secrets
+`npm audit`: **0 critical, 0 high**, 16 moderate -- all in the eslint
+toolchain, dev-only, rooted at one `minimatch` advisory. Nothing
+moderate reaches the browser.
+
+The client bundle (`.next/static` only -- server chunks legitimately
+hold `BACKEND_URL` and are never downloaded) was grepped for `AIza`,
+`JWT_SECRET`, `postgresql://`, `documind:documind`, `BACKEND_URL`,
+`dm_session=`, `COHERE` and `sk-`. All clean. `sk-` matched
+`contains-task-list` and `mask-type` from the sanitiser schema; a
+key-shaped `sk-[A-Za-z0-9_-]{20,}` matches nothing. The scan was
+checked against a control string that IS present, so a silently broken
+grep would have been visible.
+
+#### ADRs
+`0004-markdown-sanitization.md` and `0005-honest-data-rules.md` join
+the three from U1. All five now cite the mutation that proves them.
+
+#### NOT verified
+- **Nothing has been tested on Vercel.** No preview deployment exists,
+  so every platform claim in ADR 0003 remains documentation rather than
+  observation.
+- **Lighthouse was not run.** axe covers the automated WCAG rules, but
+  the "accessibility >= 95" line in the definition of done is unmet
+  because the score was never produced.
+- **Responsive widths (1440/1024/390) are still unchecked.** No
+  horizontal-scroll assertion exists at any width.
+- Tests run against **fake providers**, so a provider-shape change
+  would not be caught here -- only by the live smoke.
+- The e2e suite is **serial and slow** (~8 minutes) and runs against
+  `next dev`, where Turbopack compiles routes on first visit. Two
+  upload waits were raised for that reason, and one test needed its own
+  240s budget. Against `next start` it would be far faster and less
+  timing-sensitive.
+
+### User-facing failure messages (2026-11-02)
+A failed upload was showing the uploader the raw provider exception.
+The real one from this database:
+
+    transient provider error 429: Client error '429 Too Many Requests'
+    for url 'https://generativelanguage.googleapis.com/v1beta/models/
+    gemini-embedding-001:batchEmbedContents' For more information
+    check: https://developer.mozilla.org/...
+
+Wrong twice over: it tells someone who uploaded a PDF nothing they can
+act on, and it discloses the embedding provider, the model name and the
+upstream URL -- which the phase skill's own rule already forbade
+("user-facing errors never include stack traces, backend URLs, or
+internal ids"). **833 backend tests green.**
+
+- `app/services/document_failures.py` -- `FailureCode` plus
+  `classify_failure()`. Seven coarse codes, and coarse ON PURPOSE: each
+  one has to map to a distinct ACTION (wait and retry, convert the
+  file, pick another file, ask an admin). Codes implying the same
+  action would be detail pretending to be useful.
+- **Unrecognised failures return UNKNOWN, never a plausible guess.**
+  Telling someone "the provider was busy, try again" when the real
+  cause was a corrupt file sends them round a loop they cannot exit.
+- **Classified at READ time, not stored.** A new column would have left
+  every failure already in the database blank -- including the
+  operator's own. Pattern matching is the price of covering history.
+- `DocumentDetailResponse` **no longer has `error_message` at all.**
+  The raw text stays in the row and the logs for operators. A fixed
+  enum cannot carry a URL into a response by accident.
+- Copy lives in `web/lib/site.ts` as `failureCopy`, with a
+  `title`/`body`/`action` per code -- product copy, in the one place
+  product copy lives.
+- An unrecognised code still renders copy. Rendering nothing would
+  leave a red "Failed" chip with no explanation, which is the state
+  this change exists to remove.
+
+**The same class of leak, one layer up.** `apiFetch` forwarded
+FastAPI's `detail` straight into the UI. For a 422 that is an ARRAY of
+Pydantic error objects, which rendered as "[object Object]". Now only a
+plain non-empty STRING is accepted; anything else falls back to
+`genericMessageFor(status)`, which says something useful per status --
+a 413 resolves by choosing a smaller file, a 429 by waiting, a 403 by
+asking an administrator. "Something went wrong" is true of all of them
+and useful for none.
+
+**A test that asserted the bug.**
+`test_failed_document_exposes_its_error_message` asserted the raw
+message WAS returned, on the stated reasoning that it was "the only
+feedback the uploader gets". That reasoning was the defect. Rewritten
+as `test_failed_document_reports_a_code_not_the_raw_error`, which
+asserts the code is published and that no fragment of the raw text
+appears under any key.
+
+Verified against the operator's own failed row: a 1.3 MB PDF that hit
+Gemini's free-tier limit mid-ingestion now classifies as
+`rate_limited`, and the raw 429 text stays in the database.
+
+#### Still open
+- **Ingestion gives up on a 429 instead of backing off.** The document
+  above is permanently failed and must be deleted and re-uploaded. The
+  friendly message now says so, but the underlying retry is the real
+  fix and is not done.
+- **A failed or empty document is still invisible in CHAT.** Asking
+  about it returns an ordinary refusal with no hint that the document
+  carries no indexed text. That was the original confusion in the
+  transcript and it is not yet addressed.
+- `test_rate_limit.py::test_the_bucket_is_atomic_under_concurrency`
+  fails intermittently in a full run and passes alone -- a pre-existing
+  Redis-timing flake, not related to this change.
+
+### UI backlog (backend work deferred, with its proposed design)
+Each of these is a UI element omitted at C0 because no endpoint backs it.
+
+- **Document file access -- needed for 'Open in document'.** Proposal: a
+  short-lived signed URL, org-scoped, issued by an authenticated
+  endpoint that 404s (never 403) for another org's document id, matching
+  `GET /documents/{id}`'s existing reasoning. The URL must never carry
+  the `storage_key`: that is the object's address in the bucket and is
+  absent from `DocumentDetailResponse` by construction.
+- **Budget endpoint -- needed for the sidebar and Usage budget meters.**
+  Proposal: return `used`, `limit` and `enabled`. The counters already
+  exist in Redis (`budget_key_global` / `budget_key_org`), but
+  `check_budget` only ever raises `BudgetExceeded` or returns None, so
+  nothing can read the remaining amount. Note
+  `BUDGET_DAILY_GLOBAL_UNITS` and `BUDGET_DAILY_ORG_UNITS` both default
+  to 0 = disabled, so the endpoint must report `enabled: false` rather
+  than a misleading 0%, and the global key is one key for the whole
+  deployment by design.
+- **`chunk_count` in the document LIST response.** It is already on
+  `DocumentDetailResponse` but not on `DocumentListItem`, so a table
+  cannot show it without one detail request per row. This is also what
+  the design skill's 'Pages' column would become: `Document` has no
+  `page_count` column at all, and adding one means deciding what a page
+  means for `.txt`/`.md`, which have no page concept -- ingestion
+  deliberately does not fake pages for them.
+- **Per-stage processing progress.** `DocumentStatus` is a 4-value enum
+  with no stage and no percent, so the pipeline hint (extract, chunk,
+  embed, ready) is decoration and the bar stays indeterminate.
+- **`eval/calibrate.py` has no unit tests.** Carried forward from Phase
+  4 and still true: it is driven only by live runs and its output is
+  reviewed by hand against the run file, so a mutation in it would
+  survive. Not in B1/B1b's path -- it does not read the new payload
+  fields and carries its own `candidate_count` on its own dataclass --
+  but it is the largest untested module in the tree.
+- **`RERANKER_TIMEOUT_SECONDS = 3.0` may be too tight.** The B1 live
+  smoke measured `rerank_ms = 3001` on a successful call (see above).
+  Raising it trades first-token latency against the risk of falling back
+  to RRF order, which also opens the confidence gate. Needs more than
+  one measurement before changing.
 
 ### Phase 4 completion (2026-10-31)
 

@@ -156,9 +156,24 @@ def test_document_status_polling_returns_correct_status(
     assert response.json()["status"] == "ready"
 
 
-def test_failed_document_exposes_its_error_message(
+def test_failed_document_reports_a_code_not_the_raw_error(
     client, db_session, org_factory, user_factory, auth_headers
 ):
+    """The uploader gets a CLASSIFICATION, not the provider's exception.
+
+    This test previously asserted the opposite -- that `error_message`
+    was returned verbatim, on the reasoning that it was "the only
+    feedback the uploader gets". In practice that feedback was
+    text like "transient provider error 429: Client error ... for url
+    'https://generativelanguage.googleapis.com/.../gemini-embedding-001
+    :batchEmbedContents'", which tells someone who uploaded a PDF
+    nothing they can act on and discloses the provider, the model and
+    the upstream URL.
+
+    The raw text stays in the database for operators; the API publishes
+    a code, and the UI owns the sentence. See
+    tests/test_document_failures.py for the classifier itself.
+    """
     org = org_factory()
     admin = user_factory(org, role=UserRole.ADMIN)
     document = _doc(
@@ -172,9 +187,10 @@ def test_failed_document_exposes_its_error_message(
 
     body = client.get(f"/api/v1/documents/{document.id}", headers=auth_headers(admin)).json()
 
-    # This string is the only feedback the uploader gets about why their
-    # document is unusable.
-    assert "OCR" in body["error_message"]
+    assert body["failure_code"] == "no_text"
+    # The raw text is not in the response at all, under any key.
+    assert "error_message" not in body
+    assert "OCR" not in str(body)
 
 
 def test_detail_reports_searchable_chunk_count(

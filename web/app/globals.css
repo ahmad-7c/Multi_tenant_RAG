@@ -1,0 +1,344 @@
+@import "tailwindcss";
+@import "./tokens.css";
+
+/*
+ * `@theme inline` rather than `@theme`: inline makes the generated
+ * utilities emit `var(--ac)` instead of copying the hex value, so the
+ * tokens in tokens.css stay the single source of truth and a future
+ * light theme only has to override them there.
+ */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-s1: var(--s1);
+  --color-s2: var(--s2);
+  --color-s3: var(--s3);
+  --color-line: var(--line);
+  --color-line2: var(--line2);
+  --color-tx: var(--tx);
+  --color-tx2: var(--tx2);
+  --color-tx3: var(--tx3);
+  --color-ac: var(--ac);
+  --color-ac2: var(--ac2);
+  --color-amber: var(--amber);
+  --color-on-ac: var(--on-ac);
+  --color-ok: var(--ok);
+  --color-ok-tx: var(--ok-tx);
+  --color-err: var(--err);
+  --color-err-tx: var(--err-tx);
+  --color-ac-tint: var(--ac-tint);
+  --color-ac-ring: var(--ac-ring);
+
+  --radius-ctl: var(--r-ctl);
+  --radius-card: var(--r-card);
+  --radius-pill: var(--r-pill);
+
+  --font-display: var(--font-sora);
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-mono-jb);
+
+  --ease-brand: var(--ease);
+}
+
+/* The conic border's angle. A registered property is what makes an
+   angle animatable at all -- a plain custom property is a string to
+   the animation engine and jumps from 0 to 360 with nothing between. */
+@property --a {
+  syntax: "<angle>";
+  inherits: false;
+  initial-value: 0deg;
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--tx);
+  font-family: var(--font-inter), system-ui, sans-serif;
+  /* Tabular numerals so a streaming timing chip does not reflow as its
+     digits change. */
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The living background.
+ *
+ * A fixed, pointer-events-none layer holding two large warm radial
+ * pools that drift. It is a ::before on body rather than a background
+ * on body itself so the gradients can be TRANSFORMED -- animating
+ * transform on one composited layer costs nothing per frame, whereas
+ * animating background-position on the page background repaints the
+ * whole document every tick.
+ *
+ * -1 z-index keeps it behind content without needing a stacking
+ * context on every section above it.
+ */
+body::before {
+  content: "";
+  position: fixed;
+  inset: -25%;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(42rem 42rem at 18% 12%, var(--glow-a), transparent 62%),
+    radial-gradient(34rem 34rem at 82% 78%, var(--glow-b), transparent 60%);
+  animation: bgDrift var(--bg-drift) var(--ease) infinite alternate;
+  will-change: transform;
+}
+
+@keyframes bgDrift {
+  from {
+    transform: translate3d(-2%, -1.5%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(2.5%, 2%, 0) scale(1.08);
+  }
+}
+
+/* Headings and big numbers only. Never body text. */
+.font-display {
+  font-family: var(--font-sora), system-ui, sans-serif;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-sora), system-ui, sans-serif;
+}
+
+/* Letter-spacing tightens only above 24px, per the type spec. */
+.tracking-display {
+  letter-spacing: -0.02em;
+}
+
+/* Every interactive element gets a visible orange ring. Applied via
+   :focus-visible so a mouse click does not leave one behind. */
+*:focus-visible {
+  outline: 2px solid var(--ac2);
+  outline-offset: 2px;
+  border-radius: var(--r-ctl);
+}
+
+/* ---------------------------------------------------------------- *
+ * Motion
+ *
+ * Durations: hover/focus 200-250ms, entrance 600-800ms, stagger
+ * 50-100ms. Everything here animates transform or opacity except the
+ * four deliberate exceptions called out in the design spec: the
+ * progress shimmer (background-position), the conic border (--a), and
+ * stroke-dashoffset for sparklines and rings.
+ * ---------------------------------------------------------------- */
+
+@keyframes fadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(15px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-up {
+  animation: fadeUp 700ms var(--ease) both;
+}
+
+/* Section stagger. Capped at ~1s total so the last element is not
+   still arriving after the user has started reading. */
+.stagger-1 { animation-delay: 60ms; }
+.stagger-2 { animation-delay: 120ms; }
+.stagger-3 { animation-delay: 180ms; }
+.stagger-4 { animation-delay: 240ms; }
+.stagger-5 { animation-delay: 300ms; }
+
+@keyframes ping {
+  0% { transform: scale(1); opacity: 0.7; }
+  70% { transform: scale(2.4); opacity: 0; }
+  100% { transform: scale(2.4); opacity: 0; }
+}
+
+.animate-ping-dot {
+  animation: ping 1.8s var(--ease) infinite;
+}
+
+@keyframes shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+.animate-shimmer {
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+
+@keyframes caret {
+  50% { opacity: 0; }
+}
+
+/* steps(1) so it blinks like a terminal cursor rather than pulsing. */
+.animate-caret {
+  animation: caret 1s steps(1) infinite;
+}
+
+/*
+ * The shaded orange surface.
+ *
+ * One gradient, 220% wide, slid horizontally. Only background-position
+ * changes, so there is no layout and no geometry repaint -- the same
+ * technique as the progress shimmer, applied to a fill.
+ */
+.ac-surface {
+  background-image: var(--ac-grad);
+  background-size: 220% 100%;
+  animation: acSheen var(--ac-sheen) linear infinite;
+}
+
+@keyframes acSheen {
+  from { background-position: 0% 50%; }
+  to { background-position: -220% 50%; }
+}
+
+/* Orange gradient as TEXT, for the one accented word in a headline. */
+.ac-text {
+  background-image: linear-gradient(100deg, var(--ac2), var(--amber), var(--ac2));
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: acSheen 7s linear infinite;
+}
+
+/* The upload icon's gentle float. transform only. */
+@keyframes bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+@keyframes spinConic {
+  to { --a: 360deg; }
+}
+
+/*
+ * The focal element. ONE per screen.
+ *
+ * The gradient is painted into the border box only: two backgrounds,
+ * one clipped to the padding box and one to the border box, composited
+ * so the ring shows and the fill does not. A 1px border cannot hold a
+ * gradient any other way.
+ */
+.conic-border {
+  position: relative;
+  border: 1px solid transparent;
+  background:
+    linear-gradient(var(--s2), var(--s2)) padding-box,
+    conic-gradient(
+        from var(--a),
+        transparent 0deg,
+        var(--ac) 90deg,
+        var(--amber) 180deg,
+        transparent 270deg
+      )
+      border-box;
+  animation: spinConic 5s linear infinite;
+  will-change: --a;
+}
+
+@keyframes drift {
+  0% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(40px, -30px) scale(1.08); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+
+.animate-drift-slow { animation: drift 19s var(--ease) infinite; }
+.animate-drift-slower { animation: drift 14s var(--ease) infinite reverse; }
+
+/* Drawn on mount with stroke-dashoffset. pathLength="1" normalises the
+   geometry so one keyframe works for any path length. */
+@keyframes draw {
+  from { stroke-dashoffset: 1; }
+  to { stroke-dashoffset: 0; }
+}
+
+.animate-draw {
+  stroke-dasharray: 1;
+  animation: draw 900ms var(--ease) both;
+}
+
+@keyframes riseBar {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+
+.animate-rise {
+  transform-origin: bottom;
+  animation: riseBar 700ms var(--ease) both;
+}
+
+/*
+ * One-time grow for a progress bar on mount. The only place a layout
+ * property is animated, and deliberately: a width transition is what
+ * makes a progress bar read as progress.
+ */
+.progress-fill {
+  transition: width 600ms var(--ease);
+}
+
+/* ---------------------------------------------------------------- *
+ * Reduced motion
+ *
+ * Final states immediately. Entrance, orbs, typing, conic spin and
+ * shimmer all stop; nothing is left mid-animation and nothing
+ * disappears, because every animation above uses `both` fill or ends
+ * at the resting state.
+ * ---------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* The conic border would freeze at a random angle and read as a
+     half-drawn ring, so it becomes a plain static border instead. */
+  .conic-border {
+    animation: none !important;
+    background: var(--s2) padding-box;
+    border-color: var(--line2);
+    will-change: auto;
+  }
+
+  .animate-shimmer {
+    animation: none !important;
+    background-image: none !important;
+  }
+
+  /* The drifting background pools stop but STAY. They are depth, not
+     motion, and removing them would change the page's colour rather
+     than just its movement. */
+  body::before {
+    animation: none !important;
+    will-change: auto;
+  }
+
+  /* The orange keeps its shading, loses its travel -- so a button is
+     still a lit surface rather than flattening to a swatch. */
+  .ac-surface,
+  .ac-text {
+    animation: none !important;
+    background-position: 30% 50% !important;
+  }
+
+  /* A blinking caret is the one continuous animation worth keeping --
+     it marks "still streaming", which is information, not decoration.
+     Held visible rather than blinking. */
+  .animate-caret {
+    animation: none !important;
+    opacity: 1;
+  }
+}
