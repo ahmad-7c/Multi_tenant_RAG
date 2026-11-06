@@ -36,7 +36,7 @@ its own dimension on a route change cannot be summed across the change.
 """
 import logging
 import uuid
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import func, select

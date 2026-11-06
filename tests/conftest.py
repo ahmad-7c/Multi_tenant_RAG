@@ -238,6 +238,32 @@ def client(db_session, monkeypatch, tmp_path):
 
     monkeypatch.setattr(main_module, "SessionLocal", lambda: _SuiteSession())
 
+    # The ANSWER endpoint does the same thing, and patching app.main
+    # alone did not cover it. app/api/v1/routes/conversations.py
+    # imports SessionLocal at module scope and opens its own sessions
+    # in phase 3 (persist_turn) and in the slot-release paths, none of
+    # which go through the get_db dependency.
+    #
+    # Found by running this suite INSIDE the production image, where
+    # DATABASE_URL is deliberately an unreachable placeholder: three
+    # rate-limit tests failed with OperationalError against
+    # `postgresql://unused:unused@127.0.0.1:1/unused`. They pass on a
+    # developer's machine for the worst possible reason -- DATABASE_URL
+    # there points at the real DEV database, so those tests were
+    # connecting to, and writing into, a database this suite does not
+    # own. Exactly the class of bug the comment above describes, one
+    # layer further in.
+    #
+    # Commits through _SuiteSession stay safe: db_session runs on a
+    # connection with join_transaction_mode="create_savepoint", so a
+    # commit releases a savepoint and the outer transaction is still
+    # rolled back when the test ends.
+    import app.api.v1.routes.conversations as conversations_module
+
+    monkeypatch.setattr(
+        conversations_module, "SessionLocal", lambda: _SuiteSession()
+    )
+
     with TestClient(fastapi_app) as test_client:
         yield test_client
 

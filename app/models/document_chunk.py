@@ -1,5 +1,5 @@
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import Computed, ForeignKey, Integer, String, Text
@@ -8,6 +8,15 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.config import settings
 from app.db.base import Base
+
+# The relationship targets are declared as STRINGS and resolved by
+# SQLAlchemy's declarative registry at mapper-configuration time, so
+# importing them at runtime is unnecessary -- and would be a circular
+# import. Declared under TYPE_CHECKING instead, which runs never:
+# it tells a reader and a type checker where the name lives, and
+# stops `Mapped["X"]` reading as a name that exists nowhere.
+if TYPE_CHECKING:
+    from app.models.document import Document
 
 # Must match migration 0004's to_tsvector() config. Duplicated rather than
 # shared because the migration cannot import a value that might change.

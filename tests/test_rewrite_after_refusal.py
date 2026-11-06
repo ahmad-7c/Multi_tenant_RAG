@@ -6,12 +6,10 @@ refuses, then an ordinary follow-up -- and asserts the refusal text
 never reaches the rewriter.
 """
 import json
-import uuid
 
-import pytest
 
 from app.core.config import settings
-from app.models.conversation import Conversation, Message, MessageKind, MessageRole
+from app.models.conversation import Message, MessageKind, MessageRole
 from app.services.cache import InMemoryAnswerCache
 from app.services.embedding import FakeEmbeddings
 from app.services.llm import SAFETY_BLOCKED_ANSWER, FakeLLM, LLMSafetyBlockedError

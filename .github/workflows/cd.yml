@@ -1,0 +1,141 @@
+# CD: deploy main to the Lightsail instance, after CI has passed.
+#
+# Triggered by workflow_run rather than `on: push`, so a deploy is
+# impossible unless the CI run for that exact commit SUCCEEDED. A
+# `needs:` in one workflow would do the same only if CI and CD shared a
+# file; splitting them keeps `packages: write` out of the workflow that
+# runs on every pull request, including from forks.
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  # ONE deploy at a time, and NEVER cancel one in flight:
+  # cancel-in-progress would abort a half-finished migration or leave
+  # the stack between two image tags. A queued deploy waits instead.
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    # The workflow_run trigger fires on failure too, so the conclusion
+    # must be checked explicitly or a red CI would still deploy.
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+      sha: ${{ steps.name.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The commit CI tested, not whatever main points at now. A
+          # push landing during the build would otherwise deploy code
+          # no CI run ever saw.
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: compute the image reference
+        id: name
+        # ghcr.io requires a LOWERCASE image name and this repository is
+        # mixed case (Multi_tenant_RAG), so the push fails without the
+        # conversion. GitHub's own packaging docs do this with the same
+        # `tr`.
+        run: |
+          set -euo pipefail
+          repo=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          sha="${{ github.event.workflow_run.head_sha }}"
+          echo "image=ghcr.io/${repo}" >> "$GITHUB_OUTPUT"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: log in to ghcr.io
+        # Pinned to the commit SHA published by GitHub's packaging docs.
+        uses: docker/login-action@65b78e6e13532edd9afa3aa52ac7964289d1a9c1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build and push, tagged by git SHA
+        uses: docker/build-push-action@f2a1d5e99d037542a71f64918e516c093c6f3fc4
+        with:
+          context: .
+          target: runtime
+          push: true
+          # The SHA tag is the deployable identity and it is immutable,
+          # which is what makes rollback a matter of naming the previous
+          # one. `latest` is pushed as a convenience for humans reading
+          # the registry; nothing deploys from it, because a moving tag
+          # cannot be rolled back to.
+          tags: |
+            ${{ steps.name.outputs.image }}:${{ steps.name.outputs.sha }}
+            ${{ steps.name.outputs.image }}:latest
+
+  deploy:
+    needs: build-push
+    runs-on: ubuntu-latest
+    # A GitHub environment, so protection rules (required reviewers, a
+    # wait timer) can be switched on WITHOUT editing this file. The
+    # secrets below are scoped to it.
+    environment: production
+    steps:
+      - name: install the deploy key and the host key
+        # Secrets arrive through `env:`, never interpolated into the
+        # script body. Two reasons: an inline ${{ }} is substituted
+        # BEFORE the shell parses the line, so a secret containing shell
+        # metacharacters becomes executable text; and a value passed as
+        # an argument can surface in process listings, while an env var
+        # does not.
+        #
+        # Raw ssh, not a third-party action. This step holds a key that
+        # reaches production, and that is the one place in this repo
+        # that should not take a supply-chain risk on an action whose
+        # SHA cannot be verified here.
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          echo "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+          test -s ~/.ssh/deploy_key || { echo "DEPLOY_SSH_KEY is empty"; exit 1; }
+          test -s ~/.ssh/known_hosts || { echo "DEPLOY_KNOWN_HOSTS is empty"; exit 1; }
+
+      - name: deploy, verify, and roll back on failure
+        # Everything decisive happens in scripts/deploy.sh ON THE
+        # SERVER. Keeping the logic in a reviewed file rather than
+        # inline YAML means it can be run by hand during an incident,
+        # when GitHub may be the thing that is down.
+        #
+        # The image reference and the SHA are the only arguments.
+        # deploy.sh records the tag it is replacing and restores it if
+        # the health check or the smoke test fails.
+        #
+        # StrictHostKeyChecking is left at its default (ON) and backed by
+        # the known_hosts written above. Setting it to `no` would accept
+        # any host key presented and make the deploy MITM-able, which is
+        # the classic shortcut in exactly this step.
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          IMAGE: ${{ needs.build-push.outputs.image }}
+          SHA: ${{ needs.build-push.outputs.sha }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/documind && ./scripts/deploy.sh $IMAGE $SHA"
+
+      - name: discard the key
+        # always(): a failed deploy must not leave a production key on a
+        # runner, even though GitHub-hosted runners are ephemeral. Cheap
+        # insurance against the day a self-hosted runner is introduced.
+        if: always()
+        run: rm -f ~/.ssh/deploy_key

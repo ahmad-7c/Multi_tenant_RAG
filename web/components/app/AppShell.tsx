@@ -34,7 +34,17 @@ function StatusChipInline({ status }: { status: string | null }) {
   return (
     <span className="inline-flex items-center gap-2 rounded-pill border border-line bg-s1 px-3 py-1.5 text-[12px] text-tx2">
       <StatusDot tone={ok ? "ok" : "warn"} ping={ok} />
-      {ok ? "All systems normal" : status ? "Service degraded" : "Status unknown"}
+      {/* The dot alone below `sm`. On a 390px header the breadcrumb and
+          a six-word chip cannot both fit, and the breadcrumb is what
+          tells you where you are. `sr-only sm:not-sr-only` keeps the
+          wording available to assistive tech at every width -- ONE
+          element, so the two cannot drift apart. Two spans (one
+          `hidden sm:inline`, one `sr-only sm:hidden`) said the same
+          thing twice and a reworded chip would have been reworded in
+          only one of them. */}
+      <span className="sr-only sm:not-sr-only">
+        {ok ? "All systems normal" : status ? "Service degraded" : "Status unknown"}
+      </span>
     </span>
   );
 }

@@ -22,7 +22,7 @@ import pytest
 
 from app.api import limits
 from app.core.config import settings
-from app.models.conversation import Conversation, Message
+from app.models.conversation import Conversation
 from app.services.cache import InMemoryAnswerCache
 from app.services.embedding import FakeEmbeddings
 from app.services.llm import FakeLLM, LLMRateLimitError

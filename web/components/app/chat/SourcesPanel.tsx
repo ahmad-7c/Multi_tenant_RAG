@@ -90,9 +90,12 @@ export function SourcesPanel({
   if (!open || citations.length === 0) return null;
 
   return (
+    // Stacked under the conversation on narrow screens, a rail beside
+    // it from xl. Capped at 45vh when stacked so it cannot swallow the
+    // whole phone screen and hide the composer.
     <aside
       aria-label="Sources"
-      className="animate-fade-up flex w-full shrink-0 flex-col border-t border-line bg-s1/50 xl:w-[380px] xl:border-l xl:border-t-0"
+      className="animate-fade-up flex max-h-[45vh] w-full shrink-0 flex-col border-t border-line bg-s1/50 xl:max-h-none xl:w-[380px] xl:border-l xl:border-t-0"
     >
       <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-4">
         <h2 className="font-display text-[15px] font-semibold text-tx">

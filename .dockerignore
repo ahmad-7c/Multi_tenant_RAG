@@ -1,0 +1,65 @@
+# What must never enter the build context.
+#
+# A .dockerignore is not an optimisation here, it is the control that
+# keeps live provider keys out of the image. Without it `COPY . .` --
+# or any future broad COPY -- bakes `.env` into a layer, and a layer
+# is readable by anyone who can pull the image even if a later layer
+# deletes the file.
+#
+# Deny-by-exception would be safer still, but Docker has no reliable
+# "ignore everything then re-include" for build contexts across
+# versions, so this is an explicit list and D1 verifies the result by
+# listing the image filesystem rather than trusting this file.
+
+# ---- secrets -----------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.production.example
+
+# ---- user data ---------------------------------------------------------
+# Uploaded documents. These belong in a volume at runtime, never in an
+# image: baking them in would ship one tenant's files to every deploy.
+uploads/
+uploads-e2e/
+
+# ---- version control and history ---------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# ---- local runtimes ----------------------------------------------------
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- the frontend ------------------------------------------------------
+# The Next.js app deploys to Vercel and shares no runtime with the API.
+# node_modules alone is hundreds of megabytes of build context.
+web/
+
+# ---- things that are not the application --------------------------------
+#
+# NOT excluded here: tests/ and eval/. The build context is shared by
+# every stage, so excluding them would make it impossible to run the
+# suite inside the image -- which is exactly how the runtime gets
+# verified (R4). They are kept OUT OF THE RUNTIME STAGE instead, by
+# copying only `app/` and `alembic/` into it. D1 proves that by
+# listing the final image's filesystem.
+scripts/
+docs/
+.claude/
+.agents/
+*.md
+!README.md
+
+# ---- editor / OS noise --------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

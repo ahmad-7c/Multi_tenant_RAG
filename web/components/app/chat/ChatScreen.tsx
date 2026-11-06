@@ -284,8 +284,20 @@ export function ChatScreen() {
     : (history ?? []);
 
   return (
-    <div className="flex h-[calc(100vh-72px)] min-w-0">
-      <div className="flex min-w-0 flex-1 flex-col">
+    // flex-col until xl, then row.
+    //
+    // This was `flex` at every width, so on a phone the Sources panel
+    // -- a `w-full shrink-0` sibling -- took the whole width and shoved
+    // the conversation off-screen. The panel's own `border-t` and
+    // `xl:border-t-0` always intended stacking; the parent never
+    // switched.
+    //
+    // 100dvh, not 100vh: on mobile browsers 100vh is the height WITH
+    // the URL bar collapsed, so a 100vh column puts the composer below
+    // the fold and the user cannot reach the input without scrolling
+    // the page itself.
+    <div className="flex h-[calc(100dvh-72px)] min-w-0 flex-col xl:flex-row">
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-3 sm:px-8">
           <span className="rounded-pill border border-line bg-s1 px-3 py-1 font-mono text-[11px] text-tx2">
             Org only

@@ -118,15 +118,37 @@ export function Sidebar({
       {/* Mobile slide-over. */}
       {open && (
         <div className="fixed inset-0 z-50 lg:hidden">
-          <button
-            type="button"
-            aria-label="Close menu"
+          {/* Tap-outside-to-close. aria-hidden because the drawer now
+              has a real Close button; exposing both would put two
+              identical controls in the accessibility tree. */}
+          <div
+            aria-hidden="true"
             onClick={onClose}
             className="absolute inset-0 bg-black/60 backdrop-blur-sm"
           />
           <aside className="animate-fade-up absolute inset-y-0 left-0 flex w-[270px] flex-col border-r border-line bg-s1">
-            <div className="px-5 py-5">
+            <div className="flex items-center justify-between gap-3 px-5 py-5">
               <Logo />
+              {/* A VISIBLE close control, not just the backdrop.
+                  Tapping outside is a convention, not an affordance:
+                  on a 390px screen this drawer covers most of the
+                  view, and a sighted touch user needs something to
+                  aim at. 44px so it is a legal tap target. */}
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close menu"
+                className="-mr-2 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-ctl text-tx2 transition-colors duration-200 hover:bg-s2 hover:text-tx"
+              >
+                <svg viewBox="0 0 20 20" className="h-4 w-4" aria-hidden="true">
+                  <path
+                    d="M5 5l10 10M15 5L5 15"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
             </div>
             <div className="flex-1 px-4" onClick={onClose}>
               <Nav isAdmin={isAdmin} />
