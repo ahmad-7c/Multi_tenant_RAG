@@ -6,6 +6,12 @@
 # temporary" is how a key reaches a public remote.
 .env.*
 !.env.example
+# The deployment's instruction sheet, and the one env file that IS
+# committed. Carries no real values -- every secret is a <GENERATE>
+# or <PASTE> placeholder, pinned by tests/test_env_production_example.py.
+# Without this negation the `.env.*` rule above swallows it, and the
+# two test modules that read it fail on any fresh clone (i.e. in CI).
+!.env.production.example
 
 # Python
 __pycache__/

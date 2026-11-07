@@ -293,7 +293,7 @@ async def test_gate_closes_for_an_irrelevant_question(db_session, corpus, monkey
     events = [item async for item in query_service.generate_answer(prepared, llm=llm)]
     assert llm.calls == []
     outcome = events[-1][1]
-    answer, citations, errored = outcome.answer, outcome.citations, outcome.errored
+    errored = outcome.errored
     assert outcome.citations == []
     assert errored is False
 
@@ -664,7 +664,7 @@ async def test_llm_error_mid_stream_still_ends_with_done(db_session, corpus):
 
     assert events[-1][0] == "done"
     outcome = events[-1][1]
-    citations, errored = outcome.citations, outcome.errored
+    errored = outcome.errored
     assert errored is True
     assert outcome.citations == []
 

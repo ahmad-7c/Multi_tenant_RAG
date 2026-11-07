@@ -184,12 +184,45 @@ def test_the_key_builders_cannot_collide():
 # ------------------------------------------------- Redis: the real thing --
 
 
+# The slowest refill the limiter accepts, for tests that assert an EXACT
+# allowed count against a real Redis.
+#
+# These used per_minute=60, which is a refill of ONE TOKEN PER SECOND --
+# so any batch taking longer than a second to finish regains a token and
+# the count comes out one too high. That is the limiter working
+# correctly: time really had passed. The TEST was wrong about what it
+# controls.
+#
+# Measured against the real Lua script, capacity 5, 40 concurrent calls,
+# varying only how long the batch takes:
+#
+#   span 0.14s -> refill 0.14 tok -> allowed 5   (pass)
+#   span 0.40s -> refill 0.40 tok -> allowed 5   (pass)
+#   span 1.19s -> refill 1.19 tok -> allowed 6   (FAIL)
+#   span 1.96s -> refill 1.96 tok -> allowed 6   (FAIL)
+#
+# which is exactly why it only ever failed in the FULL suite: alone the
+# batch takes ~140 ms, but a loaded box stretches it past a second. At
+# per_minute=1 the rate is one token per sixty seconds, so the same
+# batch would have to stall for a minute to shift any count.
+#
+# This does NOT weaken the atomicity proof. The CONCURRENCY is what
+# catches a non-atomic limiter, not the rate -- measured: a naive
+# GET/decide/SET limiter allowed all 40 of a simultaneous gather, and
+# exactly 5 once the calls were staggered by 30 ms. So the gather in
+# test_the_bucket_is_atomic_under_concurrency must stay bare, with no
+# sleeps between calls, or it stops proving anything.
+NO_REFILL_PER_MINUTE = 1
+
+
 async def test_the_redis_bucket_allows_exactly_its_burst(redis_limiter):
     key = key_for(redis_limiter, "burst")
     allowed = 0
     for _ in range(10):
         allowed += 1 if (
-            await redis_limiter.check(key, per_minute=60, burst=4)
+            await redis_limiter.check(
+                key, per_minute=NO_REFILL_PER_MINUTE, burst=4
+            )
         ).allowed else 0
     assert allowed == 4
 
@@ -206,10 +239,19 @@ async def test_the_bucket_is_atomic_under_concurrency(redis_limiter):
     it does so under load -- so the limiter fails open at the exact
     moment it is needed. 40 simultaneous calls against a capacity of 5
     makes that race reliable rather than occasional.
+
+    The gather below is deliberately BARE -- no sleeps, no staggering.
+    That is the whole experiment: a naive GET/decide/SET limiter allowed
+    all 40 of a simultaneous gather, and exactly 5 once the calls were
+    spread by 30 ms. Staggering these calls would leave the test passing
+    against a limiter with no atomicity at all.
     """
     key = key_for(redis_limiter, "atomic")
     results = await asyncio.gather(
-        *[redis_limiter.check(key, per_minute=60, burst=5) for _ in range(40)]
+        *[
+            redis_limiter.check(key, per_minute=NO_REFILL_PER_MINUTE, burst=5)
+            for _ in range(40)
+        ]
     )
     allowed = sum(1 for r in results if r.allowed)
     # Exactly 5. Not "about 5": Redis runs the script to completion
@@ -221,9 +263,13 @@ async def test_redis_buckets_are_per_key(redis_limiter):
     a = key_for(redis_limiter, "org-a")
     b = key_for(redis_limiter, "org-b")
     for _ in range(3):
-        await redis_limiter.check(a, per_minute=60, burst=3)
-    assert not (await redis_limiter.check(a, per_minute=60, burst=3)).allowed
-    assert (await redis_limiter.check(b, per_minute=60, burst=3)).allowed
+        await redis_limiter.check(a, per_minute=NO_REFILL_PER_MINUTE, burst=3)
+    assert not (
+        await redis_limiter.check(a, per_minute=NO_REFILL_PER_MINUTE, burst=3)
+    ).allowed
+    assert (
+        await redis_limiter.check(b, per_minute=NO_REFILL_PER_MINUTE, burst=3)
+    ).allowed
 
 
 async def test_a_redis_decision_is_not_marked_degraded(redis_limiter):

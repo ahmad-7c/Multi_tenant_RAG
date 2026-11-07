@@ -254,7 +254,6 @@ def test_the_startup_guard_reads_the_TEST_database(
     from fastapi.testclient import TestClient
 
     import app.main as main_module
-    from app.core.config import settings
     from app.main import app as fastapi_app
     from app.api.deps import get_db
 

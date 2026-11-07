@@ -15,7 +15,6 @@ Two properties matter most and both are pinned below:
     eye and attributes a threshold change to the reranker.
 """
 import json
-import os
 from dataclasses import dataclass
 
 import pytest

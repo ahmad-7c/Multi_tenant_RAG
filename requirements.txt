@@ -1,4 +1,12 @@
 fastapi==0.115.0
+# REQUIRED, not optional. FastAPI raises at IMPORT time -- not at
+# request time -- if a route declares Form or UploadFile and this is
+# missing, so the upload endpoint in app/api/v1/routes/documents.py
+# makes `import app.main` fail outright. It was absent from this file
+# while present in the dev venv as a transitive install, which is why
+# every local run worked while the production image could not boot at
+# all. Found by building the image and importing the app inside it.
+python-multipart==0.0.32
 uvicorn[standard]==0.32.0
 sqlalchemy==2.0.54
 psycopg2-binary==2.9.13
@@ -12,6 +20,20 @@ pyjwt==2.9.0
 pytest==8.3.3
 httpx==0.27.2
 celery==5.4.0
+# Pinned because it is NOT just a transitive detail: kombu owns the
+# Celery broker transport, and 5.7.0 began requiring redis-py >= 6.1.0.
+# With `redis==5.0.8` below, a fresh install resolved kombu 5.7.0 and the
+# worker died at startup with
+#   kombu.exceptions.VersionMismatch: Redis transport requires redis-py
+#   versions 6.1.0 or later. You have 5.0.8
+# so ingestion would never have run in production. The dev venv had
+# 5.6.2 from an older install and worked, which is exactly how the drift
+# stayed invisible: same requirements.txt, different resolved tree.
+# 5.6.2 is the version the 961-test suite is green against.
+#
+# The general fix is a lockfile (pip-compile / pip freeze) so the image
+# and the venv cannot diverge at all. Not done here; see the D1 report.
+kombu==5.6.2
 redis==5.0.8
 pymupdf==1.28.2
 openai==1.51.0

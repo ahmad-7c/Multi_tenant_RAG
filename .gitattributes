@@ -1,0 +1,28 @@
+# Line endings, enforced where they are FUNCTIONAL rather than cosmetic.
+#
+# Without this file, the committed line endings depend on each
+# contributor's core.autocrlf. That is not a tidiness question here:
+# scripts/deploy.sh and scripts/smoke_test.sh are executed by bash ON
+# THE LINUX SERVER, and a CRLF copy fails with
+#
+#   set: pipefail
+#   : invalid option name
+#
+# which is a deploy that dies on its first line. That exact failure was
+# hit during development, from a Windows editor writing CRLF into a
+# script the local Git Bash tolerated and Linux did not.
+#
+# Dockerfiles, compose files and the Caddyfile are listed for the same
+# reason: each is parsed by a Linux tool at build or boot time.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+Caddyfile   text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# Keep the repo's own text normalised so a diff shows real changes
+# rather than a whole-file line-ending churn.
+*.py        text
+*.md        text
+*.ts        text
+*.tsx       text
