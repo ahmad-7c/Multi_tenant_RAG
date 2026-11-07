@@ -10,7 +10,10 @@ hurt someone: deploying code CI never saw, cancelling a deploy
 mid-migration, accepting any SSH host key, interpolating a secret into a
 shell line, or deploying a moving tag that cannot be rolled back to.
 """
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -333,3 +336,134 @@ def test_the_smoke_test_calls_routes_that_exist():
             if path
         }
         assert normalised in candidates, f"{raw} is not a route this app serves"
+
+
+# --------------------------------------------------------------------
+# The smoke gap: credentials never reached the server, and a skipped
+# check counted as a pass. Three tests, one per half of the fix.
+# --------------------------------------------------------------------
+
+
+def test_the_smoke_credentials_never_ride_on_a_command_line(cd: dict):
+    """On stdin, not in argv.
+
+    `ssh host "cmd $SECRET"` puts the value in the process list on the
+    runner AND on the server, readable by any account there for the life
+    of the process. The three secrets must arrive through `env:` and be
+    piped in, never appended to the remote command.
+    """
+    step = next(
+        s for s in _steps(cd) if "deploy.sh" in str(s.get("run", ""))
+    )
+    run = step["run"]
+    env = step.get("env", {})
+
+    for name in ("SMOKE_ORG", "SMOKE_EMAIL", "SMOKE_PASSWORD"):
+        assert name in env, f"{name} must be passed through env:"
+        assert f"secrets.{name}" in env[name]
+
+    # Piped, and the pipe must reach ssh.
+    assert "printf" in run and "| ssh" in run.replace("\\n", " ")
+
+    # And never interpolated into the remote command string.
+    remote = run[run.index("ssh") :]
+    for name in ("SMOKE_ORG", "SMOKE_EMAIL", "SMOKE_PASSWORD"):
+        assert f"${name}" not in remote, f"{name} is on the remote command line"
+
+
+def test_deploy_reads_the_credentials_before_anything_consumes_stdin():
+    """Order matters, and nothing else may eat the lines.
+
+    `docker compose run --rm migrate` inherits stdin. If it runs before
+    the read, it consumes the three lines and the smoke test is handed
+    nothing -- the exact failure this change exists to remove, re-created
+    one layer down.
+    """
+    script = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    read_at = script.index("read -r SMOKE_ORG")
+    close_at = script.index("exec < /dev/null")
+    migrate_at = script.index("$COMPOSE run --rm migrate")
+
+    assert read_at < close_at < migrate_at, (
+        "stdin must be read and then closed before compose run"
+    )
+    # The base URL must be set too: Caddy serves one site address, so the
+    # script's https://localhost default matches no site on the server.
+    assert "SMOKE_BASE_URL" in script
+
+
+def _usable_bash(script: Path) -> str | None:
+    """A bash that can actually see `script`.
+
+    On Windows the `bash` on PATH is often WSL's, which cannot resolve a
+    C:/ path at all -- it needs /mnt/c/... So candidates are PROBED
+    rather than assumed, and the test skips with a true reason instead of
+    failing on "No such file or directory", which says nothing about the
+    property under test. On Linux (and in CI) the first candidate works.
+    """
+    candidates = [
+        c
+        for c in (
+            shutil.which("bash"),
+            r"C:\Program Files\Git\bin\bash.exe",
+            r"C:\Program Files (x86)\Git\bin\bash.exe",
+        )
+        if c and Path(c).exists()
+    ]
+    for candidate in candidates:
+        probe = subprocess.run(
+            [candidate, "-c", f"test -f '{script.as_posix()}'"],
+            capture_output=True,
+            timeout=60,
+        )
+        if probe.returncode == 0:
+            return candidate
+    return None
+
+
+def test_the_smoke_test_fails_when_its_credentials_are_missing():
+    """A skipped check must never count as a pass.
+
+    This printed "SKIP login" and exited 0, so a deploy whose credentials
+    never arrived was reported as a successful smoke -- and deploy.sh
+    reads that exit status as "production works". The two checks that
+    need these variables are the only ones exercising auth, the answer
+    path and a database write.
+    """
+    script = ROOT / "scripts" / "smoke_test.sh"
+    bash = _usable_bash(script)
+    if bash is None:
+        pytest.skip("no bash on this machine can read the repo path")
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SMOKE_")}
+    proc = subprocess.run(
+        [bash, script.as_posix()],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    output = proc.stdout + proc.stderr
+
+    assert proc.returncode != 0, "missing credentials must fail the smoke test"
+    # It must fail BEFORE any network call, so the message names the real
+    # cause rather than an HTTP error.
+    assert "SMOKE_ORG" in output
+    assert "PASS" not in proc.stdout, "nothing may be reported as passing"
+
+
+def test_a_failed_smoke_test_rolls_back():
+    """The whole point of running it. Pinned because it is one `if`.
+
+    Without the rollback call a failed smoke logs and exits non-zero, so
+    CD goes red while the broken image keeps serving -- the worst of both
+    outcomes, since the alert says "deploy failed" and production is on
+    the new code anyway.
+    """
+    lines = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8").splitlines()
+    start = next(i for i, l in enumerate(lines) if "smoke_test.sh" in l and l.strip().startswith("if"))
+    end = next(i for i in range(start + 1, len(lines)) if lines[i].strip() == "fi")
+    block = [l for l in lines[start:end] if not l.strip().startswith("#")]
+
+    assert any("rollback" in l for l in block), "a failed smoke must roll back"
+    assert any("exit 1" in l for l in block), "and must exit non-zero"

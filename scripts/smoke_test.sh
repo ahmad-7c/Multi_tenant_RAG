@@ -21,6 +21,39 @@
 # that belongs.
 set -euo pipefail
 
+# ---- credentials are REQUIRED, and missing ones are a FAILURE --------
+#
+# This used to print "SKIP login" and carry on exiting 0, so a deploy
+# whose credentials never arrived was reported as a successful smoke.
+# A skipped check must never count as a pass: deploy.sh reads this
+# script's exit status as "production works", and the two checks that
+# depend on these variables are the only ones that exercise auth, the
+# answer path and a database write.
+#
+# Checked FIRST, before any network call, so the failure names the real
+# cause instead of surfacing as a confusing HTTP error.
+#
+# Fail-closed by default: a local run that genuinely wants the short
+# version must say so with SMOKE_ALLOW_SKIP=1. The dangerous direction
+# is the one that needs the explicit opt-in.
+missing=""
+for var in SMOKE_ORG SMOKE_EMAIL SMOKE_PASSWORD; do
+  eval "value=\${$var:-}"
+  [ -n "$value" ] || missing="$missing $var"
+done
+if [ -n "$missing" ]; then
+  if [ "${SMOKE_ALLOW_SKIP:-0}" = "1" ]; then
+    echo "smoke: SMOKE_ALLOW_SKIP=1 -- running WITHOUT the authenticated checks."
+    echo "       This proves nothing about auth or the answer path."
+  else
+    echo "smoke: FAILED before starting -- missing:$missing" >&2
+    echo "       These are GitHub environment secrets on the 'production'" >&2
+    echo "       environment, passed to deploy.sh on stdin. Set" >&2
+    echo "       SMOKE_ALLOW_SKIP=1 only for a deliberate local run." >&2
+    exit 1
+  fi
+fi
+
 BASE="${SMOKE_BASE_URL:-https://localhost}"
 CURL=(curl --fail-with-body -sS --max-time 20)
 # -k only for the default localhost base, where Caddy serves its own
@@ -78,8 +111,13 @@ esac
 # A DEDICATED account, created once by hand (see the runbook). It is not
 # created here: a smoke test that registers leaves a new organization on
 # every deploy, and "registers nothing permanent" is the requirement.
+#
+# Reaching this branch with the variables unset is only possible under
+# SMOKE_ALLOW_SKIP=1 -- the guard at the top of this script exits
+# non-zero otherwise. The wording says what was NOT proven, because
+# "SKIP" next to five PASS lines reads like a clean run.
 if [ -z "${SMOKE_ORG:-}" ] || [ -z "${SMOKE_EMAIL:-}" ] || [ -z "${SMOKE_PASSWORD:-}" ]; then
-  echo "  SKIP  login: SMOKE_ORG / SMOKE_EMAIL / SMOKE_PASSWORD are not set"
+  echo "  SKIP  login + answer path NOT TESTED (SMOKE_ALLOW_SKIP=1)"
 else
   # The credentials ride in a POST body over TLS and are never echoed.
   # jq is not assumed present on the box, so the token is extracted with

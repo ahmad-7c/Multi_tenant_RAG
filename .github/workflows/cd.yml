@@ -124,14 +124,41 @@ jobs:
         # the known_hosts written above. Setting it to `no` would accept
         # any host key presented and make the deploy MITM-able, which is
         # the classic shortcut in exactly this step.
+        #
+        # The smoke credentials travel on STDIN, three lines, in order:
+        # org, email, password. deploy.sh reads them before anything else
+        # and closes stdin.
+        #
+        # Not as arguments: `ssh host "cmd $SECRET"` puts the value in the
+        # process list on the runner AND on the server. Not in
+        # .env.production: that is application config read by five
+        # containers, and this is CI's test account.
+        #
+        # They are checked for presence here rather than discovered as a
+        # smoke failure on the server, because an empty GitHub secret and
+        # a wrong password fail in the same place otherwise, and only one
+        # of them is fixed in the Settings UI.
         env:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           IMAGE: ${{ needs.build-push.outputs.image }}
           SHA: ${{ needs.build-push.outputs.sha }}
+          SMOKE_ORG: ${{ secrets.SMOKE_ORG }}
+          SMOKE_EMAIL: ${{ secrets.SMOKE_EMAIL }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
         run: |
           set -euo pipefail
-          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/documind && ./scripts/deploy.sh $IMAGE $SHA"
+          for name in SMOKE_ORG SMOKE_EMAIL SMOKE_PASSWORD; do
+            eval "value=\${$name:-}"
+            if [ -z "$value" ]; then
+              echo "$name is not set. Add it as an ENVIRONMENT secret on the"
+              echo "'production' environment (Settings -> Environments), not as"
+              echo "a repository secret."
+              exit 1
+            fi
+          done
+          printf '%s\n%s\n%s\n' "$SMOKE_ORG" "$SMOKE_EMAIL" "$SMOKE_PASSWORD" \
+            | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/documind && ./scripts/deploy.sh $IMAGE $SHA"
 
       - name: discard the key
         # always(): a failed deploy must not leave a production key on a

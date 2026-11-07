@@ -26,6 +26,43 @@ PREVIOUS="$(cat "$STATE_FILE" 2>/dev/null || true)"
 
 log() { echo "[deploy $(date -u +%H:%M:%S)] $*"; }
 
+# ------------------------------------------------- smoke credentials
+# Three lines on STDIN, in order: org, email, password.
+#
+# NOT arguments: an argument is visible in `ps` to every account on the
+# box for the life of the process, and `ssh host "cmd $SECRET"` puts it
+# there on BOTH ends -- in the runner's process list and in the server's.
+#
+# NOT .env.production either: that file is application config read by
+# five containers, and these are CI's test account. Putting them there
+# would widen what a container compromise reaches for no benefit.
+#
+# Read BEFORE anything else runs, because `docker compose run --rm
+# migrate` below inherits stdin and would consume these lines. Once they
+# are read, stdin is closed for the rest of the script.
+SMOKE_ORG=""
+SMOKE_EMAIL=""
+SMOKE_PASSWORD=""
+if [ ! -t 0 ]; then
+  IFS= read -r SMOKE_ORG      || true
+  IFS= read -r SMOKE_EMAIL    || true
+  IFS= read -r SMOKE_PASSWORD || true
+fi
+exec < /dev/null
+export SMOKE_ORG SMOKE_EMAIL SMOKE_PASSWORD
+
+# The smoke test must address the REAL hostname. Caddy serves exactly
+# one site address ({$API_HOSTNAME}), so the script's https://localhost
+# default presents an SNI no site matches -- the smoke would fail for a
+# reason that has nothing to do with the deploy. API_HOSTNAME is not a
+# secret; nothing else is read out of that file here.
+SMOKE_BASE_URL="https://$(sed -n 's/^API_HOSTNAME=//p' .env.production | head -1)"
+export SMOKE_BASE_URL
+if [ "$SMOKE_BASE_URL" = "https://" ]; then
+  log "API_HOSTNAME is not set in .env.production -- cannot address the smoke test"
+  exit 1
+fi
+
 # ---------------------------------------------------------------- wait
 wait_for_api_health() {
   # Polls the CONTAINER healthcheck rather than curling a port. The api
