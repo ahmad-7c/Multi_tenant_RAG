@@ -15,7 +15,10 @@ human watching. The constraints that shaped every decision below:
   rolling update — a deploy is a replacement, and the only safety net
   is the ability to go back;
 - the deploy step necessarily holds a credential that reaches
-  production.
+  production;
+- region fixed by account (ap-southeast-2); latency to US-hosted
+  Gemini/Cohere accepted; mitigation: place the Vercel BFF function
+  region near Sydney if the plan allows it.
 
 ## Decisions
 

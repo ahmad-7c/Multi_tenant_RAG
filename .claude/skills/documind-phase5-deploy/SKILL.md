@@ -10,7 +10,7 @@ Do not claim something works unless you ran it. Prove each safety property with 
 Verify third-party facts (Caddy directives, GitHub Actions syntax, image tags, Lightsail limits) against current official docs and cite them.
 Keep scope small and boring. One instance, Docker Compose, no Kubernetes, no extra AWS services unless the human asks.
 Decisions already made (do not reopen without the human)
-Host: one Lightsail Linux instance, Ubuntu LTS, public IPv4, 2 GB RAM plan, static IP attached, in us-east-1 (matches Vercel's default function region; the human may change the region). Add a 2 GB swap file.
+Host: one Lightsail Linux instance, Ubuntu LTS, public IPv4, 2 GB RAM plan, static IP attached, in ap-southeast-2 (Sydney) — fixed by this AWS account and not changeable; place the Vercel BFF function region near Sydney if the plan allows it. Add a 2 GB swap file.
 Runtime: Docker Compose. Services: api, worker (Celery), db (Postgres with pgvector), redis, caddy, plus a one-shot migrate job.
 HTTPS: Caddy with automatic certificates on a free DuckDNS subdomain (no paid domain).
 Database in a container on the same box (free), with nightly dumps. A managed database is an ADR alternative, not the default.
