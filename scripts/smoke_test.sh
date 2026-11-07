@@ -96,16 +96,46 @@ else
     ok "the smoke account signed in"
 
     # ---- 6. the free question path, end to end ---------------------
-    # A greeting: intercepted before any provider call. Proves auth, the
-    # limiter, SSE framing and a database write for zero quota.
-    stream=$("${CURL[@]}" -N -X POST "$BASE/api/v1/conversations/ask" \
-               -H "Authorization: Bearer $token" \
-               -H 'Content-Type: application/json' \
-               -d '{"question":"hello"}' || true)
-    case "$stream" in
-      *"event: citations"*) ok "the assist path streamed a citations event (no provider cost)" ;;
-      *)                    bad "no citations event on the assist path" ;;
-    esac
+    #
+    # The route is POST /conversations/{id}/messages with a `content`
+    # field. There is NO /conversations/ask endpoint and never was --
+    # this block asked for one, so check 6 returned 404 and reported
+    # "no citations event", which deploy.sh reads as a failed smoke and
+    # ROLLS BACK. Every CD deploy would have rolled back. Never caught
+    # because the script had only ever run with SMOKE_* unset, where the
+    # whole block SKIPs.
+    #
+    # An existing conversation is reused, and one created only on the
+    # very first run: the stated requirement is that a smoke test
+    # registers nothing permanent, and a fresh conversation row per
+    # deploy is exactly that. The two Message rows per run are the
+    # database write the check exists to exercise.
+    convo=$("${CURL[@]}" "$BASE/api/v1/conversations" \
+              -H "Authorization: Bearer $token" \
+            | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || true
+
+    if [ -z "${convo:-}" ]; then
+      convo=$("${CURL[@]}" -X POST "$BASE/api/v1/conversations" \
+                -H "Authorization: Bearer $token" \
+                -H 'Content-Type: application/json' \
+                -d '{"title":"smoke checks"}' \
+              | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || true
+    fi
+
+    if [ -z "${convo:-}" ]; then
+      bad "could not open a conversation for the assist path"
+    else
+      # A greeting: intercepted before any provider call. Proves auth, the
+      # limiter, SSE framing and a database write for zero quota.
+      stream=$("${CURL[@]}" -N -X POST "$BASE/api/v1/conversations/$convo/messages" \
+                 -H "Authorization: Bearer $token" \
+                 -H 'Content-Type: application/json' \
+                 -d '{"content":"hello"}' || true)
+      case "$stream" in
+        *"event: citations"*) ok "the assist path streamed a citations event (no provider cost)" ;;
+        *)                    bad "no citations event on the assist path" ;;
+      esac
+    fi
   else
     bad "the smoke account could not sign in"
   fi

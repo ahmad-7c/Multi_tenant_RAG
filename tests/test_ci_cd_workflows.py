@@ -15,6 +15,9 @@ from pathlib import Path
 
 import pytest
 
+from app.main import app
+from app.schemas.conversation import CreateMessageRequest
+
 # Reads repository files that are absent from the runtime image.
 pytestmark = pytest.mark.repo
 
@@ -268,7 +271,65 @@ def test_the_smoke_test_costs_no_provider_quota():
     every deploy.
     """
     script = (ROOT / "scripts" / "smoke_test.sh").read_text(encoding="utf-8")
-    assert '"question":"hello"' in script.replace(" ", "")
+
+    # The field name comes from the SCHEMA, not from memory. This
+    # assertion used to read '"question":"hello"' -- the script's actual
+    # payload at the time, and wrong: the route takes `content`. The test
+    # was pinning the bug, so it passed for exactly as long as the script
+    # stayed broken.
+    assert "content" in CreateMessageRequest.model_fields, (
+        "the ask payload field was renamed; update the smoke script too"
+    )
+    assert '"content":"hello"' in script.replace(" ", "")
+
     # And it must check readiness, not just liveness: /health reports ok
     # with Postgres unreachable, by design.
     assert "/health/ready" in script
+
+
+def test_the_smoke_test_calls_routes_that_exist():
+    """Pinned against the app's own route table, not a remembered string.
+
+    The script posted the greeting to `/conversations/ask`, which has
+    never existed -- asking is POST /conversations/{id}/messages. Check 6
+    therefore 404'd and reported a failure, and `deploy.sh` reads a failed
+    smoke as grounds to roll back: EVERY CD deploy would have rolled back,
+    with the cause two layers from the symptom. It went unnoticed because
+    the block only runs when SMOKE_* are set, and they never had been.
+
+    A string check could not have caught that. Comparing against the real
+    routes can.
+    """
+    script = (ROOT / "scripts" / "smoke_test.sh").read_text(encoding="utf-8")
+    # COMMENTS STRIPPED: the assertions below are about what the script
+    # calls, and the comment explaining the old bug necessarily names the
+    # dead route. Same reason test_the_rollback_does_not_run_migrations
+    # strips them.
+    code = "\n".join(
+        line for line in script.splitlines() if not line.strip().startswith("#")
+    )
+    paths = {getattr(route, "path", None) for route in app.routes}
+
+    assert "/api/v1/conversations/{conversation_id}/messages" in paths
+    assert "/api/v1/conversations" in paths
+
+    # The non-existent route must not come back under any spelling.
+    assert "conversations/ask" not in code
+
+    # Every static /api/v1 path the script references must be a real
+    # route. Segments holding a shell variable are the path parameters
+    # and are normalised away before comparing.
+    referenced = set(re.findall(r"/api/v1/[A-Za-z0-9/_${}-]*", code))
+    for raw in referenced:
+        normalised = "/".join(
+            "{}" if "$" in segment else segment for segment in raw.split("/")
+        )
+        candidates = {
+            "/".join(
+                "{}" if part.startswith("{") and part.endswith("}") else part
+                for part in path.split("/")
+            )
+            for path in paths
+            if path
+        }
+        assert normalised in candidates, f"{raw} is not a route this app serves"
