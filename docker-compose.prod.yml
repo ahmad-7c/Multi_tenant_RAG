@@ -112,7 +112,9 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    networks: [internal]
+    # `egress` as well as `internal`: the query path calls Gemini and
+    # Cohere, and on `internal` alone it could not resolve a hostname.
+    networks: [internal, egress]
     logging: *logging
     deploy:
       resources:
@@ -168,7 +170,9 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    networks: [internal]
+    # Ingestion embeds, so the worker needs egress for the same reason
+    # the api does.
+    networks: [internal, egress]
     logging: *logging
     deploy:
       resources:
@@ -283,6 +287,30 @@ networks:
   internal:
     driver: bridge
     internal: true
+  # OUTBOUND ONLY, for api and worker.
+  #
+  # `internal: true` gives a network no gateway, which is what keeps db
+  # and redis unreachable -- and it cut api and worker off from the
+  # internet too, because they were on `internal` and nothing else.
+  # Measured on the server: DNS for generativelanguage.googleapis.com
+  # failed with "Temporary failure in name resolution", every ask 500'd
+  # with TransientEmbeddingError, and ingestion died earlier still
+  # inside tiktoken trying to fetch its vocabulary.
+  #
+  # A separate non-internal network rather than putting api on `edge`:
+  # `edge` exists to describe what the EDGE reaches, and adding api to
+  # it would make "who is on edge" stop meaning "who faces the
+  # internet". This network is named for the one thing it grants.
+  #
+  # Outbound only is not a setting -- it is the absence of a `ports:`
+  # key. A bridge network gives NAT out; inbound needs a published
+  # port, and only caddy has one.
+  #
+  # db, redis and migrate are deliberately NOT attached. migrate talks
+  # to Postgres and nothing else, so egress would be privilege it has
+  # no use for.
+  egress:
+    driver: bridge
 
 volumes:
   db_data:

@@ -105,9 +105,95 @@ def test_the_internal_network_really_is_internal(compose):
     )
 
 
-def test_the_edge_is_the_only_service_on_both_networks(services):
+def test_the_edge_is_the_only_service_on_the_edge_network(services):
+    """`edge` describes what faces the internet INBOUND.
+
+    api and worker are also on two networks now, but the second one is
+    `egress`. Adding them to `edge` instead would have worked and would
+    have made "who is on edge" stop meaning anything.
+    """
     on_edge = sorted(n for n, s in services.items() if "edge" in (s.get("networks") or []))
     assert on_edge == [EDGE_SERVICE], on_edge
+
+
+# ------------------------------------------------------- egress ----
+# Measured on the server, not theorised. api and worker were attached
+# ONLY to documind-prod_internal, which `internal: true` gives no
+# gateway -- so DNS for generativelanguage.googleapis.com failed with
+# "Temporary failure in name resolution", every ask returned 500 with
+# TransientEmbeddingError, and ingestion died even earlier inside
+# tiktoken fetching its vocabulary.
+#
+# The fix is a topology property, so it is pinned as one. These tests
+# would have caught the original bug.
+
+
+def _egress_networks(compose) -> set[str]:
+    """Declared networks that have a route to the internet.
+
+    A bridge network gets a gateway and NAT unless `internal: true`
+    removes it. That single key is the whole difference between "can
+    call Gemini" and "cannot resolve a hostname".
+    """
+    return {
+        name
+        for name, spec in (compose.get("networks") or {}).items()
+        if not (spec or {}).get("internal")
+    }
+
+
+@pytest.mark.parametrize("name", ["api", "worker"])
+def test_api_and_worker_can_reach_the_internet(compose, services, name):
+    """Both call Gemini; the api also calls Cohere.
+
+    Without this the stack starts, reports healthy, serves /health, and
+    fails every single question -- which is the worst shape of broken,
+    because nothing in `docker compose ps` looks wrong.
+    """
+    attached = services[name].get("networks") or []
+    reachable = _egress_networks(compose)
+    assert set(attached) & reachable, (
+        f"{name} is on {attached}, none of which has a gateway "
+        f"(networks with egress: {sorted(reachable)})"
+    )
+
+
+@pytest.mark.parametrize("name", ["db", "redis", "migrate"])
+def test_the_datastores_have_no_route_to_the_internet(compose, services, name):
+    """The other half, and the reason `egress` is a separate network.
+
+    Granting api and worker egress must not grant it to Postgres and
+    Redis. `migrate` is included because it talks to Postgres and
+    nothing else: egress would be privilege with no use, and the cheapest
+    time to notice someone adding it is now.
+    """
+    attached = set(services[name].get("networks") or [])
+    reachable = _egress_networks(compose)
+    assert not (attached & reachable), (
+        f"{name} is attached to {sorted(attached & reachable)}, which has "
+        "a gateway -- it can reach the internet"
+    )
+
+
+def test_the_egress_network_grants_no_inbound_access(compose, services):
+    """Outbound-only is the ABSENCE of a ports key, not a setting.
+
+    A bridge network NATs outbound traffic; inbound needs a published
+    port. So the guarantee here is exactly the one
+    test_only_the_edge_service_publishes_ports already makes -- stated
+    again against the egress members specifically, because "I gave api
+    internet access" is the moment someone also adds `ports:` to debug
+    it.
+    """
+    reachable = _egress_networks(compose) - {"edge"}
+    on_egress = [
+        n for n, s in services.items() if set(s.get("networks") or []) & reachable
+    ]
+    assert sorted(on_egress) == ["api", "worker"], on_egress
+    for name in on_egress:
+        assert not services[name].get("ports"), (
+            f"{name} has egress AND publishes a port"
+        )
 
 
 # ----------------------------------------------- data that must live ----
