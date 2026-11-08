@@ -58,23 +58,60 @@ from datetime import datetime, timezone
 
 from sqlalchemy import update
 
+from app.core.config import settings
 from app.db.session import SessionLocal
 from app.models.document import Document, DocumentStatus
 from app.models.document_chunk import DocumentChunk
 from app.models.organization import Organization
 from app.services.chunking import chunk_pages
 from app.services.cleaning import clean_pages
-from app.services.embedding import EmbeddingError, embed_in_batches, get_embedding_provider
+from app.services.embedding import (
+    EmbeddingError,
+    PermanentEmbeddingError,
+    TransientEmbeddingError,
+    embed_in_batches,
+    get_embedding_provider,
+)
 from app.services.extraction import ExtractionError, extract_pages
 from app.services.storage import StorageError, get_storage
 from app.workers.celery_app import celery_app
+from celery.exceptions import MaxRetriesExceededError, Retry
 
 logger = logging.getLogger(__name__)
 
 # Errors that mean "this document can never be ingested as-is". All of them
 # are reported to the uploader via documents.error_message rather than
 # retried, because the same bytes will fail the same way.
-PERMANENT_ERRORS = (ExtractionError, StorageError, EmbeddingError)
+#
+# PermanentEmbeddingError, NOT EmbeddingError. That was the bug:
+# TransientEmbeddingError SUBCLASSES EmbeddingError, so a DNS failure or
+# a 503 was caught by the permanent branch, written as a terminal
+# failure, and never retried. The document was unrecoverable and the
+# uploader was told to delete and re-upload a file that was fine.
+#
+# A bare EmbeddingError -- neither subclass -- still lands here, which is
+# the right default for an error nobody has classified yet.
+PERMANENT_ERRORS = (ExtractionError, StorageError, PermanentEmbeddingError, EmbeddingError)
+
+# Errors that mean "the same bytes would probably succeed later".
+#
+# MUST be caught BEFORE PERMANENT_ERRORS, because TransientEmbeddingError
+# is a subclass of EmbeddingError and Python takes the first matching
+# handler, not the most specific one. test_transient_is_caught_before_
+# permanent pins the ordering, which is invisible in a diff.
+TRANSIENT_ERRORS = (TransientEmbeddingError,)
+
+
+def _retry_delay(attempt: int) -> int:
+    """Bounded exponential backoff, in seconds.
+
+    Bounded twice over: the exponent is capped so a long tail cannot
+    schedule a retry hours out, and INGEST_MAX_RETRIES caps the count.
+    An unbounded retry on a provider outage is a queue that grows for as
+    long as the outage lasts and then stampedes.
+    """
+    base = settings.INGEST_RETRY_BASE_SECONDS
+    return int(min(base * (2 ** min(attempt, 4)), 600))
 
 
 class NoChunksProducedError(Exception):
@@ -170,6 +207,41 @@ def ingest_document(self, document_id: str) -> None:
             raise NoChunksProducedError(
                 f"Embedder returned {len(vectors)} vectors for {len(children)} chunks."
             )
+    except TRANSIENT_ERRORS as exc:
+        # Reachability, a 429, a 5xx: the same bytes would probably
+        # succeed later, so the document stays PROCESSING and the task
+        # is rescheduled. Marking it failed here is what made a
+        # five-minute DNS outage into a permanently broken document.
+        try:
+            self.retry(
+                exc=exc,
+                countdown=_retry_delay(self.request.retries),
+                max_retries=settings.INGEST_MAX_RETRIES,
+            )
+        except Retry:
+            # Celery's signal to reschedule. Re-raised so it reaches the
+            # worker; swallowing it here would silently drop the task,
+            # and the catch-all below would mark the document failed.
+            logger.warning(
+                "ingest_document: transient failure on %s, retry %s/%s in %ss",
+                document_id,
+                self.request.retries + 1,
+                settings.INGEST_MAX_RETRIES,
+                _retry_delay(self.request.retries),
+            )
+            raise
+        except MaxRetriesExceededError:
+            # Out of attempts. NOW it is terminal, and it records the
+            # real cause -- provider_unavailable, not unknown -- so the
+            # uploader is told to wait rather than to fix their file.
+            logger.error(
+                "ingest_document: %s failed after %s retries",
+                document_id,
+                settings.INGEST_MAX_RETRIES,
+            )
+            _mark_failed(doc_uuid, exc)
+            return
+        return
     except PERMANENT_ERRORS as exc:
         _mark_failed(doc_uuid, exc)
         return

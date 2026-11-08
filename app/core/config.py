@@ -256,6 +256,14 @@ class Settings(BaseSettings):
     # REQUESTS, not texts -- EMBED_BATCH_SIZE texts ride in one request.
     EMBED_REQUESTS_PER_MINUTE: int = 90
 
+    # Task-level retry for a document whose ingestion hit something
+    # transient (DNS, a 429, a 5xx). Distinct from EMBED_MAX_RETRIES,
+    # which retries ONE batch inside the embedding provider: this one
+    # re-runs the whole task, so the delays are longer and the count is
+    # smaller.
+    INGEST_MAX_RETRIES: int = 3
+    INGEST_RETRY_BASE_SECONDS: float = 10.0
+
     # ---- Retrieval ------------------------------------------------------
     # Candidates surviving the RRF merge of vector + full-text results.
     RETRIEVE_CANDIDATES: int = 50
