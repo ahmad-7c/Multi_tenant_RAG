@@ -77,6 +77,73 @@ COPY --chown=10001:10001 app ./app
 COPY --chown=10001:10001 alembic ./alembic
 COPY --chown=10001:10001 alembic.ini ./
 
+# tiktoken's vocabulary, BAKED AT BUILD TIME.
+#
+# chunking.count_tokens calls tiktoken.get_encoding("cl100k_base"), and
+# tiktoken downloads that vocabulary on FIRST USE, with
+# `requests.get("https://openaipublic.blob.core.windows.net/...")`. So a
+# container with no egress died inside chunk_pages -> count_tokens
+# before reaching an embedding call -- which is exactly what happened on
+# the server, and it presented as a failed ingest with no provider in
+# the traceback.
+#
+# Baking it is better than granting egress even now that egress exists:
+# it removes a third-party host from the runtime dependency list
+# entirely, so an Azure blob outage cannot stop a document being
+# chunked. The vocabulary is a fixed artefact, not live data.
+#
+# TIKTOKEN_CACHE_DIR is set with ENV, not just for this RUN, because it
+# has to be present at RUNTIME too -- without it tiktoken looks in a
+# temp directory, finds nothing, and downloads again.
+ENV TIKTOKEN_CACHE_DIR=/code/.tiktoken
+
+# cl100k_base is the one production uses: EMBEDDING_MODEL is
+# gemini-embedding-001, which encoding_for_model does not know, so
+# _encoding_for falls through to it. o200k_base costs little and covers
+# anyone who points EMBEDDING_MODEL at a current OpenAI model.
+RUN mkdir -p "$TIKTOKEN_CACHE_DIR" && python - <<'PY'
+import tiktoken
+
+for name in ("cl100k_base", "o200k_base"):
+    enc = tiktoken.get_encoding(name)
+    # Exercise it, rather than trusting that construction downloaded
+    # anything. A registry entry resolves without fetching the blob.
+    assert enc.encode("documind"), name
+    print(f"cached {name}")
+PY
+
+# The download must have produced files. A silent failure here would
+# ship an empty cache directory and move the fetch back to runtime,
+# which is the bug this step exists to remove -- and it would only
+# surface on a box with no egress.
+RUN test -n "$(ls -A "$TIKTOKEN_CACHE_DIR")" \
+ && chown -R 10001:10001 "$TIKTOKEN_CACHE_DIR"
+
+# PROVE it loads with no network, at build time.
+#
+# `requests.get` is monkeypatched to raise before tiktoken is imported,
+# so any attempt to fetch fails the build instead of silently working
+# because the builder happened to have egress. (`RUN --network=none`
+# would be stronger still, but it is not available on every BuildKit
+# version and a build that fails on an unsupported flag is worse than
+# one that proves the property a different way.)
+RUN python - <<'PY'
+import requests
+
+
+def _blocked(*args, **kwargs):
+    raise AssertionError(f"tiktoken tried to download: {args!r}")
+
+
+requests.get = _blocked
+requests.Session.get = _blocked
+
+import tiktoken
+
+assert len(tiktoken.get_encoding("cl100k_base").encode("hello world")) == 2
+print("tiktoken cl100k_base loads with the network blocked")
+PY
+
 # The mount point, pre-created and owned, so the volume inherits the
 # ownership instead of arriving as root-owned and unwritable.
 RUN mkdir -p /code/uploads && chown 10001:10001 /code/uploads
