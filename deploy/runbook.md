@@ -2457,54 +2457,602 @@ branch is merged. §10 is where that happens.
 
 ---
 
-## 7. SSH hardening and the firewall
+## 7. SSH hardening, the firewall, and fail2ban
 
-**Only after §4 is verified and the stack in §6 is up.** From here on,
-**keep a second SSH session open** — every command below can lock you
-out.
+**Only after §6 — the stack must already be running and verified.**
+
+This is the section that can lock you out of the server permanently.
+Everything below is ordered so you always have a way back, and each step
+has a rollback you can run from a session that is already open.
+
+> ### The three rules for this section
+>
+> **1. Keep your current `ubuntu` session open from 7.1 until 7.16 is
+> done.** Do not close it, do not let it time out, do not reboot. An
+> already-authenticated session keeps working even if you break the
+> config for every *new* connection — it is the only cheap way back.
+>
+> **2. Never reload sshd without running `sudo sshd -t` first.** It
+> validates the config and prints the file and line of any mistake. A
+> reload with a broken config is how people lose a server.
+>
+> **3. Test every change from a NEW window before closing anything.** A
+> change that works in your existing session proves nothing: that
+> session authenticated under the old rules.
+
+`ubuntu` stays your **admin recovery path** throughout. It keeps key
+login, it keeps `sudo`, and nothing here restricts it beyond requiring a
+key — which is already how you connect.
+
+### 7.1 [server] Confirm both accounts can log in by key, right now
+
+Establish the thing you are about to depend on, before changing it.
+
+```bash
+sudo grep -c . /home/ubuntu/.ssh/authorized_keys /home/deploy/.ssh/authorized_keys
+```
+
+Counts non-empty lines in each file without printing any key.
+
+Expected — at least one key each:
+
+```
+/home/ubuntu/.ssh/authorized_keys:1
+/home/deploy/.ssh/authorized_keys:1
+```
+
+**If `deploy` shows 0, stop.** You would be hardening SSH with no
+working deploy key, and CI/CD would never connect again.
+
+### 7.2 [server] Check what the config actually allows today
+
+```bash
+sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)'
+```
+
+`sshd -T` prints the **effective** configuration — defaults resolved,
+includes applied. Reading `sshd_config` by eye misses what a file in
+`sshd_config.d/` already overrode.
+
+Expected on a fresh Lightsail Ubuntu 24.04. Note `passwordauthentication`
+is usually **already** `no`, because the image ships it that way:
+
+```
+permitrootlogin prohibit-password
+passwordauthentication no
+kbdinteractiveauthentication no
+pubkeyauthentication yes
+```
+
+Write down what you see. It is your rollback target, and it tells you
+how much 7.3 actually changes.
+
+### 7.3 [server] Write the hardening file
 
 ```bash
 sudo tee /etc/ssh/sshd_config.d/99-documind.conf >/dev/null <<'EOF'
+# Key-only login, for ubuntu and deploy. Nothing else.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 EOF
-sudo sshd -t && sudo systemctl reload ssh
 ```
 
-`sshd -t` first: it validates the config and a reload with a broken
-config is how people lock themselves out permanently.
+A drop-in under `sshd_config.d/` rather than an edit to `sshd_config`:
+the main file is package-managed and an upgrade can replace it, taking
+your changes with it. A drop-in survives, and deleting one file is a
+complete rollback.
+
+What each line does:
+
+- `PermitRootLogin no` — root cannot log in at all. The default,
+  `prohibit-password`, still permits a key, and Lightsail installs one
+  for root that prints a notice. `no` removes the question.
+- `PasswordAuthentication no` — no password login for anybody. This is
+  what makes a guessed or stolen password worthless, and it is why
+  fail2ban (7.12) is a second line rather than the first.
+- `KbdInteractiveAuthentication no` — closes the other interactive
+  route. Leaving this `yes` alongside `PasswordAuthentication no` is a
+  classic half-fix, because PAM can still prompt for a password through
+  it.
+- `PubkeyAuthentication yes` — stated explicitly. It is the default, but
+  this file is where someone will look to find out how logins work, and
+  a hardening file that never mentions the method that must keep working
+  is one someone will "tidy up".
+
+Expected: **no output.**
+
+### 7.4 [server] Validate before reloading — do not skip this
+
+```bash
+sudo sshd -t
+```
+
+Expected: **no output at all.** Silence means the config is valid.
+
+**Any output is an error**, naming a file and line. Fix it before going
+further. Do not reload.
+
+> Rollback here costs nothing, because nothing has been applied yet:
+> ```bash
+> sudo rm /etc/ssh/sshd_config.d/99-documind.conf
+> ```
+
+### 7.5 [server] Confirm the effective config is what you meant
+
+```bash
+sudo sshd -T | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication)'
+```
+
+`sshd -T` reads the files from disk, so this shows the result **before**
+any running process adopts it.
+
+Expected:
+
+```
+permitrootlogin no
+passwordauthentication no
+kbdinteractiveauthentication no
+pubkeyauthentication yes
+```
+
+### 7.6 [server] Reload sshd
+
+```bash
+sudo systemctl reload ssh
+```
+
+`reload`, not `restart`: a reload re-reads the config and **leaves
+established connections alone**, so your open session survives even if
+something is wrong. On Ubuntu 24.04 the unit is `ssh`, not `sshd`.
+
+Expected: **no output.**
+
+```bash
+systemctl is-active ssh
+```
+
+Expected:
+
+```
+active
+```
+
+> **Rollback — run this in your STILL-OPEN session:**
+> ```bash
+> sudo rm /etc/ssh/sshd_config.d/99-documind.conf && sudo sshd -t && sudo systemctl reload ssh
+> ```
+
+### 7.7 [Windows] Test both logins from a NEW window
+
+**Do not close your existing session.** Open a new cmd window.
+
+```
+ssh -i "<path-to-LightsailDefaultKey.pem>" ubuntu@documind-prod.duckdns.org "whoami"
+```
+
+Expected:
+
+```
+ubuntu
+```
+
+```
+ssh -i "%USERPROFILE%\.ssh\documind_deploy" deploy@documind-prod.duckdns.org "whoami"
+```
+
+Expected:
+
+```
+deploy
+```
+
+**Both must succeed before you continue.** If either fails, run the
+rollback from 7.6 in your open session, then re-check 7.1.
+
+### 7.8 [Windows] Confirm password login is actually refused
+
+Proving the change did what it claims, rather than trusting it.
+
+```
+ssh -o PreferredAuthentications=password -o PubkeyAuthentication=no ubuntu@documind-prod.duckdns.org
+```
+
+This asks the server for password authentication specifically, and
+offers no key.
+
+Expected — refused without ever prompting:
+
+```
+ubuntu@documind-prod.duckdns.org: Permission denied (publickey).
+```
+
+**A password prompt here means `PasswordAuthentication no` did not take
+effect.** Re-check 7.5 and 7.6.
+
+### 7.9 [server] The firewall — read this before running anything
+
+The next steps are the ones most often misunderstood, so here is the
+honest picture first.
+
+**Docker-published ports BYPASS ufw.** When Docker publishes `80:80` and
+`443:443` it writes its own rules into the `DOCKER` and `DOCKER-USER`
+iptables chains, and traffic to a published container port is handled
+there **before** ufw's `INPUT` rules are consulted. So:
+
+- `sudo ufw deny 80/tcp` would **not** stop traffic reaching Caddy.
+- `ufw status` can report "deny" for a port that is wide open in
+  practice.
+
+What follows from that:
+
+- **The Lightsail IPv4 firewall is the real perimeter** for 80 and 443.
+  It sits outside the host, in front of the kernel, and Docker cannot
+  write rules there. It is already restricted to 22/80/443 from §1.
+- **ufw here guards HOST services only** — sshd, and anything else
+  listening directly on the host rather than inside a container. That is
+  a real and worthwhile job: it is the layer that catches a service
+  someone installs later and forgets to think about.
+- ufw is therefore defence in depth, not the perimeter. Configuring it
+  while believing otherwise is how people conclude their database is
+  firewalled when it is in fact published to the world.
+
+§6.10 already proved Postgres and Redis publish nothing, and that is
+what actually keeps them unreachable — the compose file's
+`internal: true` network, not any firewall.
+
+### 7.10 [server] Configure and enable ufw
+
+Order matters: add the allow rules **before** enabling, or
+`default deny incoming` takes effect with no SSH rule and the next
+connection is refused.
 
 ```bash
 sudo ufw default deny incoming
+```
+
+Expected — and note this has not taken effect yet, ufw is still
+inactive:
+
+```
+Default incoming policy changed to 'deny'
+(be sure to update your rules accordingly)
+```
+
+```bash
 sudo ufw default allow outgoing
-sudo ufw allow 22/tcp     # or: sudo ufw allow from <YOUR_IP> to any port 22
-sudo ufw allow 80/tcp
-sudo ufw allow 443/tcp
+```
+
+Outbound stays open: the server must reach Gemini, Cohere, Let's Encrypt
+and the Docker registry.
+
+Expected:
+
+```
+Default outgoing policy changed to 'allow'
+```
+
+```bash
+sudo ufw allow 22/tcp comment 'ssh'
+```
+
+**The rule that matters.** It must exist before you enable.
+
+Expected:
+
+```
+Rule added
+Rule added (v6)
+```
+
+```bash
+sudo ufw allow 80/tcp comment 'http (also handled by docker)'
+```
+
+```bash
+sudo ufw allow 443/tcp comment 'https (also handled by docker)'
+```
+
+Expected for each: `Rule added` and `Rule added (v6)`. These two are
+declared for honesty — so `ufw status` describes the intended perimeter
+instead of contradicting it — not because ufw is what enforces them
+(7.9).
+
+```bash
 sudo ufw --force enable
+```
+
+`--force` skips the interactive "this may disrupt existing ssh
+connections" prompt, which cannot be answered in a non-interactive
+shell. Your open session is unaffected: ufw does not drop established
+connections.
+
+Expected:
+
+```
+Firewall is active and enabled on system startup
+```
+
+### 7.11 [server] Verify the firewall, then test from outside
+
+```bash
 sudo ufw status verbose
 ```
 
-Expected: `Status: active`, and exactly 22, 80, 443 allowed.
+Expected — active, deny incoming, exactly three allowed ports:
 
-> Rollback: in your still-open session, `sudo ufw disable`.
+```
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
 
----
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere                   # ssh
+80/tcp                     ALLOW IN    Anywhere                   # http (also handled by docker)
+443/tcp                    ALLOW IN    Anywhere                   # https (also handled by docker)
+22/tcp (v6)                ALLOW IN    Anywhere (v6)              # ssh
+80/tcp (v6)                ALLOW IN    Anywhere (v6)              # http (also handled by docker)
+443/tcp (v6)               ALLOW IN    Anywhere (v6)              # https (also handled by docker)
+```
 
-## 8. Unattended upgrades and fail2ban
+Now confirm from your laptop, in a **new** window, that nothing broke:
+
+```
+curl.exe -sS -o NUL -w "health=%{http_code}\n" https://documind-prod.duckdns.org/health
+```
+
+Expected:
+
+```
+health=200
+```
+
+```
+ssh -i "%USERPROFILE%\.ssh\documind_deploy" deploy@documind-prod.duckdns.org "whoami"
+```
+
+Expected: `deploy`
+
+> **Rollback — from your still-open session:**
+> ```bash
+> sudo ufw disable
+> ```
+> Immediate and complete. To remove the rules as well:
+> `sudo ufw --force reset`
+
+### 7.12 [server] Install fail2ban
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y unattended-upgrades fail2ban
-sudo dpkg-reconfigure -plow unattended-upgrades   # answer Yes
+```
+
+```bash
+sudo apt-get install -y fail2ban
+```
+
+Expected: a normal install log ending in `Setting up fail2ban ...` plus
+a `Created symlink` line for the service.
+
+With `PasswordAuthentication no` already set, fail2ban is **not** what
+stops a break-in — keys are. What it stops is the noise. A public IPv4
+collects thousands of authentication attempts a day, and each is a log
+line, a few CPU cycles and a crypto handshake. Banning repeat offenders
+keeps the journal readable, which is what makes a real anomaly visible.
+
+### 7.13 [server] Configure the sshd jail explicitly
+
+```bash
+sudo tee /etc/fail2ban/jail.local >/dev/null <<'EOF'
+[DEFAULT]
+# Read from the systemd journal. Ubuntu 24.04 ships no rsyslog and so
+# has no /var/log/auth.log; a jail left on the file backend loads,
+# reports itself active, and silently never matches anything.
+backend = systemd
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+EOF
+```
+
+**`backend = systemd` is the line that makes this work on 24.04.** The
+default expects `/var/log/auth.log`, which does not exist on this image.
+That failure mode looks exactly like "no attacks yet", which is why it
+goes unnoticed.
+
+`jail.local` rather than editing `jail.conf`: the `.conf` is
+package-managed and replaced on upgrade.
+
+Expected: **no output.**
+
+```bash
 sudo systemctl enable --now fail2ban
+```
+
+Expected: **no output**, or one `Created symlink` line.
+
+### 7.14 [server] Verify fail2ban is actually watching
+
+```bash
+sudo fail2ban-client status
+```
+
+Expected — the jail list must contain `sshd`:
+
+```
+Status
+|- Number of jail:	1
+`- Jail list:	sshd
+```
+
+```bash
 sudo fail2ban-client status sshd
+```
+
+Expected — counters will differ, and a non-zero `Total failed` within
+minutes is normal on a public IPv4:
+
+```
+Status for the jail: sshd
+|- Filter
+|  |- Currently failed:	0
+|  |- Total failed:	14
+|  `- Journal matches:	_SYSTEMD_UNIT=sshd.service + _COMM=sshd
+`- Actions
+   |- Currently banned:	0
+   |- Total banned:	2
+   `- Banned IP list:
+```
+
+**`Journal matches:` is the line that proves the backend is right.** If
+it instead reads `File list: /var/log/auth.log`, the backend did not
+apply — re-check 7.13.
+
+**If `Total failed` stays at 0 for an hour on a public IP**, be
+suspicious rather than pleased: that is the signature of a jail running
+and matching nothing.
+
+> **Rollback:**
+> ```bash
+> sudo systemctl disable --now fail2ban
+> ```
+> To unban an address — including your own, if you fat-finger a login
+> five times:
+> ```bash
+> sudo fail2ban-client set sshd unbanip <YOUR_IP>
+> ```
+> If your home IP is stable, add it to the never-ban list: put
+> `ignoreip = 127.0.0.1/8 <YOUR_IP>` under `[DEFAULT]` in `jail.local`
+> and `sudo systemctl reload fail2ban`.
+
+### 7.15 Optional — restrict logins to two accounts
+
+Stronger, with a sharper edge. Skip it if you are unsure.
+
+```bash
+echo 'AllowUsers ubuntu deploy' | sudo tee -a /etc/ssh/sshd_config.d/99-documind.conf
+```
+
+Any account not named here can no longer log in by any method. A typo in
+either name locks out that account, which is why this is last, optional,
+and validated the same way:
+
+```bash
+sudo sshd -t && sudo sshd -T | grep '^allowusers'
+```
+
+Expected:
+
+```
+allowusers ubuntu deploy
+```
+
+```bash
+sudo systemctl reload ssh
+```
+
+Then **test both accounts from a new window again**, exactly as in 7.7.
+
+> **Rollback:** remove the line and reload.
+> ```bash
+> sudo sed -i '/^AllowUsers/d' /etc/ssh/sshd_config.d/99-documind.conf && sudo sshd -t && sudo systemctl reload ssh
+> ```
+
+### 7.16 Only now, close the spare session
+
+Once 7.7, 7.8, 7.11 and 7.14 have all passed from a **new** window, the
+old session has done its job. Close it.
+
+For one more reassurance, reboot — a reboot is the real test that
+nothing here depended on state that only existed in memory:
+
+```bash
+sudo reboot
+```
+
+Wait about 40 seconds, then from your laptop:
+
+```
+ssh -i "%USERPROFILE%\.ssh\documind_deploy" deploy@documind-prod.duckdns.org "cd /opt/documind && docker compose -f docker-compose.prod.yml --env-file .env.production ps --format '{{.Name}} {{.Status}}'"
+```
+
+Expected — the stack back up by itself, because §3.8 enabled Docker at
+boot and every service carries `restart: unless-stopped`:
+
+```
+documind-prod-api-1 Up 30 seconds (healthy)
+documind-prod-caddy-1 Up 25 seconds
+documind-prod-db-1 Up 32 seconds (healthy)
+documind-prod-redis-1 Up 32 seconds (healthy)
+documind-prod-worker-1 Up 30 seconds (healthy)
+```
+
+---
+
+## 8. Unattended upgrades and the clock
+
+```bash
+sudo apt-get install -y unattended-upgrades
+```
+
+Security updates applied without anyone remembering to. On a box with
+one public IPv4 and one operator, an unpatched sshd is a likelier
+problem than a bad automatic update.
+
+Expected: a normal install log.
+
+```bash
+sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+Answer **Yes**. This is the one interactive prompt in the runbook.
+
+Expected: a blue dialog. Afterwards, confirm it stuck:
+
+```bash
+grep -E 'Unattended-Upgrade|Update-Package-Lists' /etc/apt/apt.conf.d/20auto-upgrades
+```
+
+Expected — both `"1"`:
+
+```
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+```
+
+```bash
 sudo timedatectl set-timezone UTC
 ```
 
-Expected: `fail2ban-client status sshd` shows the jail active;
-`timedatectl` reports `Time zone: UTC`.
+Every timestamp in this system is UTC — `usage_events`, the daily budget
+key, the `clock_timestamp()` column default, the backup filenames in
+§11. A host in local time turns "which day did that happen" into a
+conversion.
+
+Expected: **no output.**
+
+```bash
+timedatectl | grep -E 'Time zone|System clock'
+```
+
+Expected:
+
+```
+                Time zone: Etc/UTC (UTC, +0000)
+System clock synchronized: yes
+```
+
+> **Note:** unattended-upgrades does not reboot by default, so a kernel
+> update sits applied-but-not-active until you reboot. Check with
+> `ls /var/run/reboot-required` — if that file exists, reboot when
+> convenient. Automatic reboots are deliberately **not** enabled: this
+> host runs a database with no replica, and a 3am reboot during an
+> ingestion is a worse outcome than a kernel update applied a day late.
 
 ---
 
@@ -2599,10 +3147,276 @@ revision. Then revert.
 
 ---
 
+## 11. Backups, and a restore drill (P6)
+
+Right now the named volumes are the **only** copy of every uploaded
+document and the entire database. There is no replica and no snapshot.
+
+Two scripts, run as `deploy`:
+
+- `scripts/backup.sh` — a compressed custom-format `pg_dump` plus a tar
+  of the uploads volume, into a 0700 directory, 7 days retained.
+- `scripts/restore_drill.sh` — restores a dump into a **throwaway**
+  container and compares row counts against production.
+
+> **A backup on the same disk as the thing it backs up is not a
+> backup.** It survives `DROP TABLE`, a bad migration and a deleted
+> document. It does not survive the instance being deleted, the volume
+> failing, or the account being lost. §11.6 is the decision that fixes
+> that, and it needs your input.
+
+### 11.1 [server] Run a backup by hand first
+
+Never schedule something you have not watched work.
+
+```bash
+cd /opt/documind && bash scripts/backup.sh
+```
+
+Expected — sizes will differ; the archive entry count will not be 0:
+
+```
+[backup 02:00:01] dumping documind
+[backup 02:00:04] dump OK: 148K, 212 archive entries
+[backup 02:00:04] archiving the uploads volume
+[backup 02:00:06] uploads OK: 12K
+[backup 02:00:07] uploads archive contains 3 file(s)
+[backup 02:00:07] pruning backups older than 7 days
+[backup 02:00:07] done. 1 database backup(s) retained in /home/deploy/backups
+```
+
+**`uploads archive contains 0 file(s)` is legitimate** if nothing has
+been uploaded yet — but it is printed on purpose, because "backup
+succeeded" over an empty archive is exactly how a broken volume mount
+hides.
+
+If it says `pg_dump failed (is the stack up?)`, the database container
+is not running. Check with §6.6's `ps`.
+
+### 11.2 [server] Confirm what landed, and its permissions
+
+```bash
+ls -l /home/deploy/backups
+```
+
+Expected — two files, both `-rw-------`:
+
+```
+total 164
+-rw------- 1 deploy deploy 151552 Nov  8 02:00 documind-db-20261108T020001Z.dump
+-rw------- 1 deploy deploy  12408 Nov  8 02:00 documind-uploads-20261108T020001Z.tar.gz
+```
+
+```bash
+stat -c '%a %U %n' /home/deploy/backups
+```
+
+Expected — `700`, owned by `deploy`:
+
+```
+700 deploy /home/deploy/backups
+```
+
+A dump contains every row of every tenant's data. It is the single most
+sensitive file on this box — more than `.env.production`, which only
+holds the keys to it.
+
+### 11.3 [server] Run the restore drill
+
+This is the step that turns a file into a backup.
+
+```bash
+cd /opt/documind && bash scripts/restore_drill.sh
+```
+
+With no argument it picks the newest dump. Pass a path to drill a
+specific one.
+
+Expected:
+
+```
+[drill 02:05:00] restoring documind-db-20261108T020001Z.dump (148K)
+[drill 02:05:00] reading production row counts
+[drill 02:05:01] starting a throwaway postgres (publishes no port, anonymous volume)
+[drill 02:05:03] waiting for it to accept connections
+[drill 02:05:09] running pg_restore
+[drill 02:05:11] comparing row counts
+
+  table                  production     restored   verdict
+  --------------------   ----------     --------   -------
+  organizations                   2            2   ok
+  users                           2            2   ok
+  documents                       3            3   ok
+  document_chunks                14           14   ok
+  conversations                   4            4   ok
+  messages                       18           16   older than prod
+  usage_events                   22           20   older than prod
+
+[drill 02:05:11] restored schema version: 0009
+[drill 02:05:11] RESTORE DRILL PASSED. Production volumes were never touched.
+```
+
+**`older than prod` is not a failure.** Production keeps accepting
+writes after the dump is taken, so a live system will almost always show
+fewer rows in the restore. It is printed so the gap is visible rather
+than averaged away.
+
+Three things **are** failures, and the drill exits non-zero on each:
+
+| verdict | meaning |
+|---|---|
+| `MISSING TABLE` | the table did not restore at all |
+| `MORE THAN PROD` | more rows than production has — impossible from a dump of it, so the dump or the comparison is wrong |
+| `EMPTY, PROD IS NOT` | the table restored with no rows while production has some |
+
+It also fails if `alembic_version` is missing: a dump restored into the
+wrong code generation is a different kind of broken that row counts
+cannot see.
+
+**What the drill never touches:** it starts its container with
+`docker run`, not through the compose file, so there is no project, no
+named volume and no network it could join by accident. Its storage is an
+anonymous volume that dies with the container, it publishes no port, and
+`tests/test_backup_scripts.py::test_the_drill_never_names_a_production_volume`
+asserts the script cannot even name `documind-prod_db_data`.
+
+### 11.4 [server] Schedule it nightly
+
+```bash
+crontab -e
+```
+
+Choose `nano` if asked. Add these two lines:
+
+```
+# Nightly at 02:17 UTC. Not 02:00 -- every cron job in the world runs on
+# the hour, and this box shares a hypervisor.
+17 2 * * * cd /opt/documind && bash scripts/backup.sh >> /home/deploy/backup.log 2>&1
+# A restore drill every Sunday. A backup nobody has restored is a file.
+41 3 * * 0 cd /opt/documind && bash scripts/restore_drill.sh >> /home/deploy/backup.log 2>&1
+```
+
+Save and exit. Expected:
+
+```
+crontab: installing new crontab
+```
+
+**`deploy`'s own crontab, not a systemd timer and not root's.**
+Installing a system unit needs root, and `deploy` deliberately has no
+`sudo` (§4.4). A systemd *user* timer would need
+`loginctl enable-linger deploy`, which also needs root. A user crontab
+needs neither and survives reboots.
+
+Confirm it is installed:
+
+```bash
+crontab -l
+```
+
+Expected: the two lines you just added.
+
+### 11.5 [server] Confirm cron actually ran, tomorrow
+
+Scheduling is not running. Check the day after:
+
+```bash
+tail -20 /home/deploy/backup.log
+```
+
+Expected: a `done.` line dated last night.
+
+```bash
+ls -l /home/deploy/backups | tail -3
+```
+
+Expected: a dump with yesterday's date in its name.
+
+**If the log is empty**, cron did not fire. The usual cause is that
+`cron` is not running (`systemctl is-active cron` → `active`), or the
+job failed before producing output — the log captures both stdout and
+stderr, so an empty file means it never started.
+
+### 11.6 The off-box copy — your decision
+
+Everything above lives on the same 60 GB disk as the database. Three
+options, costed for a free-tier project. **Pick one and I will write
+it up.**
+
+**Option A — pull to your laptop over scp (free).**
+
+A scheduled task on your *laptop* pulls the newest files. The laptop
+pulls rather than the server pushing, because the server cannot reach a
+machine behind home NAT, and because a server that can write to your
+laptop is a wider blast radius than one that cannot.
+
+```
+scp -i "%USERPROFILE%\.ssh\documind_deploy" deploy@documind-prod.duckdns.org:/home/deploy/backups/* D:\documind-backups\
+```
+
+- **Cost:** nothing.
+- **For:** genuinely off-AWS, so it survives losing the account. You can
+  restore from it with nothing but Docker.
+- **Against:** only happens when the laptop is on. No retention policy
+  unless you write one. The dumps land on a machine that is probably not
+  encrypted at rest.
+
+**Option B — Lightsail automatic snapshots (~$0.25–0.50/month).**
+
+Lightsail takes a daily snapshot of the whole instance and keeps 7.
+
+- **Cost:** $0.05/GB-month of *used* disk, incremental after the first.
+  At ~5 GB used that is roughly $0.25/month, rising as documents
+  accumulate.
+- **For:** zero scripting, zero maintenance, covers the OS and the
+  config as well as the data. Restoring is "create instance from
+  snapshot", which also rehearses a total rebuild.
+- **Against:** it is in the same AWS account and the same region, so it
+  does not protect against account loss or a region event. Whole-instance
+  granularity — you cannot pull one table out of it. It is a *second*
+  backup mechanism, not the one these scripts produce.
+
+**Option C — Cloudflare R2 or Backblaze B2 (free tier, then cheap).**
+
+`rclone` from the nightly cron to object storage. R2's free tier is 10 GB
+and charges no egress.
+
+- **Cost:** £0 until 10 GB.
+- **For:** proper off-site, automatic, retained, and restorable from
+  anywhere.
+- **Against:** another credential on the box — and it must be
+  **write-only scoped**, or a compromised server can delete the backups
+  as well as the data. That is the whole reason this is not the default
+  recommendation: it adds the exact failure mode backups exist to
+  survive.
+
+**My recommendation: A and B together.** B is the cheap insurance that
+needs no discipline, A is the copy that survives losing the AWS account,
+and between them a failure of either one is not a total loss. C is the
+right answer once this stops being a free-tier project, with a
+write-only key.
+
+### 11.7 What is still not covered
+
+- **No point-in-time recovery.** A nightly dump means up to 24 hours of
+  loss. PITR needs WAL archiving and somewhere to put it; that is a
+  different design, not a setting.
+- **The restore drill does not test the uploads archive.** It verifies
+  the tar is readable and counts its files (§11.1), but nothing checks
+  that a restored document still ingests. A document whose bytes come
+  back but whose `document_chunks` rows do not would present as a
+  citation pointing at a passage that no longer exists.
+- **Nothing alerts on a failed backup.** The cron job writes to a log
+  nobody reads. P8's observability work is where a failed backup should
+  become a notification; until then, §11.5 is a manual habit.
+
+---
+
 ## Not covered here
 
-- **Backups (P6).** Nightly `pg_dump`, 7-day retention, an off-box copy,
-  and a restore drill. A backup that was never restored is not a backup.
+- **The off-box copy (P6).** §11 covers the nightly dump, retention and
+  the restore drill; where the copy goes is still an open decision --
+  see §11.6.
 - **Observability (P8).** Structured JSON logs with a request id, an
   external uptime monitor on `/health`, an AWS Budgets alert.
 - **Vercel hand-off (P9)** and the outside verification list **(P10)**.
