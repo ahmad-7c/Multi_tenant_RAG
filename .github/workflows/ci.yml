@@ -1,0 +1,257 @@
+# CI: every push to main and every pull request.
+#
+# ACTION PINNING. The docker/* actions are pinned to the exact commit
+# SHAs that GitHub's own packaging documentation publishes
+# (docs.github.com -> Packages -> "Publishing and installing a package
+# with GitHub Actions", read 2026-11). The actions/* ones are pinned to
+# a major tag because resolving their SHAs needs a network lookup this
+# repo could not make, and a FABRICATED SHA is a workflow that fails on
+# first run. Converting the tags to SHAs is a one-command follow-up:
+#
+#   gh api repos/actions/checkout/commits/v7 --jq .sha
+#
+# A tag satisfies the "pinned to a version (or commit SHA)" rule; a SHA
+# is stronger because a tag can be moved. See docs/adr/0007.
+name: CI
+
+on:
+  # EVERY branch, not just main. CI's whole job is to tell you a branch
+  # is broken before it reaches main, and gating that on opening a pull
+  # request means a pushed branch sits unverified until someone
+  # remembers to open one.
+  push:
+    branches: ["**"]
+  # A button in the Actions tab, so a run can be repeated without
+  # inventing a commit -- useful when the failure was a flake or an
+  # expired credential rather than the code.
+  workflow_dispatch:
+
+  # NOT `pull_request`. With `push: ["**"]` a same-repo pull request
+  # would run the whole suite twice for one commit, on a pipeline whose
+  # slowest job builds an image and runs 895 tests inside it.
+  #
+  # The tradeoff, stated because it is real: a pull request from a FORK
+  # pushes no branch here, so it gets no CI. This repo has a single
+  # author; if outside contributions ever arrive, add `pull_request:`
+  # back and accept the duplicate runs.
+
+# Least privilege. CI only ever READS the repository: the image is built
+# here to prove it builds, and pushed nowhere. Pushing needs
+# packages: write and lives in cd.yml alone.
+permissions:
+  contents: read
+
+concurrency:
+  # One CI run per ref. A superseded push has nothing to tell us, and
+  # cancelling frees a runner for the push that replaced it.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: install ruff
+        run: pip install --no-cache-dir -r requirements-dev.txt
+      - name: ruff
+        # No --select: the default rule set, which this repo is clean
+        # against as of 2026-11 (24 findings were fixed to make this
+        # gate meaningful rather than theatre).
+        run: ruff check app/ eval/ scripts/ tests/
+
+      - name: repo and deployment-artefact tests
+        # The `repo`-marked tests assert properties of the Dockerfile,
+        # the compose file, the Caddyfile, these workflows and
+        # .gitignore. They run HERE, on the checkout, and are excluded
+        # from the in-image run -- the runtime stage deliberately copies
+        # only app/ and alembic/, so inside the image they fail with
+        # FileNotFoundError and drown the application signal. 47 did
+        # exactly that the first time the suite ran in the image.
+        #
+        # Needs the app importable (one module builds a Settings object)
+        # plus git and bash, which the runner has and the image does not.
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+          python -m pytest -q -m repo
+
+  backend:
+    name: backend tests (inside the image)
+    runs-on: ubuntu-latest
+    services:
+      # Real Postgres with pgvector, not SQLite: the suite exercises
+      # HNSW, cosine distance and tsvector, none of which SQLite has.
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: documind
+          POSTGRES_PASSWORD: documind
+          POSTGRES_DB: documind_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U documind -d documind_test"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: build the test image
+        # R4: the suite runs on the EXACT interpreter and wheels that
+        # will serve production. Running it on a setup-python runner
+        # would prove the tests pass somewhere other than the artefact
+        # being shipped.
+        run: docker build --target test -t documind-api:test .
+
+      - name: confirm the image interpreter
+        # Named explicitly so a base-image bump that changes Python is a
+        # failed step rather than a surprise in production.
+        run: |
+          set -euo pipefail
+          version=$(docker run --rm documind-api:test python -c 'import sys;print("%d.%d"%sys.version_info[:2])')
+          echo "image python: $version"
+          test "$version" = "3.14"
+
+      - name: run the full suite inside the image
+        # --network host so the job's service containers are reachable
+        # at localhost from inside the container.
+        #
+        # TEST_DATABASE_URL and DATABASE_URL are deliberately DIFFERENT:
+        # tests/conftest.py refuses to run when they match, because it
+        # drops the schema it is pointed at. No provider keys are set --
+        # conftest forces all three providers to `fake`, so the suite is
+        # offline by construction and cannot bill anyone.
+        run: |
+          docker run --rm --network host -e TEST_DATABASE_URL="postgresql://documind:documind@localhost:5432/documind_test" -e DATABASE_URL="postgresql://unused:unused@127.0.0.1:1/unused" -e JWT_SECRET_KEY="ci-only-not-a-real-secret" -e REDIS_URL="redis://localhost:6379/0" documind-api:test python -m pytest -q -m "not repo"
+
+      - name: the runtime image can actually import the app
+        # The cheapest possible catch for a whole class of outage: a
+        # runtime dependency present in a developer's venv but absent
+        # from requirements.txt. `python-multipart` was exactly that --
+        # FastAPI raises at IMPORT time when a route declares Form or
+        # UploadFile without it, so the shipping image could not boot at
+        # all while every local run passed. Nothing in the test suite
+        # could see it, because the suite runs where the venv has it.
+        #
+        # Dummy env only so Settings can construct; nothing connects.
+        run: |
+          set -euo pipefail
+          docker build --target runtime -t documind-api:local .
+          docker run --rm --entrypoint python -e DATABASE_URL="postgresql://u:p@127.0.0.1:1/d" -e JWT_SECRET_KEY="ci-only-not-a-real-secret" documind-api:local -c 'import app.main; print("app imports inside the runtime image")'
+
+      - name: the runtime image carries no tests, no eval, no .env
+        # Asserted against the image FILESYSTEM, not against
+        # .dockerignore. The ignore file is the intent; this is the
+        # result.
+        run: |
+          set -euo pipefail
+          leaked=$(docker run --rm --entrypoint sh documind-api:local -c 'find / -xdev -name ".env" -o -name ".env.*" 2>/dev/null | grep -v example || true')
+          test -z "$leaked" || { echo "image contains: $leaked"; exit 1; }
+          stray=$(docker run --rm --entrypoint sh documind-api:local -c 'ls -d /code/tests /code/eval 2>/dev/null || true')
+          test -z "$stray" || { echo "runtime stage contains: $stray"; exit 1; }
+          echo "OK: no .env, no tests/, no eval/ in the runtime image"
+
+  caddyfile:
+    name: Caddyfile validates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: caddy validate
+        # Parsed by CADDY, not by a grep. Every file-reading test in
+        # this repo passed against a Caddyfile that Caddy refused to
+        # load: `email {$ACME_EMAIL:}` expanded to a bare `email` and
+        # the whole config was unparseable, so the edge would not have
+        # started at all.
+        #
+        # Both cases are checked, because they behave differently:
+        # Caddy's `{$VAR:default}` fallback applies only when the
+        # variable is UNSET, so a variable set to "" still breaks.
+        run: |
+          set -euo pipefail
+          validate() {
+            docker run --rm "$@" -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.10-alpine caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          }
+          echo "-- with a real hostname and address"
+          validate -e API_HOSTNAME=api.example.com -e ACME_EMAIL=ops@example.com
+          echo "-- with ACME_EMAIL unset (the Caddyfile default must cover it)"
+          validate -e API_HOSTNAME=localhost
+          # NOT tested here: ACME_EMAIL set to the empty string, which
+          # Caddy genuinely cannot parse -- `{$VAR:default}` falls back
+          # only when the variable is UNSET. The Caddyfile's contract is
+          # therefore "unset or non-empty", and what guarantees it is
+          # docker-compose.prod.yml's `${ACME_EMAIL:-admin@localhost}`
+          # (compose substitutes on unset OR empty). That guarantee is
+          # pinned by a test, not by this job:
+          # test_prod_compose.py::test_the_edge_never_receives_an_empty_acme_email
+
+  frontend:
+    name: frontend (lint, types, build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # `npm ci`, never `npm install`: ci installs exactly the lockfile
+      # and fails if package.json and the lock disagree, which is the
+      # property that makes a CI build reproducible.
+      - run: npm ci
+      - run: npm run lint
+      # The only type check in this pipeline. The Python half has never
+      # been type-checked and adopting mypy is an open decision -- see
+      # requirements-dev.txt, which records that the cost is UNKNOWN
+      # rather than estimated.
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: python advisories
+        run: |
+          pip install --no-cache-dir -r requirements-dev.txt
+          pip-audit --requirement requirements.txt --strict
+      - name: npm advisories
+        # high and critical only. The tree carries 16 moderate findings,
+        # all in the eslint toolchain, all dev-only, all rooted at one
+        # minimatch advisory -- none reaches the browser bundle. A gate
+        # that fires on those gets switched off within a week.
+        working-directory: web
+        run: npm audit --audit-level=high
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The whole history. A key deleted in a later commit is still
+          # in the history and still leaked, and the default shallow
+          # clone cannot see it.
+          fetch-depth: 0
+      - run: bash scripts/scan_secrets.sh
+
+  guards:
+    name: repo guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: no destructive volume-removing command anywhere
+        run: bash scripts/check_no_destructive_commands.sh

@@ -256,6 +256,14 @@ class Settings(BaseSettings):
     # REQUESTS, not texts -- EMBED_BATCH_SIZE texts ride in one request.
     EMBED_REQUESTS_PER_MINUTE: int = 90
 
+    # Task-level retry for a document whose ingestion hit something
+    # transient (DNS, a 429, a 5xx). Distinct from EMBED_MAX_RETRIES,
+    # which retries ONE batch inside the embedding provider: this one
+    # re-runs the whole task, so the delays are longer and the count is
+    # smaller.
+    INGEST_MAX_RETRIES: int = 3
+    INGEST_RETRY_BASE_SECONDS: float = 10.0
+
     # ---- Retrieval ------------------------------------------------------
     # Candidates surviving the RRF merge of vector + full-text results.
     RETRIEVE_CANDIDATES: int = 50
@@ -344,6 +352,21 @@ class Settings(BaseSettings):
     # Turn it on only when every request passes a proxy that overwrites
     # the header.
     TRUST_FORWARDED_FOR: bool = False
+
+    # Shared secret that makes an X-Client-IP header trustworthy.
+    #
+    # Behind the Next.js BFF every request arrives from one Vercel
+    # egress address, so the per-IP limits on login and register become
+    # per-DEPLOYMENT: credential stuffing looks like normal traffic, and
+    # a handful of real users signing in at once rate-limit each other.
+    # The BFF therefore forwards the browser's real address, and this
+    # secret is what distinguishes it from a caller inventing one.
+    #
+    # EMPTY BY DEFAULT, and empty means the header is ignored entirely
+    # -- not "trusted because nothing was configured". There is no
+    # degraded middle state. A deliberately different header name from
+    # X-Forwarded-For, because Caddy overwrites that one at the edge.
+    CLIENT_IP_SECRET: str = ""
 
     # Concurrent SSE streams per org. Each open stream holds a provider
     # connection and an LLM generation; the cap is what stops one

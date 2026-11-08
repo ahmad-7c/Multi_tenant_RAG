@@ -29,6 +29,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.v1.query_errors import QUERY_PROVIDER_ERRORS, query_unavailable
 from app.api.limits import get_limiter, limit_answers, limit_default
 from app.core.config import settings
 from app.db.session import SessionLocal, get_db
@@ -315,19 +316,27 @@ async def create_message(
     # FACTORY rather than a session, and pushes each blocking step onto a
     # worker thread that opens and closes its own session there -- so no
     # Session ever crosses a thread boundary, and the loop stays free.
-    prepared = await query_service.prepare_query(
-        session_factory=SessionLocal,
-        org_id=org_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        question=payload.content,
-        history=history,
-        index_version=index_version,
-        embedder=get_embedding_provider(),
-        reranker=get_reranker(),
-        rewrite_llm=get_rewrite_llm(),
-        cache=get_answer_cache(),
-    )
+    # A provider failure here happens BEFORE any byte of the stream is
+    # sent, so it can still be answered with a status code. Unhandled,
+    # it reached FastAPI's default handler as a bare 500 -- which says
+    # "this server is broken" and invites a retry that cannot work.
+    # 503 plus Retry-After says "not right now, and for how long".
+    try:
+        prepared = await query_service.prepare_query(
+            session_factory=SessionLocal,
+            org_id=org_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            question=payload.content,
+            history=history,
+            index_version=index_version,
+            embedder=get_embedding_provider(),
+            reranker=get_reranker(),
+            rewrite_llm=get_rewrite_llm(),
+            cache=get_answer_cache(),
+        )
+    except QUERY_PROVIDER_ERRORS as exc:
+        raise query_unavailable(exc) from exc
     # THE boundary. Past this line there is no DB session until phase 3.
 
     llm = get_llm()

@@ -1,0 +1,160 @@
+# DocuMind edge. The ONLY service that publishes ports.
+#
+# The hostname is never hard-coded: `{$API_HOSTNAME:localhost}` is an
+# environment substitution that Caddy performs BEFORE parsing, so it
+# can appear in a site address (placeholders cannot). The `:localhost`
+# default is what makes this file testable on a laptop -- Caddy issues
+# a locally-trusted certificate for `localhost` automatically, so the
+# same file serves real HTTPS in both places.
+# Verified against caddyserver.com/docs/caddyfile/concepts (2026-11).
+#
+# HTTP -> HTTPS is not written as a directive because Caddy does it
+# itself: a site address with a hostname gets automatic HTTPS and an
+# HTTP redirect host. Recorded here so nobody adds a second redirect
+# that shadows it. NOT verified from outside -- see the note below.
+# Verified: caddyserver.com/docs/automatic-https (2026-11).
+
+{
+	# One address for ACME problems and expiry notices.
+	#
+	# The default is NOT empty, and that is not cosmetic. `{$VAR:}`
+	# expands to nothing, leaving a bare `email` with no argument,
+	# which Caddy rejects outright:
+	#
+	#   Error: parsing caddyfile tokens for "email": wrong argument
+	#   count or unexpected line ending after 'email'
+	#
+	# So an unset ACME_EMAIL did not degrade, it made the whole
+	# config unparseable and the edge refuse to start. The previous
+	# comment here claimed it was "harmless if empty". Measured with
+	# `caddy validate` -- every grep-based test in this repo passed
+	# against the broken version.
+	#
+	# The placeholder is never sent anywhere in local use: with
+	# API_HOSTNAME=localhost Caddy issues from its own local CA and
+	# makes no ACME request at all. Production must set a real
+	# address -- deploy/runbook.md section 7 requires it.
+	email {$ACME_EMAIL:admin@localhost}
+
+	# There is deliberately NO `servers { trusted_proxies ... }` block,
+	# and the reason is the opposite of obvious.
+	#
+	# This file used to carry `trusted_proxies static private_ranges`.
+	# Caddy ignores an inbound client-supplied X-Forwarded-For by
+	# default, specifically to prevent spoofing -- but trusted_proxies
+	# REVERSES that for peers inside the listed ranges: Caddy then
+	# accepts and preserves whatever X-Forwarded-For they sent.
+	# Verified: caddyserver.com/docs/caddyfile/options (2026-11).
+	#
+	# Caddy is the sole ingress here and has nothing in front of it, so
+	# there was never a proxy to trust. The ranges were the hazard:
+	# depending on how Docker publishes a port the peer address can be
+	# the bridge gateway, which IS a private address -- and that would
+	# make every client on the internet a trusted proxy. The per-IP
+	# login limiter reads the LEFTMOST X-Forwarded-For entry
+	# (app/api/limits.py::client_ip), so a caller sending a fresh
+	# forged value per request would receive a fresh empty bucket every
+	# time and credential stuffing would meet no limit at all.
+	#
+	# Pinned by tests/test_prod_compose.py::test_no_trusted_proxies_at_the_edge.
+}
+
+{$API_HOSTNAME:localhost} {
+	# ---- request size ------------------------------------------------
+	# 5MB at the edge against MAX_UPLOAD_BYTES=4000000 in
+	# .env.production.example. Deliberately ABOVE the configured cap so
+	# an oversized upload is rejected by the application, with a
+	# sentence a user can act on, rather than by the edge with a bare
+	# 413. The margin covers multipart overhead.
+	#
+	# NB that is above the PRODUCTION-CONFIGURED cap, not above the
+	# code default: Settings.MAX_UPLOAD_BYTES is 25 MB, which ADR 0003
+	# keeps deliberately for self-hosted deployments. This comment used
+	# to call 4,000,000 "the app's cap" full stop, which made the
+	# ordering look guaranteed when it holds only while production sets
+	# the smaller value. If it ever stops, the edge becomes the thing
+	# that refuses and this max_size must be raised with it.
+	# Pinned by test_the_edge_body_limit_is_above_the_app_limit.
+	# Verified: caddyserver.com/docs/caddyfile/directives/request_body
+	request_body {
+		max_size 5MB
+	}
+
+	# ---- security headers --------------------------------------------
+	header {
+		# The API is consumed by a server-side BFF, never framed.
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		# HSTS. Not preloaded: preload is effectively irreversible and
+		# this is a DuckDNS subdomain that may be handed back.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# Caddy advertises itself in a Server header by default.
+		# Removing it is not security, but it is free reconnaissance
+		# otherwise. This rationale used to sit in the global block 25
+		# lines up, where it explained the wrong directive and left
+		# `trusted_proxies` -- the load-bearing one -- unexplained.
+		# Pinned by test_the_server_header_is_removed.
+		-Server
+	}
+
+	# ---- the API -----------------------------------------------------
+	reverse_proxy api:8000 {
+		# SSE. A negative flush interval is Caddy's "low-latency mode":
+		# response buffering is disabled and every write is flushed to
+		# the client immediately. Caddy already applies this to
+		# `text/event-stream` automatically; it is set explicitly so the
+		# requirement is visible in the file rather than depending on a
+		# default that could change.
+		# Verified: caddyserver.com/docs/caddyfile/directives/reverse_proxy
+		flush_interval -1
+
+		# Long enough for a streamed answer, which the backend itself
+		# caps at LLM_TOTAL_TIMEOUT_SECONDS (120s). The edge must not be
+		# the thing that cuts a stream, or the backend's own deadline --
+		# which cleans up and persists nothing -- never runs.
+		transport http {
+			read_timeout 300s
+			write_timeout 300s
+		}
+
+		# ---- X-Forwarded-For (D-3) ---------------------------------
+		#
+		# OVERWRITTEN, not appended, and set from the connection's own
+		# peer address. `{remote_host}` is `{http.request.remote.host}`
+		# -- the direct connection source, which a client cannot
+		# influence. `header_up <name> <value>` replaces any existing
+		# values for the field.
+		# Verified: caddyserver.com/docs/caddyfile/directives/reverse_proxy
+		# and /docs/caddyfile/concepts (2026-11).
+		#
+		# Caddy ALREADY does this by default -- the docs say of the
+		# X-Forwarded-* headers that "by default, the proxy will ignore
+		# their values from incoming requests, to prevent spoofing", and
+		# they recommend configuring real-client-IP parsing through the
+		# global `trusted_proxies` option rather than per proxy. It is
+		# written explicitly anyway, for one reason: `trusted_proxies`
+		# REVERSES the default for peers in its ranges, and this file
+		# shipped `trusted_proxies static private_ranges` once already.
+		# A `header_up` on this handler runs regardless, so the explicit
+		# line survives someone re-adding that option. Defence in depth
+		# against a mistake that has already been made here once.
+		#
+		# This is what makes TRUST_FORWARDED_FOR=true safe: client_ip in
+		# app/api/limits.py reads the LEFTMOST entry, so an appended
+		# header would put the forged value first and hand every request
+		# a fresh empty rate-limit bucket.
+		#
+		# Proven by BEHAVIOUR, not by reading: tests/test_edge_live.py
+		# sends a forged header through a running Caddy and asserts the
+		# API did not use it. The file-level pin is
+		# test_prod_compose.py::test_the_edge_overwrites_forwarded_for.
+		#
+		# NOT SOLVED HERE -- the BFF case. Through the Next.js BFF the
+		# peer Caddy sees is the BFF host, so every end user shares one
+		# IP and the per-IP limiter becomes per-deployment. Deliberately
+		# out of scope for D1; the proposed design is recorded in
+		# docs/adr/0006-client-ip-at-the-edge.md.
+		header_up X-Forwarded-For {remote_host}
+	}
+}

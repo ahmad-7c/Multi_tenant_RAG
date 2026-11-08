@@ -1,13 +1,17 @@
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy import text as sql_text
+from sqlalchemy.orm import Session
 
 from app.api.v1.routes import auth, conversations, documents, usage, users
 from app.core.config import settings
 from app.core.http import aclose_async_client
-from app.db.session import SessionLocal
+from app.core.startup_checks import enforce_production_safety, is_production
+from app.db.session import SessionLocal, get_db
 from app.services.reranker import check_reranker_config, get_reranker
 from app.services.embedding import (
     EmbeddingModelMismatch,
@@ -35,6 +39,17 @@ async def lifespan(app: FastAPI):
     into an outage plus a crash-loop. Instead the condition is recorded
     and the query endpoints alone refuse.
     """
+    # BEFORE anything else, and it RAISES rather than degrading.
+    #
+    # Every other guard here keeps the process alive on purpose. This
+    # one must not: a process signing tokens with the documented
+    # placeholder secret lets anyone who has read the repository mint
+    # an admin token for any organization. Raising inside the lifespan
+    # means uvicorn exits non-zero, so Docker's restart policy surfaces
+    # it as a crash-loop an operator can see -- rather than a service
+    # that looks healthy and is not.
+    enforce_production_safety(settings)
+
     app.state.embedding_model_error = None
 
     # Cheap, no I/O. Catches the misconfiguration that costs answer
@@ -51,8 +66,16 @@ async def lifespan(app: FastAPI):
         logger.critical("REFUSING TO SERVE QUERIES: %s", exc)
     except Exception:
         # A DB that is not reachable at startup is a separate problem and
-        # the readiness probe will catch it. Not a reason to refuse
-        # queries that might work once it comes back.
+        # /health/ready is what catches it. Not a reason to refuse queries
+        # that might work once it comes back.
+        #
+        # This comment used to claim "the readiness probe will catch it"
+        # while no readiness probe existed anywhere in the tree, so the
+        # condition it waves through had NO probe at all: with Postgres
+        # down the process logged this one warning, reported startup
+        # complete, served /health as "ok" and 500ed every authenticated
+        # route. Measured on a dev box, then fixed by writing the probe
+        # this line already assumed.
         logger.warning("embedding-model guard could not run", exc_info=True)
     finally:
         db.close()
@@ -115,7 +138,20 @@ def configure_cors(target: FastAPI) -> list[str]:
     return origins
 
 
-app = FastAPI(title="DocuMind", version="0.1.0", lifespan=lifespan)
+# The interactive docs publish the whole API shape -- every route,
+# every schema, including the citations-event contract. Useful in
+# development, and reconnaissance in production, so they are off there.
+# None disables the route entirely rather than hiding a link to it.
+_docs_enabled = not is_production(settings)
+
+app = FastAPI(
+    title="DocuMind",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
+)
 
 configure_cors(app)
 
@@ -169,3 +205,62 @@ def health():
     if degraded:
         body["degraded"] = degraded
     return body
+
+
+@app.get("/health/ready")
+def ready(db: Session = Depends(get_db)):
+    """Readiness: would a real request actually succeed right now?
+
+    A SECOND endpoint rather than a field on /health, because the two
+    answer different questions and one status word cannot answer both.
+
+    /health is liveness plus quality degradations and must stay "ok"
+    through all of them -- a load balancer reads it to decide whether
+    to keep this instance in rotation, and pulling a working instance
+    because the reranker breaker tripped turns a degradation into an
+    outage. That reasoning is unchanged and /health is untouched.
+
+    This endpoint is the opposite, and it exists because the gap was
+    measured rather than imagined: with Postgres unreachable, /health
+    returned 200 {"status": "ok"} while POST /api/v1/auth/login
+    returned 500, because every authenticated route begins with a
+    query and the lifespan deliberately logs a warning and continues
+    (the database may come back). Nothing anywhere reported the one
+    condition that makes the whole API useless.
+
+    The container HEALTHCHECK points HERE, not at /health. That is
+    what makes `depends_on: service_healthy` and the deploy's health
+    gate honest: an api that cannot reach its database, or whose
+    credentials or migrations are wrong, must fail the check so the
+    automatic rollback fires. Pointed at /health it would report
+    success and the rollback would never run.
+
+    SELECT 1, not a count or a table read: the question is whether a
+    connection can be checked out of the pool and a statement
+    round-tripped, which is precisely what every route needs and
+    nothing more. `pool_pre_ping=True` on the engine means a stale
+    pooled connection is replaced rather than reported as a failure.
+
+    Redis is deliberately NOT checked. The app is built to survive
+    losing it -- auth and reads fail open, the answer path falls back
+    to a per-process bucket -- and /health already names that as
+    `rate_limiter_degraded`. Failing readiness on Redis would refuse
+    traffic this process can still serve, which is the mistake
+    /health's own docstring warns against.
+    """
+    try:
+        db.execute(sql_text("SELECT 1"))
+    except Exception:
+        # The body names the failing dependency and NOTHING else. A
+        # driver's exception text carries the host, port and user from
+        # the DSN, and this endpoint is reachable through the edge --
+        # so the detail goes to the operator's log and the response
+        # stays a bare word. Same rule as the user-facing failure
+        # codes: never a backend URL in a response.
+        logger.exception("readiness probe failed: database unreachable")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unavailable", "failed": ["database"]},
+        )
+
+    return {"status": "ready"}

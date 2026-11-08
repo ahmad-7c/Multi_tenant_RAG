@@ -23,7 +23,6 @@ checked for leaked content and not merely for refusing.
 """
 import argparse
 import asyncio
-import json
 import os
 import statistics
 import sys
@@ -48,7 +47,7 @@ from app.services.cache import InMemoryAnswerCache
 from app.services.chunking import chunk_pages
 from app.services.cleaning import clean_pages
 from app.services.embedding import EmbeddingTask, get_embedding_provider
-from app.services.extraction import Page, extract_pages
+from app.services.extraction import extract_pages
 from app.services.llm import get_judge_llm, get_llm, get_rewrite_llm
 from app.services.reranker import (
     Reranker,
@@ -1108,7 +1107,7 @@ async def main_async(args) -> int:
         log("  NOT a calibration run: a threshold fitted to this subset")
         log("  would be fitted to the cases that happened to be selected.")
 
-    choices = report(golden, results, args)
+    report(golden, results, args)
     return 0
 
 
@@ -1330,7 +1329,7 @@ def report(golden, results, args):
     cosine_rows = sweep(
         results, "top_vector_similarity", [round(0.40 + x * 0.025, 3) for x in range(0, 21)]
     )
-    best_cosine = print_curve(
+    print_curve(
         "CURVE B: vector-similarity floor (reranker DOWN)",
         cosine_rows,
         note="today a fallback opens the gate unconditionally; this is the "
@@ -1471,8 +1470,8 @@ def report(golden, results, args):
         choices[setting] = (choice, cases)
 
         log()
-        log(f"  rule: midpoint of the widest gap below the lowest answerable")
-        log(f"        score; fall back to 0.50 if no gap reaches 0.03")
+        log("  rule: midpoint of the widest gap below the lowest answerable")
+        log("        score; fall back to 0.50 if no gap reaches 0.03")
         log(f"  -> {setting} = {choice.value}")
         log(f"     {choice.reason}")
         if len(choice.alternatives) > 1:

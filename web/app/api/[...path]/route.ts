@@ -2,7 +2,12 @@ import { NextResponse } from "next/server";
 
 import {
   BACKEND_URL,
+  CLIENT_IP_HEADER,
+  CLIENT_IP_SECRET,
+  CLIENT_IP_SECRET_HEADER,
+  MAX_UPLOAD_BYTES,
   forwardableHeaders,
+  platformClientIp,
   resolveBackendPath,
 } from "@/lib/backend";
 import { checkCsrf } from "@/lib/csrf";
@@ -45,12 +50,47 @@ async function handle(request: Request, ctx: Ctx): Promise<Response> {
     return NextResponse.json({ error: "Not found." }, { status: 404 });
   }
 
+  // Refuse an oversized body HERE, with a sentence, rather than letting
+  // Vercel answer FUNCTION_PAYLOAD_TOO_LARGE with a platform error page
+  // at 4.5 MB -- or, worse, forwarding a 4.2 MB file that the backend's
+  // own 25 MB cap happily accepts, which made the advertised 4 MB limit
+  // a client-side suggestion. MAX_UPLOAD_BYTES was exported and read by
+  // nothing until this check existed.
+  //
+  // content-length is absent on a chunked body, and checking that would
+  // mean buffering the stream -- which is exactly what the streaming
+  // proxy exists to avoid. The browser sets it for a File upload, which
+  // is the case this guards; the backend's own cap remains the backstop.
+  const declared = Number(request.headers.get("content-length") ?? 0);
+  if (Number.isFinite(declared) && declared > MAX_UPLOAD_BYTES) {
+    const limitMb = Math.round(MAX_UPLOAD_BYTES / (1024 * 1024));
+    return NextResponse.json(
+      { error: `That file is too large. The limit is ${limitMb} MB.` },
+      { status: 413 },
+    );
+  }
+
   const token = await readToken();
   const incomingUrl = new URL(request.url);
   const target = `${BACKEND_URL}${resolved.backendPath}${incomingUrl.search}`;
 
+  // forwardableHeaders STRIPS the client-IP pair, so whatever the
+  // browser sent is already gone before the next two lines run. Strip
+  // then set, in that order, is the whole defence -- see proxy-rules.ts.
   const headers = forwardableHeaders(request.headers);
   if (token) headers.set("authorization", `Bearer ${token}`);
+
+  // Sent only when BOTH a secret is configured and the platform gave us
+  // an address. Half a pair is worse than neither: a header with no
+  // secret is ignored by the backend, and a secret with no header tells
+  // it nothing, so there is no point spending a round trip on either.
+  if (CLIENT_IP_SECRET) {
+    const clientIp = platformClientIp(request.headers);
+    if (clientIp) {
+      headers.set(CLIENT_IP_HEADER, clientIp);
+      headers.set(CLIENT_IP_SECRET_HEADER, CLIENT_IP_SECRET);
+    }
+  }
 
   let upstream: Response;
   try {

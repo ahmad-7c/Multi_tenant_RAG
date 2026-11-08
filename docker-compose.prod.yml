@@ -1,0 +1,323 @@
+# Production stack for a single 2 GB Lightsail instance.
+#
+# The one invariant: ONLY caddy publishes ports. Postgres and Redis are
+# reachable on the internal network and from nowhere else. The dev
+# compose file publishes 5434, 5433, 6379 and 8000 to the host, which
+# is right for a laptop and would be an open database on a public IPv4.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+#
+# NEVER bring this stack down with the volume-removing flag. That flag
+# destroys the named volumes, which here is every uploaded document AND
+# the entire database. `scripts/check_no_destructive_commands.sh` fails
+# if the literal command appears anywhere in the repo -- which is why
+# this warning describes it instead of spelling it out. An exception
+# list would be a loophole: a real command could hide behind the same
+# excuse.
+
+# documind-prod, NOT documind.
+#
+# The dev compose file has no explicit name, so its project is derived
+# from the directory -- which normalises to exactly "documind" on a
+# checkout in a folder called DocuMind. Both files then define db,
+# redis, api and worker, and this file's `db_data` volume resolves to
+# `documind_db_data`: the volume the DEV database is already using.
+#
+# `up -d` with the two sharing a project would recreate the dev db
+# container as the prod one ON TOP OF THE DEV DATA DIRECTORY. Postgres
+# ignores POSTGRES_PASSWORD when the data dir already exists, so the
+# result is either an authentication failure the app reports as a 500,
+# or a stack labelled "production" quietly serving development data.
+#
+# Renaming now costs nothing because nothing is deployed yet. After a
+# real deploy, changing it would orphan the live volumes -- so if this
+# ever needs to change again, migrate the volumes deliberately.
+name: documind-prod
+
+# Each backing-service URL is defined ONCE and merged in with `<<`.
+# It carried the generated Postgres password, written out verbatim in
+# api, worker and migrate -- three places a host rename or a credential
+# rotation has to land, and two of them are easy to miss. Compose
+# supports anchors and merge keys directly (the "fragments" feature),
+# so this needs no templating step.
+x-db-env: &db-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-documind}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-documind}
+
+x-redis-env: &redis-env
+  REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD}@redis:6379/0
+
+x-logging: &logging
+  driver: json-file
+  options:
+    # Without rotation one container's logs fill the 2 GB box's disk
+    # and every service dies at once, which looks like a hardware
+    # failure rather than a logging default.
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ------------------------------------------------------------ edge --
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    # The ONLY published ports in this file.
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_HOSTNAME: ${API_HOSTNAME:-localhost}
+      # NOT `${ACME_EMAIL:-}`. An empty value is worse than an unset
+      # one here: Caddy's own `{$ACME_EMAIL:default}` fallback applies
+      # only when the variable is UNSET, so an empty string reaches the
+      # Caddyfile as a bare `email` with no argument and the whole
+      # config becomes unparseable -- the edge then refuses to start.
+      # `:-` in compose substitutes on unset OR empty, which closes it.
+      # Measured with `caddy validate`; CI now runs that on every push.
+      ACME_EMAIL: ${ACME_EMAIL:-admin@localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and ACME account keys. Without this volume every
+      # restart re-requests a certificate and hits Let's Encrypt rate
+      # limits within a day.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [edge, internal]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 96M
+
+  # ------------------------------------------------------------- api --
+  api:
+    image: ${API_IMAGE:-documind-api:local}
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    # No `ports:`. Deliberate -- caddy reaches it as api:8000 over the
+    # internal network, and nothing else can reach it at all.
+    env_file: ${ENV_FILE:-.env.production}
+    environment:
+      <<: [*db-env, *redis-env]
+    volumes:
+      - uploads:/code/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # `egress` as well as `internal`: the query path calls Gemini and
+    # Cohere, and on `internal` alone it could not resolve a hostname.
+    networks: [internal, egress]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------- worker --
+  worker:
+    image: ${API_IMAGE:-documind-api:local}
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    env_file: ${ENV_FILE:-.env.production}
+    environment:
+      <<: [*db-env, *redis-env]
+    # Concurrency 1, not the dev file's 2. Ingestion holds a whole
+    # document in memory while chunking and embedding; two of those
+    # inside a 512M limit is how the worker gets OOM-killed mid-file.
+    # acks_late and the visibility timeout come from celery_app.py and
+    # are not overridden here.
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info --concurrency=1 --max-tasks-per-child=100
+    # The image's HEALTHCHECK polls /health/ready on port 8000, which
+    # is right for the api and impossible for the worker: a Celery
+    # worker runs no web server, so the inherited check can NEVER pass.
+    # The container ran fine and reported `unhealthy` forever -- an
+    # operator reading `docker compose ps` sees a broken worker, and any
+    # future `depends_on: worker: service_healthy` would hang for good.
+    #
+    # Replaced rather than disabled, because there IS a real liveness
+    # question for a worker: can it reach the broker and answer? `inspect
+    # ping` asks exactly that, scoped to this node by hostname so it
+    # cannot be satisfied by some other worker answering first.
+    # The interval is long (30s) because each ping is a broker
+    # round-trip, and this box has 2 GB.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping -d celery@$$HOSTNAME --timeout 10 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 40s
+    volumes:
+      # The SAME named volume as api. With STORAGE_BACKEND=local the
+      # api writes bytes and the worker reads them back by storage_key;
+      # separate volumes mean every ingestion fails on a missing file.
+      - uploads:/code/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Ingestion embeds, so the worker needs egress for the same reason
+    # the api does.
+    networks: [internal, egress]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+
+  # --------------------------------------------------------- migrate --
+  # A one-shot job that must finish BEFORE api and worker start.
+  #
+  # Never inside the api container's startup: two api containers would
+  # race the same migration, and a failed migration would present as a
+  # crash-looping api rather than a job that exited non-zero. Migrations
+  # are expand-then-contract, so rolling the code back never requires
+  # rolling the database back.
+  migrate:
+    image: ${API_IMAGE:-documind-api:local}
+    build:
+      context: .
+      target: runtime
+    restart: "no"
+    env_file: ${ENV_FILE:-.env.production}
+    environment:
+      <<: *db-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    networks: [internal]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # -------------------------------------------------------------- db --
+  db:
+    # Pinned to a patch-stable tag. `latest` would silently move the
+    # Postgres major version under a volume that cannot be read by it.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    # No `ports:`. This is the whole point of the file.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-documind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-documind}
+    # Sized for a 2 GB box shared with four other services.
+    # maintenance_work_mem is the one that matters: HNSW index builds
+    # use it, and the default would let one REINDEX take the box down.
+    command: >
+      postgres
+      -c shared_buffers=192MB
+      -c effective_cache_size=384MB
+      -c maintenance_work_mem=96MB
+      -c work_mem=6MB
+      -c max_connections=30
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-documind} -d ${POSTGRES_DB:-documind}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [internal]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+
+  # ----------------------------------------------------------- redis --
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # No `ports:`.
+    #
+    # noeviction is load-bearing. Redis holds four different things
+    # here: the Celery broker, Celery results, rate-limit buckets and
+    # the answer cache. Under an LRU policy Redis would evict QUEUED
+    # INGESTION TASKS at the memory cap -- uploads would silently never
+    # process, with nothing in any log to say why. noeviction instead
+    # fails writes at the cap, which the app already handles: cache
+    # writes are non-fatal by design, and the limiter fails open on
+    # reads and closed on the answer endpoint.
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      --maxmemory 128mb
+      --maxmemory-policy noeviction
+      --appendonly no
+      --save ""
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    networks: [internal]
+    logging: *logging
+    deploy:
+      resources:
+        limits:
+          memory: 160M
+
+networks:
+  # Two networks, so "which services can the internet reach" is a
+  # property of the topology rather than of remembering not to add a
+  # `ports:` key. Only caddy is on both.
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+  # OUTBOUND ONLY, for api and worker.
+  #
+  # `internal: true` gives a network no gateway, which is what keeps db
+  # and redis unreachable -- and it cut api and worker off from the
+  # internet too, because they were on `internal` and nothing else.
+  # Measured on the server: DNS for generativelanguage.googleapis.com
+  # failed with "Temporary failure in name resolution", every ask 500'd
+  # with TransientEmbeddingError, and ingestion died earlier still
+  # inside tiktoken trying to fetch its vocabulary.
+  #
+  # A separate non-internal network rather than putting api on `edge`:
+  # `edge` exists to describe what the EDGE reaches, and adding api to
+  # it would make "who is on edge" stop meaning "who faces the
+  # internet". This network is named for the one thing it grants.
+  #
+  # Outbound only is not a setting -- it is the absence of a `ports:`
+  # key. A bridge network gives NAT out; inbound needs a published
+  # port, and only caddy has one.
+  #
+  # db, redis and migrate are deliberately NOT attached. migrate talks
+  # to Postgres and nothing else, so egress would be privilege it has
+  # no use for.
+  egress:
+    driver: bridge
+
+volumes:
+  db_data:
+  # Uploaded documents (D-1). A named volume, not a bind mount: it
+  # survives `docker compose down`, is backed up by the nightly job,
+  # and is owned by uid 10001 because the runtime image pre-creates
+  # /code/uploads with that owner before the volume is mounted.
+  uploads:
+  caddy_data:
+  caddy_config:

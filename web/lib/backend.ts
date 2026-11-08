@@ -40,7 +40,29 @@ export const SESSION_MAX_AGE_SECONDS = Number(
  */
 export const MAX_UPLOAD_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Shared secret that lets the backend trust our client-IP header.
+ *
+ * Without it the backend's per-IP limits on /auth/login and
+ * /auth/register see one Vercel egress address for every user on the
+ * internet, so the bucket is per-DEPLOYMENT: credential stuffing is
+ * indistinguishable from normal traffic, and -- the half that bites
+ * first -- a handful of real users signing in at once 429 each other.
+ *
+ * UNSET IS SAFE AND IS THE DEFAULT. The header is simply not sent, and
+ * the backend keeps its existing behaviour. There is no degraded middle
+ * state: either both sides hold the same secret and the real IP is
+ * used, or the real IP is not used at all.
+ */
+export const CLIENT_IP_SECRET = process.env.CLIENT_IP_SECRET ?? "";
+
 // The pure rules live in their own module so they can be imported
 // by a test; re-exported here so every call site is unchanged.
-export { forwardableHeaders, resolveBackendPath } from "./proxy-rules";
+export {
+  CLIENT_IP_HEADER,
+  CLIENT_IP_SECRET_HEADER,
+  forwardableHeaders,
+  platformClientIp,
+  resolveBackendPath,
+} from "./proxy-rules";
 export type { Resolved } from "./proxy-rules";

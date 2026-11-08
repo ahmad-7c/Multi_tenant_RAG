@@ -340,6 +340,229 @@ def _():
     )
 
 
+# ==================================================================
+# Phase 5 / D1. The production configuration gate.
+#
+# These matter more than most in this file, because the gate's whole
+# value is that it FIRES. A gate that quietly stopped firing looks
+# identical from outside: the process boots, serves, and nobody finds
+# out until the day it should have refused.
+# ==================================================================
+
+
+# 21. The gate runs, collects nothing, reports success. The most
+#     plausible regression of all: a refactor that keeps the signature
+#     and loses the body.
+@mutation("startup-gate-never-fires")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        """    problems: list[str] = []
+""",
+        """    problems: list[str] = []
+    return problems  # MUTATION
+""",
+    )
+
+
+# 22. The gate is wired in, but runs only OUTSIDE production -- the
+#     exact inversion a hurried `if` rewrite produces.
+@mutation("startup-gate-skips-production")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        """    if not is_production(settings):
+        return""",
+        """    if is_production(settings):
+        return""",
+    )
+
+
+# 23. passthrough is accepted again. Reads as a tidy-up, because
+#     `hosted` is checked two lines below and this looks redundant.
+@mutation("startup-allows-passthrough-reranker")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        'if settings.RERANKER_PROVIDER == "passthrough":',
+        "if False:  # MUTATION",
+    )
+
+
+# 24. The reranker key check loses its negation, so hosted-with-no-key
+#     passes. One character.
+@mutation("startup-allows-hosted-reranker-without-key")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        'if settings.RERANKER_PROVIDER == "hosted" and _absent(settings.RERANKER_API_KEY):',
+        'if settings.RERANKER_PROVIDER == "hosted" and not _absent(settings.RERANKER_API_KEY):',
+    )
+
+
+# 25. Only the embedding use of the Gemini key is checked. The two
+#     blocks are near-identical, so deleting one reads as
+#     deduplication -- and the LLM would still have no key.
+@mutation("startup-checks-gemini-key-for-embeddings-only")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        """    if settings.LLM_PROVIDER == "gemini" and _absent(settings.GEMINI_API_KEY):
+        problems.append("LLM_PROVIDER=gemini but GEMINI_API_KEY is not set")
+""",
+        "",
+    )
+
+
+# 26. Truthiness becomes `is not None`, so an empty `GEMINI_API_KEY=`
+#     line in the env file now passes. Presence stops being checked
+#     while the check still appears to be there.
+@mutation("startup-accepts-an-empty-gemini-key")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        '    return not (value or "").strip()',
+        "    return value is None  # MUTATION",
+    )
+
+
+# 27. Exact matches only; the prefix rule goes. So
+#     "change-me-for-real-this-time" boots.
+@mutation("startup-placeholder-prefix-rule-dropped")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        '    return normalised.startswith("change-me") or normalised.startswith("changeme")',
+        "    return False  # MUTATION",
+    )
+
+
+# 28. The error names the offending secret, "to help the operator".
+#     Boot behaviour is unchanged -- only the logs of every failed
+#     deploy now contain a key.
+@mutation("startup-error-echoes-the-secret")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        'f"JWT_SECRET_KEY is shorter than {MIN_JWT_SECRET_CHARS} characters"',
+        'f"JWT_SECRET_KEY {secret!r} is shorter than {MIN_JWT_SECRET_CHARS} chars"',
+    )
+
+
+# 29. `and` becomes `or`, so EITHER budget at zero is refused. This
+#     one fires too much rather than too little -- which is its own
+#     failure, because a check that blocks a correct deploy is a check
+#     someone removes.
+@mutation("startup-refuses-one-disabled-budget")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        "if not settings.BUDGET_DAILY_GLOBAL_UNITS and not settings.BUDGET_DAILY_ORG_UNITS:",
+        "if not settings.BUDGET_DAILY_GLOBAL_UNITS or not settings.BUDGET_DAILY_ORG_UNITS:",
+    )
+
+
+# 30. The interactive docs come back in production. Likeliest real
+#     cause: someone debugging a deploy who wanted /docs for five
+#     minutes and did not put it back.
+@mutation("docs-exposed-in-production")
+def _():
+    edit(
+        "app/main.py",
+        "_docs_enabled = not is_production(settings)",
+        "_docs_enabled = True  # MUTATION",
+    )
+
+
+# 31. The gate is no longer CALLED. The function, its tests and its
+#     coverage all survive; only the wiring is gone, which is what
+#     makes this the hardest of the set to notice by reading.
+@mutation("gate-not-wired-into-lifespan")
+def _():
+    edit(
+        "app/main.py",
+        "    enforce_production_safety(settings)",
+        "    pass  # MUTATION: gate not called",
+    )
+
+
+# 32. Readiness stops actually asking the database. The endpoint, its
+#     route and its 503 branch all survive; only the statement that
+#     could fail is gone -- so it answers "ready" for a process with no
+#     database, which is the exact condition it was added to catch.
+@mutation("readiness-never-queries")
+def _():
+    edit(
+        "app/main.py",
+        '        db.execute(sql_text("SELECT 1"))',
+        "        pass  # MUTATION: never asks the database",
+    )
+
+
+# 33. The container healthcheck goes back to /health. Nothing in Python
+#     changes, every readiness test but one still passes, and the deploy
+#     silently loses its rollback trigger. This is the original defect.
+@mutation("healthcheck-targets-health-not-ready")
+def _():
+    edit(
+        "Dockerfile",
+        "c.request('GET','/health/ready')",
+        "c.request('GET','/health')",
+    )
+
+
+# 34. `trusted_proxies` returns to the edge. Likeliest real cause: a
+#     copy-pasted Caddy snippet for a deployment that genuinely sits
+#     behind a load balancer. It makes a client-supplied
+#     X-Forwarded-For trusted, and the per-IP login limiter reads it.
+@mutation("edge-trusts-forwarded-for")
+def _():
+    # Tabs built from chr() rather than written as escapes: the
+    # Caddyfile is tab-indented and an editor that helpfully converts
+    # them would make this mutation silently un-appliable.
+    tab = chr(9)
+    edit(
+        "deploy/Caddyfile",
+        tab + "email {$ACME_EMAIL:}",
+        tab + "email {$ACME_EMAIL:}" + chr(10)
+        + tab + "servers {" + chr(10)
+        + tab + tab + "trusted_proxies static private_ranges" + chr(10)
+        + tab + "}",
+    )
+
+
+# 35. The Server header is advertised again -- a one-line deletion in a
+#     header block nobody re-reads.
+@mutation("edge-advertises-its-server")
+def _():
+    tab = chr(9)
+    edit("deploy/Caddyfile", chr(10) + tab + tab + "-Server", "")
+
+
+# 36. The .gitignore negation is dropped, so `.env.production.example`
+#     is swallowed by the blanket `.env.*` rule. Passes on any machine
+#     that already has the file; fails only on a fresh clone, i.e. CI.
+@mutation("prod-example-falls-back-into-gitignore")
+def _():
+    edit(
+        ".gitignore",
+        "!.env.production.example",
+        "# MUTATION: !.env.production.example",
+    )
+
+
+# 37. The CORS gate stops recognising loopback origins. The check, its
+#     constant and its message all remain; only the comparison goes --
+#     which is what a refactor of _origin_host would plausibly break.
+@mutation("cors-gate-ignores-loopback")
+def _():
+    edit(
+        "app/core/startup_checks.py",
+        "        if _origin_host(origin) in LOOPBACK_HOSTS:",
+        "        if False:  # MUTATION",
+    )
+
+
 if __name__ == "__main__":
     name = sys.argv[1]
     if name == "--list":

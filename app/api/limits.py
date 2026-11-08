@@ -35,6 +35,8 @@ on anything the caller can set -- a body field, a path parameter, a
 header -- is not a limiter: the caller picks a fresh, empty bucket for
 every request.
 """
+import hmac
+import ipaddress
 import logging
 
 from fastapi import Depends, HTTPException, Request, status
@@ -95,16 +97,87 @@ def reset_fallback() -> None:
     _FALLBACK = InMemoryLimiter()
 
 
+#: Longest plausible textual address, with room for an IPv6 scope id.
+#: The value becomes part of a Redis key, so an unbounded one is a
+#: memory problem wearing a header's clothing -- and this cap applies
+#: even to a value that passed the secret check, because "authenticated"
+#: is not the same as "well formed".
+MAX_CLIENT_IP_CHARS = 64
+
+#: Set by the BFF, never by Caddy. A distinct name from X-Forwarded-For
+#: on purpose: Caddy overwrites that one with the connection's own peer
+#: address, so a value sent in it would be discarded at the edge.
+CLIENT_IP_HEADER = "x-client-ip"
+CLIENT_IP_SECRET_HEADER = "x-client-ip-secret"
+
+
+def _attested_client_ip(request: Request) -> str | None:
+    """The browser's address, if the caller proved it may say so.
+
+    Returns None whenever anything is missing, mismatched or malformed,
+    so every failure path lands on the existing behaviour rather than on
+    a half-trusted value.
+
+    `hmac.compare_digest` rather than `==`: a plain comparison returns
+    as soon as two bytes differ, so the time it takes reveals how much
+    of the secret a guess got right. That is a remote oracle for
+    recovering it one character at a time.
+    """
+    expected = settings.CLIENT_IP_SECRET
+    # Unset means the feature is off. Checked FIRST, so an empty
+    # configured secret can never be "matched" by an empty header.
+    if not expected:
+        return None
+
+    presented = request.headers.get(CLIENT_IP_SECRET_HEADER)
+    if not presented:
+        return None
+    if not hmac.compare_digest(presented, expected):
+        return None
+
+    candidate = (request.headers.get(CLIENT_IP_HEADER) or "").strip()
+    if not candidate or len(candidate) > MAX_CLIENT_IP_CHARS:
+        return None
+
+    # Validated, not merely non-empty. A trusted sender can still be
+    # buggy, and keying a limit on "undefined" or "" would put every
+    # such request in one bucket -- which is the failure this whole
+    # change exists to remove, re-created by accident.
+    try:
+        ipaddress.ip_address(candidate)
+    except ValueError:
+        logger.warning(
+            "client-ip header passed the secret check but is not an address; "
+            "falling back to the peer address"
+        )
+        return None
+    return candidate
+
+
 def client_ip(request: Request) -> str:
     """The address a per-IP limit is keyed on.
 
-    X-Forwarded-For is consulted only when TRUST_FORWARDED_FOR is set.
+    Three sources, most trustworthy first:
+
+    1. X-Client-IP, but ONLY when CLIENT_IP_SECRET is configured and the
+       accompanying secret header matches it in constant time. This is
+       the BFF telling us the browser's real address, which it alone
+       can see.
+    2. X-Forwarded-For, only when TRUST_FORWARDED_FOR is set, which is
+       correct when Caddy is the sole ingress because Caddy overwrites
+       that header with the connection's own peer address.
+    3. The peer address.
+
     An unconditionally trusted header is strictly worse than no header:
     the caller sets a different value per request and receives a fresh,
     empty bucket each time, so the limit protects nothing while
-    appearing to work. The LEFTMOST entry is the client; the rest are
+    appearing to work. That is why 1 needs a secret and 2 needs a flag.
+    The LEFTMOST X-Forwarded-For entry is the client; the rest are
     proxies.
     """
+    attested = _attested_client_ip(request)
+    if attested:
+        return attested
     if settings.TRUST_FORWARDED_FOR:
         forwarded = request.headers.get("x-forwarded-for")
         if forwarded:

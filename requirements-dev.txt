@@ -1,0 +1,22 @@
+# CI-only tooling. NOT installed into the runtime image: the Dockerfile
+# installs requirements.txt alone, and the runtime stage copies only
+# site-packages from the deps stage.
+#
+# Pinned exactly, like requirements.txt. A linter that changes rules on
+# its own is a build that breaks on a day nobody touched the code.
+ruff==0.14.2
+
+# Dependency audit for the CI "audit" job. Reads requirements.txt and
+# reports known advisories.
+pip-audit==2.9.0
+
+# NOT PINNED HERE: mypy.
+#
+# This project has never been type-checked and has no mypy config, so
+# adopting it is a decision with a cost, not a line in a requirements
+# file. The cost was going to be measured before recommending anything
+# and could not be -- the install failed with "No space left on device"
+# (the disk was 100% full), so the error count is UNKNOWN rather than
+# estimated. The frontend IS type-checked in CI (`tsc --noEmit`), which
+# is a real gate today; the Python half is deliberately absent and
+# named in the CI summary so the gap is visible rather than implied.

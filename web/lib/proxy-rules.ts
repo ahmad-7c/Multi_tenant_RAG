@@ -33,6 +33,16 @@
  */
 const ALLOWED_PREFIXES = ["users", "documents", "conversations", "usage"];
 
+/**
+ * The client-IP pair. Deliberately NOT `x-forwarded-for`: Caddy
+ * overwrites that one with the connection's own peer address
+ * (`header_up X-Forwarded-For {remote_host}`), so anything sent in it
+ * is discarded at the edge. A distinct name passes through untouched,
+ * which is what keeps this change out of the Caddyfile.
+ */
+export const CLIENT_IP_HEADER = "x-client-ip";
+export const CLIENT_IP_SECRET_HEADER = "x-client-ip-secret";
+
 export type Resolved = { backendPath: string } | null;
 
 /**
@@ -89,6 +99,17 @@ const HOP_BY_HOP = new Set([
   // Never let a caller supply its own bearer: the cookie is the only
   // source of identity here.
   "authorization",
+  // The client-IP pair, STRIPPED ON THE WAY IN. The backend trusts
+  // these when the secret matches, so a browser that could set them
+  // would choose its own rate-limit bucket -- a fresh empty one per
+  // request, which is strictly worse than no per-IP limit at all
+  // because the limit would still look like it was working.
+  //
+  // Stripping happens here, before anything sets them, so the forged
+  // value is gone whether or not the BFF goes on to add a real one.
+  // The order is the whole defence: strip, then set.
+  CLIENT_IP_HEADER,
+  CLIENT_IP_SECRET_HEADER,
 ]);
 
 export function forwardableHeaders(incoming: Headers): Headers {
@@ -97,4 +118,45 @@ export function forwardableHeaders(incoming: Headers): Headers {
     if (!HOP_BY_HOP.has(key.toLowerCase())) out.set(key, value);
   });
   return out;
+}
+
+/**
+ * The browser's real IP, as attested by the platform.
+ *
+ * `x-vercel-forwarded-for` is preferred, and the preference is not
+ * arbitrary. Vercel's request-headers reference says of
+ * `x-forwarded-for`: "we currently overwrite the X-Forwarded-For header
+ * and do not forward external IPs. This restriction is in place to
+ * prevent IP spoofing." So a caller-supplied value is discarded --
+ * EXCEPT that custom X-Forwarded-For is purchasable as a Trusted Proxy
+ * on Enterprise plans, and the docs note of `x-vercel-forwarded-for`
+ * that it is "identical to the x-forwarded-for header. However,
+ * x-forwarded-for could be overwritten if you're using a proxy on top
+ * of Vercel."
+ *
+ * `x-real-ip` is documented as "identical to the x-forwarded-for
+ * header", so it carries the same caveat and is only a fallback.
+ *
+ * Net: on this plan none of the three can be spoofed by the caller, and
+ * `x-vercel-forwarded-for` is the one that stays correct if a CDN is
+ * ever put in front. Verified against
+ * vercel.com/docs/headers/request-headers (last updated 2025-12-13).
+ *
+ * Returns the LEFTMOST entry: the list is client, then proxies.
+ */
+export function platformClientIp(incoming: Headers): string | null {
+  for (const header of [
+    "x-vercel-forwarded-for",
+    "x-real-ip",
+    "x-forwarded-for",
+  ]) {
+    const raw = incoming.get(header);
+    if (!raw) continue;
+    const first = raw.split(",")[0].trim();
+    // Capped here as well as in the backend. The value becomes part of
+    // a Redis key, and an unbounded one is a memory problem wearing a
+    // header's clothing.
+    if (first && first.length <= 64) return first;
+  }
+  return null;
 }

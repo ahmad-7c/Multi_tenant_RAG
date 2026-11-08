@@ -860,7 +860,7 @@ async def test_org_b_cannot_obtain_org_a_passages_through_the_cache(
     collide on the question text alone.
     """
     org_a = org_factory()
-    user_a = user_factory(org_a, role=UserRole.ADMIN)
+    user_factory(org_a, role=UserRole.ADMIN)
     org_b = org_factory()
     user_b = user_factory(org_b, role=UserRole.ADMIN)
     _seed(db_session, embedder, org_b, user_b, "policy-b.pdf", CHUNK_TEXTS)

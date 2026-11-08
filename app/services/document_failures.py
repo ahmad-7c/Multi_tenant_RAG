@@ -91,7 +91,20 @@ _PATTERNS: tuple[tuple[FailureCode, re.Pattern[str]], ...] = (
         FailureCode.PROVIDER_UNAVAILABLE,
         re.compile(
             r"\b5\d\d\b|service unavailable|connecterror|connection refused|"
-            r"connection error|name or service not known|temporarily unavailable",
+            r"connection error|name or service not known|temporarily unavailable|"
+            # DNS. Added after a real incident: api and worker were on a
+            # Docker network declared `internal: true`, which has no
+            # gateway, and every embedding call failed with
+            # "[Errno -3] Temporary failure in name resolution". None of
+            # the patterns above matched it -- "temporarily unavailable"
+            # is not "Temporary failure" -- so the document was recorded
+            # as UNKNOWN, which tells the uploader nothing and tells the
+            # operator nothing either.
+            r"name resolution|getaddrinfo|gaierror|"
+            r"nodename nor servname|name does not resolve|"
+            # Reachability, as distinct from a provider answering badly.
+            r"network is unreachable|no route to host|connection reset|"
+            r"connection aborted|connection timed out|failed to establish",
             re.I,
         ),
     ),

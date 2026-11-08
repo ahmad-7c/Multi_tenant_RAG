@@ -38,6 +38,59 @@ unexamined.
 **12 applied, 12 caught, 0 survivors** — after one real gap was found
 and closed.
 
+## Results — 2026-11-04, Phase 5 deploy work, 936 tests
+
+Mutations 21-37, each applied alone and reverted. 17 applied, **17
+caught, 0 survivors**. Mutations 21-31 were written with the D1
+deploy work but no sweep had ever been recorded for them; they are
+swept here for the first time, alongside the six added while fixing
+the review findings below.
+
+| mutation | what it breaks | caught by |
+|---|---|---|
+| `startup-gate-never-fires` | `collect_production_problems` returns `[]` | `test_placeholder_jwt_secrets_are_refused` (+5 more) |
+| `startup-gate-skips-production` | the gate treats production as dev | `test_the_secret_value_is_never_echoed_in_the_error`, `test_non_production_is_untouched` |
+| `startup-allows-passthrough-reranker` | passthrough reaches production, opening the confidence gate | `test_passthrough_reranker_is_refused` |
+| `startup-allows-hosted-reranker-without-key` | hosted reranker with no key | `test_hosted_reranker_without_a_key_is_refused` |
+| `startup-checks-gemini-key-for-embeddings-only` | the LLM's key requirement is dropped | `test_a_missing_gemini_key_is_refused_for_both_uses` |
+| `startup-accepts-an-empty-gemini-key` | `_absent` becomes `is None` | `test_hosted_reranker_without_a_key_is_refused[""]` |
+| `startup-placeholder-prefix-rule-dropped` | only exact placeholders are caught | `test_placeholder_jwt_secrets_are_refused[change-me-something-else-entirely]` |
+| `startup-error-echoes-the-secret` | the failed-boot log prints the key | `test_the_secret_value_is_never_echoed_in_the_error` |
+| `startup-refuses-one-disabled-budget` | `and` becomes `or`, so one budget is not enough | `test_either_budget_alone_is_enough` |
+| `docs-exposed-in-production` | `/docs` and `/openapi.json` come back | `test_the_app_disables_docs_in_production` |
+| `gate-not-wired-into-lifespan` | the gate exists and is never called | `test_the_lifespan_actually_calls_the_gate` |
+| `readiness-never-queries` | `/health/ready` answers "ready" without asking the database | `test_ready_is_503_when_the_database_is_unreachable` |
+| `healthcheck-targets-health-not-ready` | the container probe goes back to `/health` | `test_the_container_healthcheck_targets_readiness_not_health` |
+| `edge-trusts-forwarded-for` | `trusted_proxies` returns, making a forged `X-Forwarded-For` trusted | `test_no_trusted_proxies_at_the_edge` |
+| `edge-advertises-its-server` | the `Server` header is no longer stripped | `test_the_server_header_is_removed` |
+| `prod-example-falls-back-into-gitignore` | `.env.production.example` is swallowed by `.env.*` | `test_the_example_exists_and_is_tracked` |
+| `cors-gate-ignores-loopback` | a loopback CORS origin passes the production gate | `test_loopback_origins_are_refused` |
+
+### Two of these were real defects before they were mutations
+
+`healthcheck-targets-health-not-ready` and
+`prod-example-falls-back-into-gitignore` are not hypotheticals: both
+were the state of the tree. The healthcheck polled `/health`, which
+reports `ok` with Postgres unreachable (measured: `/health` 200 and
+`POST /auth/login` 500 in the same process), so a deploy with a broken
+database would have reported success and P7's automatic rollback would
+never have fired. And `.env.production.example` was matched by the
+blanket `.env.*` rule, so the file existed only on the author's
+machine — `test_the_example_exists_and_is_tracked` asserted
+`is_file()`, which is true locally and says nothing about a clone.
+
+`cors-gate-ignores-loopback` is the inverse: the check did not exist
+at all, so there was nothing to mutate until it was written.
+
+### One mutation is caught by a test for a different check
+
+`startup-accepts-an-empty-gemini-key` swaps `_absent` for an `is None`
+comparison, and the test that fails is
+`test_hosted_reranker_without_a_key_is_refused[""]` — a RERANKER test.
+`_absent` is shared by both call sites, so either one pins it. Noted
+rather than fixed: the helper is correct to be shared, but a reader
+tracing coverage for the Gemini key would not find it here.
+
 ## The gap this exercise found
 
 `leak-slot-on-disconnect` moves the SSE slot release out of its

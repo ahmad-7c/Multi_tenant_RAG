@@ -1,11 +1,21 @@
 import enum
 import uuid
+from typing import TYPE_CHECKING
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum as SAEnum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+# The relationship targets are declared as STRINGS and resolved by
+# SQLAlchemy's declarative registry at mapper-configuration time, so
+# importing them at runtime is unnecessary -- and would be a circular
+# import. Declared under TYPE_CHECKING instead, which runs never:
+# it tells a reader and a type checker where the name lives, and
+# stops `Mapped["X"]` reading as a name that exists nowhere.
+if TYPE_CHECKING:
+    from app.models.organization import Organization
 
 
 class UserRole(str, enum.Enum):

@@ -27,7 +27,7 @@ import asyncio
 import logging
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 
 from app.core.config import settings
