@@ -44,6 +44,11 @@ PLACEHOLDER_SECRETS = frozenset(
 #: grind it without touching the service.
 MIN_JWT_SECRET_CHARS = 32
 
+#: Same floor, same reason: CLIENT_IP_SECRET is compared rather than
+#: hashed, so its entire strength is its entropy. Unset is fine and
+#: means the feature is off; short is not.
+MIN_CLIENT_IP_SECRET_CHARS = 32
+
 PRODUCTION_ENVS = frozenset({"production", "prod"})
 
 #: Hosts that mean "this machine". An origin on one of them is a
@@ -126,6 +131,29 @@ def collect_production_problems(settings: Settings) -> list[str]:
         problems.append(
             f"JWT_SECRET_KEY is shorter than {MIN_JWT_SECRET_CHARS} characters"
         )
+
+    # ---- the client-IP secret -------------------------------------
+    # Unset is a valid, safe configuration: the header is ignored and
+    # the limiter keeps using the peer address. But a SHORT one is not
+    # safe, and it fails silently in the worst direction -- a guessable
+    # secret lets any caller nominate its own rate-limit bucket, which
+    # removes the per-IP limit while leaving it looking enforced.
+    #
+    # The length floor matches MIN_JWT_SECRET_CHARS for the same reason:
+    # this value is compared, not hashed, so its whole strength is its
+    # entropy.
+    client_ip_secret = settings.CLIENT_IP_SECRET or ""
+    if client_ip_secret:
+        if _looks_placeholder(client_ip_secret):
+            problems.append(
+                "CLIENT_IP_SECRET is a known placeholder. Generate one with: "
+                "openssl rand -hex 32"
+            )
+        elif len(client_ip_secret) < MIN_CLIENT_IP_SECRET_CHARS:
+            problems.append(
+                f"CLIENT_IP_SECRET is shorter than "
+                f"{MIN_CLIENT_IP_SECRET_CHARS} characters"
+            )
 
     # ---- the database ---------------------------------------------
     database_url = settings.DATABASE_URL or ""

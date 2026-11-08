@@ -345,6 +345,21 @@ class Settings(BaseSettings):
     # the header.
     TRUST_FORWARDED_FOR: bool = False
 
+    # Shared secret that makes an X-Client-IP header trustworthy.
+    #
+    # Behind the Next.js BFF every request arrives from one Vercel
+    # egress address, so the per-IP limits on login and register become
+    # per-DEPLOYMENT: credential stuffing looks like normal traffic, and
+    # a handful of real users signing in at once rate-limit each other.
+    # The BFF therefore forwards the browser's real address, and this
+    # secret is what distinguishes it from a caller inventing one.
+    #
+    # EMPTY BY DEFAULT, and empty means the header is ignored entirely
+    # -- not "trusted because nothing was configured". There is no
+    # degraded middle state. A deliberately different header name from
+    # X-Forwarded-For, because Caddy overwrites that one at the edge.
+    CLIENT_IP_SECRET: str = ""
+
     # Concurrent SSE streams per org. Each open stream holds a provider
     # connection and an LLM generation; the cap is what stops one
     # tenant's dashboard with ten panels from occupying the whole pool.
