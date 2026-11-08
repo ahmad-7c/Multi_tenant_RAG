@@ -83,7 +83,13 @@ echo "== credential-bearing URLs (excluding tests and CI config)"
 #
 #   tests/test_env_production_example.py:40
 #   tests/test_startup_checks.py:47
-#   .github/workflows/ci.yml   (postgresql://u:p@127.0.0.1:1/d)
+#   .github/workflows/ci.yml   (a one-character user and password)
+#
+# None of those three is quoted verbatim here, and that is not
+# squeamishness: an earlier version of this comment pasted the CI one in
+# full, and the scanner flagged ITSELF -- scripts/ is not on the
+# exclusion list, so the documentation of an excluded example became a
+# finding. The rule was right and the comment was wrong.
 #
 # What is NOT narrowed: every pattern in PATTERNS above (API keys,
 # private keys) still applies to EVERY tracked file, tests included. A

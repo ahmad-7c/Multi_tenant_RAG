@@ -3412,6 +3412,232 @@ write-only key.
 
 ---
 
+## 12. The real client IP behind the Vercel BFF
+
+**Do this when the Vercel frontend goes live, not before.** Leaving it
+undone is safe; it is the per-IP rate limit that is weaker, not the
+system that is broken.
+
+### Why it is needed
+
+Through the BFF every request reaches FastAPI from **one** Vercel egress
+address. The per-IP limits on `/auth/login` (10/min, burst 5) and
+`/auth/register` (3/min, burst 3) therefore become **per-deployment**:
+
+- credential stuffing from one attacker is indistinguishable from
+  ordinary traffic and gets the whole bucket;
+- **and the half that bites first** — six real people signing in within
+  a minute start 429-ing each other. On a demo that reads as "the app is
+  broken".
+
+The fix: the BFF forwards the browser's real address in `X-Client-IP`,
+and a shared secret in `X-Client-IP-Secret` proves it is allowed to.
+
+Three things make it safe rather than a new hole:
+
+- the BFF **strips both headers on the way in** before setting them, so
+  a browser cannot forge its own bucket;
+- the backend compares the secret with `hmac.compare_digest` and
+  validates the address with `ipaddress.ip_address`, falling back to the
+  peer address on any mismatch or malformed value;
+- **unset means off.** No secret configured, header ignored entirely.
+
+It is `X-Client-IP`, not `X-Forwarded-For`, on purpose: Caddy overwrites
+`X-Forwarded-For` with the connection's own peer address, so a value
+sent in it would be discarded at the edge. **The Caddyfile needs no
+change.**
+
+### 12.1 [server] Generate the secret straight into the file
+
+```bash
+cd /opt/documind && sed -i "s|^CLIENT_IP_SECRET=.*|CLIENT_IP_SECRET=$(openssl rand -hex 32)|" .env.production
+```
+
+Same technique as §5.9: the value is never displayed, and your shell
+history records the literal `$(openssl rand -hex 32)` rather than the
+secret. 32 bytes as 64 hex characters — the gate refuses anything under
+32 characters.
+
+Expected: **no output.**
+
+If your `.env.production` predates this feature it has no
+`CLIENT_IP_SECRET=` line for `sed` to replace, and the command silently
+does nothing. Check, then append if needed:
+
+```bash
+grep -c '^CLIENT_IP_SECRET=' /opt/documind/.env.production
+```
+
+Expected `1`. **If it prints `0`:**
+
+```bash
+cd /opt/documind && printf 'CLIENT_IP_SECRET=%s\n' "$(openssl rand -hex 32)" >> .env.production
+```
+
+### 12.2 [server] Confirm it is set, without printing it
+
+```bash
+awk -F= '/^CLIENT_IP_SECRET=/ {print $1, length($2)}' /opt/documind/.env.production
+```
+
+Expected — name and length only:
+
+```
+CLIENT_IP_SECRET 64
+```
+
+`64` is right. `0` means the line is empty; `7` means `<GENERATE>` is
+still there.
+
+While you are here, confirm the upload cap (§B below). **This one is
+safe to print — it is a number, not a credential:**
+
+```bash
+grep -E '^MAX_UPLOAD_BYTES=' /opt/documind/.env.production
+```
+
+Expected exactly:
+
+```
+MAX_UPLOAD_BYTES=4000000
+```
+
+4,000,000 bytes sits under Vercel's 4.5 MB function body limit, under
+Caddy's 5 MB `request_body max_size`, and is now enforced by the BFF as
+well — so an oversized file gets a sentence instead of a platform error
+page.
+
+### 12.3 [server] Read the secret ONCE, to paste into Vercel
+
+This is the only moment the value appears on screen. Close the terminal
+afterwards, and **never paste it into a chat window, a ticket or a
+commit.**
+
+```bash
+grep '^CLIENT_IP_SECRET=' /opt/documind/.env.production | cut -d= -f2-
+```
+
+Expected: one 64-character hex string.
+
+Select it, copy it, and go straight to 12.4. If you would rather it
+never appear at all, generate a *second* value on your laptop with
+`openssl rand -hex 32`, paste that into Vercel, and set the same value
+on the server with the `sed` line from 12.1 — the secret just has to
+match on both sides; it does not matter which machine invented it.
+
+### 12.4 [Vercel] Add it to the project
+
+1. Vercel → your project → **Settings → Environment Variables**.
+2. **Key:** `CLIENT_IP_SECRET`
+3. **Value:** paste it.
+4. Tick **Sensitive**. Vercel then write-onlys the value: it cannot be
+   read back in the dashboard or the API, only replaced. Do this before
+   saving — it cannot be applied to an existing variable.
+5. Tick **Production**, **Preview** and **Development**.
+6. **Save**, then **Deployments → latest → Redeploy**. Environment
+   variables are read at build and run time, so an existing deployment
+   does not pick it up.
+
+### 12.5 [server] Deploy the backend change
+
+The attested-IP code is in the image, so this needs a rebuild. It is the
+same sequence as §6.14's rebuild, spelled out because this is the first
+time you are doing it against a live stack.
+
+```bash
+cd /opt/documind && git pull
+```
+
+Expected: a summary naming `app/api/limits.py`, `app/core/config.py`,
+`app/core/startup_checks.py` and `.env.production.example`.
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.production build
+```
+
+Expected: 1–3 minutes. The dependency layer is cached, so only the
+`COPY app ./app` layer and below rebuild.
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+```
+
+Expected — `db` and `redis` unchanged, `api` and `worker` recreated:
+
+```
+ ✔ Container documind-prod-db-1      Running
+ ✔ Container documind-prod-redis-1   Running
+ ✔ Container documind-prod-migrate-1 Exited
+ ✔ Container documind-prod-api-1     Healthy
+ ✔ Container documind-prod-worker-1  Started
+```
+
+There is **no migration** in this change — nothing touches the schema.
+
+### 12.6 [server] Confirm the gate accepted the secret
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.production logs api | tail -20
+```
+
+Expected: a normal uvicorn startup. **If the gate refused**, it names the
+variable and never its value:
+
+```
+refusing to start with ENV=production:
+  - CLIENT_IP_SECRET is shorter than 32 characters
+```
+
+That is the gate working. Re-run 12.1 and 12.2.
+
+```bash
+docker compose -f docker-compose.prod.yml --env-file .env.production ps
+```
+
+Expected: five rows, `api` `(healthy)`.
+
+### 12.7 Verify it actually works
+
+**Check 1 — the site still works.** From your laptop:
+
+```
+curl.exe -sS -o NUL -w "health=%{http_code}\n" https://documind-prod.duckdns.org/health
+```
+
+Expected `health=200`. Then sign in through the Vercel URL and ask a
+question. If that works, nothing regressed.
+
+**Check 2 — a forged header buys nothing.** The important one. From your
+laptop, hit the backend directly with a made-up address and no secret:
+
+```
+curl.exe -sS -o NUL -w "%{http_code}\n" -X POST "https://documind-prod.duckdns.org/api/v1/auth/login" -H "Content-Type: application/json" -H "X-Client-IP: 1.2.3.4" -d "{\"org_name\":\"nope\",\"email\":\"nope@example.com\",\"password\":\"wrongpassword\"}"
+```
+
+Expected **401** — a normal failed login. Repeat it 11 times changing
+`1.2.3.4` each time. Around the 11th you should get **429**: the forged
+header did **not** buy a fresh bucket, which is the whole property.
+
+If you get 401s forever, the header is being trusted without the secret.
+Stop and tell me.
+
+**Check 3 — two browsers do not share a bucket.** Sign in and out
+repeatedly from two different networks (laptop and phone on mobile
+data). Neither should 429 the other within the first few attempts. Before
+this change they shared one bucket and would.
+
+> **Rollback — no rebuild needed.** Blank the secret and restart:
+> ```bash
+> cd /opt/documind && sed -i 's|^CLIENT_IP_SECRET=.*|CLIENT_IP_SECRET=|' .env.production
+> docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+> ```
+> Unset means the header is ignored and the limiter returns to keying on
+> the peer address — exactly the behaviour before this section. Remove
+> the Vercel variable too, or the BFF keeps sending a header the backend
+> now ignores (harmless, but misleading to the next person reading it).
+
+---
+
 ## Not covered here
 
 - **The off-box copy (P6).** §11 covers the nightly dump, retention and
@@ -3420,6 +3646,3 @@ write-only key.
 - **Observability (P8).** Structured JSON logs with a request id, an
   external uptime monitor on `/health`, an AWS Budgets alert.
 - **Vercel hand-off (P9)** and the outside verification list **(P10)**.
-- The **BFF client-IP problem** — see `docs/adr/0006`. Through a BFF,
-  Caddy sees the BFF host, so the per-IP limiter becomes
-  per-deployment. Recorded, not solved.

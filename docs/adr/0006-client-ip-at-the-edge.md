@@ -156,3 +156,58 @@ born in the first place.
 - `TRUST_FORWARDED_FOR=true` is safe **only** while Caddy is the sole
   ingress. Publishing the api port alongside it reopens the spoof, and
   `docker-compose.prod.yml` deliberately gives `api` no `ports:` key.
+
+## Resolved at P9 (2026-11-08)
+
+Implemented, with the shape this ADR proposed and one simplification it
+did not anticipate.
+
+- The BFF sends `X-Client-IP` plus `X-Client-IP-Secret`; the backend
+  trusts the address only when `CLIENT_IP_SECRET` is configured and
+  `hmac.compare_digest` matches, then validates it with
+  `ipaddress.ip_address` and caps its length. Any failure falls through
+  to the previous behaviour, so **unset means off** rather than
+  "trusted because unconfigured".
+- `forwardableHeaders` strips both headers INBOUND before the route sets
+  them. Strip then set, in that order: without it a browser could
+  nominate its own bucket, which is worse than no per-IP limit because
+  the limit would still look enforced.
+
+**The simplification: no Caddyfile change was needed.** The proposal
+assumed the edge would have to be taught to pass a real client address
+through. It does not, because the header has a different NAME. Caddy
+rewrites only `X-Forwarded-For` (`header_up X-Forwarded-For
+{remote_host}`) and forwards unknown headers untouched, so `X-Client-IP`
+arrives intact. Choosing a new name instead of reusing `X-Forwarded-For`
+turned a three-component change into a two-component one and left the
+edge config — the part with the spoofing history — alone.
+
+**Which platform header to read, and why it is not spoofable.** Vercel's
+request-headers reference says of `x-forwarded-for`: "we currently
+overwrite the X-Forwarded-For header and do not forward external IPs.
+This restriction is in place to prevent IP spoofing." Custom
+`X-Forwarded-For` is purchasable as a Trusted Proxy on Enterprise plans
+only. `x-vercel-forwarded-for` is documented as identical to it "However,
+x-forwarded-for could be overwritten if you're using a proxy on top of
+Vercel", and `x-real-ip` as simply "identical". So the BFF prefers
+`x-vercel-forwarded-for` — the one that stays correct if a CDN is ever
+put in front — and falls back to the other two. Verified against
+vercel.com/docs/headers/request-headers (last updated 2025-12-13).
+
+**Two defences no functional test can observe**, each pinned by reading
+the source instead: the constant-time comparison (`==` returns the same
+booleans, and swapping it left the whole suite green) and the length cap
+(redundant with the address parse for any input anyone can construct).
+Same reasoning as B1's doubly-nulled citation score — where two defences
+are redundant, each needs its own pin or the layer that goes is the one
+nobody notices.
+
+The alternatives above stand as recorded. mTLS remains the stronger
+option and is still disproportionate for a single-instance Compose
+deployment.
+
+**Not verified live.** The code is tested and the suite is green, but
+nothing has run against the real Vercel deployment. `deploy/runbook.md`
+section 12.7 gives the three checks that would establish it, including
+the one that matters: eleven forged-header logins from one address must
+still reach 429.
