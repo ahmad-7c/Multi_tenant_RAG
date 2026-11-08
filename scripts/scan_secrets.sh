@@ -71,8 +71,37 @@ for pattern in "${PATTERNS[@]}"; do
   [ -n "$hits" ] && report "pattern matched: $pattern" "$hits"
 done
 
-echo "== tracked files: credential-bearing URLs"
-hits=$(tracked_files | xargs -0 grep -nIE "$DSN_PATTERN" 2>/dev/null        | grep -vE "$KNOWN_DEV_CREDS" || true)
+echo "== credential-bearing URLs (excluding tests and CI config)"
+# SCOPED, and the scope is the whole reason this rule is useful.
+#
+# Test fixtures and CI config contain DSNs with invented passwords SO
+# THAT the production gate's dev-credential check can be tested at all:
+# startup_checks.DEV_DB_MARKERS refuses documind:documind and friends,
+# so proving it ACCEPTS a real-looking one needs a fixture that looks
+# real. The scanner cannot tell that from shape, and it flagged three
+# such lines the moment 7ed43ae made them tracked:
+#
+#   tests/test_env_production_example.py:40
+#   tests/test_startup_checks.py:47
+#   .github/workflows/ci.yml   (postgresql://u:p@127.0.0.1:1/d)
+#
+# What is NOT narrowed: every pattern in PATTERNS above (API keys,
+# private keys) still applies to EVERY tracked file, tests included. A
+# real Gemini key pasted into a test still fails this scan. Only the
+# DSN heuristic is scoped, because a Postgres password is the one
+# credential this deployment already defends elsewhere -- `.env` is
+# gitignored, `.env.production.example` is asserted to hold only
+# placeholders, and startup_checks refuses dev credentials at boot.
+#
+# Measured rather than assumed. A probe staged under app/ carrying both
+# a key-shaped string and a production-shaped DSN was caught by this
+# narrowed scanner on both rules:
+#
+#   FAIL: pattern matched: AIza[0-9A-Za-z_-]{30,}   app/_scan_probe.py:1
+#   FAIL: a URL carries a non-development password  app/_scan_probe.py:2
+#
+# so the exclusion covers the two fixture directories and nothing else.
+hits=$(tracked_files        | xargs -0 grep -nIE "$DSN_PATTERN" 2>/dev/null        | grep -vE "^(tests/|\.github/)"        | grep -vE "$KNOWN_DEV_CREDS" || true)
 [ -n "$hits" ] && report "a URL carries a non-development password" "$hits"
 
 echo "== git history: every blob ever committed"

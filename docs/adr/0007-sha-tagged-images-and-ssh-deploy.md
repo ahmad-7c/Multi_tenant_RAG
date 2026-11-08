@@ -49,6 +49,15 @@ Splitting CI and CD into two files also keeps `packages: write` out of
 the workflow that runs on pull requests, including from forks. CI holds
 `contents: read` and nothing else.
 
+**CI triggers on every branch push and drops the `pull_request`
+trigger.** Every branch is verified before it reaches `main`, rather
+than sitting unverified until someone opens a PR. The cost, stated
+because it is real: a pull request from a FORK pushes no branch here and
+therefore gets **no CI at all**. Acceptable while this is a
+single-author repository — bring `pull_request:` back the day an outside
+contribution arrives, and accept that a same-repo PR will then run the
+whole pipeline twice for one commit.
+
 ### A deploy is never cancelled in flight
 
 `concurrency.cancel-in-progress: false`, with a single group for the

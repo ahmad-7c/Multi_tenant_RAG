@@ -15,9 +15,25 @@
 name: CI
 
 on:
+  # EVERY branch, not just main. CI's whole job is to tell you a branch
+  # is broken before it reaches main, and gating that on opening a pull
+  # request means a pushed branch sits unverified until someone
+  # remembers to open one.
   push:
-    branches: [main]
-  pull_request:
+    branches: ["**"]
+  # A button in the Actions tab, so a run can be repeated without
+  # inventing a commit -- useful when the failure was a flake or an
+  # expired credential rather than the code.
+  workflow_dispatch:
+
+  # NOT `pull_request`. With `push: ["**"]` a same-repo pull request
+  # would run the whole suite twice for one commit, on a pipeline whose
+  # slowest job builds an image and runs 895 tests inside it.
+  #
+  # The tradeoff, stated because it is real: a pull request from a FORK
+  # pushes no branch here, so it gets no CI. This repo has a single
+  # author; if outside contributions ever arrive, add `pull_request:`
+  # back and accept the duplicate runs.
 
 # Least privilege. CI only ever READS the repository: the image is built
 # here to prove it builds, and pushed nowhere. Pushing needs
