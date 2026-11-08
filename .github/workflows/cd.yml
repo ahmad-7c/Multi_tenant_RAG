@@ -160,6 +160,37 @@ jobs:
           printf '%s\n%s\n%s\n' "$SMOKE_ORG" "$SMOKE_EMAIL" "$SMOKE_PASSWORD" \
             | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/documind && ./scripts/deploy.sh $IMAGE $SHA"
 
+      - name: deep smoke -- REPORTING ONLY, never gates the deploy
+        # continue-on-error, deliberately.
+        #
+        # This check uploads a document, asks a real question and
+        # requires a citation, so it is the only one that proves the
+        # Gemini and Cohere keys work -- and the only one that can fail
+        # because somebody ELSE is broken.
+        #
+        # Blocking it would be worse than not running it. deploy.sh reads
+        # a failed smoke as grounds to ROLL BACK, and rolling back does
+        # not fix a provider outage: the previous image cannot reach
+        # Gemini either. A 429 at 3am would revert a healthy deploy and
+        # leave the real problem untouched, with an alert blaming the
+        # wrong thing.
+        #
+        # It runs AFTER the deploy is recorded, and as a SEPARATE
+        # invocation rather than through deploy.sh, so its result cannot
+        # reach the rollback path at all.
+        continue-on-error: true
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          SMOKE_ORG: ${{ secrets.SMOKE_ORG }}
+          SMOKE_EMAIL: ${{ secrets.SMOKE_EMAIL }}
+          SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s\n%s\n%s\n' "$SMOKE_ORG" "$SMOKE_EMAIL" "$SMOKE_PASSWORD" \
+            | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes "$DEPLOY_USER@$DEPLOY_HOST" "cd /opt/documind && ./scripts/smoke_deep.sh" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: discard the key
         # always(): a failed deploy must not leave a production key on a
         # runner, even though GitHub-hosted runners are ephemeral. Cheap

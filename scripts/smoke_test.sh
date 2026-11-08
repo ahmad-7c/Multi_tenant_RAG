@@ -179,6 +179,94 @@ else
   fi
 fi
 
+# ---- 7. DEEP: a real question, end to end -----------------------------
+#
+# OPT-IN with SMOKE_DEEP=1, because it SPENDS PROVIDER QUOTA.
+#
+# Checks 1-6 cost nothing: check 6 asks a greeting, which
+# app/services/assistance.py intercepts before the rewriter, the cache,
+# the embedder, the reranker and the model. This one uploads a document,
+# waits for ingestion, asks a real question and requires a citation --
+# so it is the only check that proves the Gemini and Cohere keys work
+# and that retrieval actually retrieves.
+#
+# It is also the only check that can fail because somebody ELSE is
+# broken. See the tradeoff in deploy/runbook.md section 10.
+if [ "${SMOKE_DEEP:-0}" = "1" ]; then
+  if [ -z "${token:-}" ] || [ -z "${convo:-}" ]; then
+    bad "deep: needs a signed-in session and a conversation"
+  else
+    # A document with one quotable fact, so a grounded answer is
+    # unmistakable and a hallucinated one is obvious.
+    tmp_doc="$(mktemp)"
+    printf '# Smoke Policy\n\nThe smoke test reimbursement limit is 42 AUD per day.\n' > "$tmp_doc"
+
+    # The filename is sent explicitly: mktemp produces a name with no
+    # extension, and the extractor dispatches on one.
+    doc_id=$("${CURL[@]}" -X POST "$BASE/api/v1/documents" \
+               -H "Authorization: Bearer $token" \
+               -F "file=@$tmp_doc;filename=smoke-deep.md" \
+             | sed -n 's/.*"document_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p') || true
+    rm -f "$tmp_doc"
+
+    if [ -z "${doc_id:-}" ]; then
+      bad "deep: the upload returned no document id"
+    else
+      # Poll rather than sleep: ingestion is a Celery round trip plus an
+      # embedding call, so a fixed sleep is either too short on a cold
+      # worker or wasted on a warm one.
+      status=""
+      for _ in $(seq 1 30); do
+        detail=$("${CURL[@]}" "$BASE/api/v1/documents/$doc_id" \
+                   -H "Authorization: Bearer $token") || true
+        status=$(printf '%s' "$detail" \
+                 | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        case "$status" in ready|failed) break ;; esac
+        sleep 2
+      done
+
+      if [ "$status" != "ready" ]; then
+        # failure_code is a fixed enum and safe to print -- that is why
+        # it exists. It says whether to wait or to look at the file.
+        code=$(printf '%s' "$detail" \
+               | sed -n 's/.*"failure_code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        bad "deep: document is '${status:-unknown}' after 60s (code: ${code:-none})"
+      else
+        ok "deep: the document ingested (status ready)"
+
+        answer=$("${CURL[@]}" -N -X POST \
+                   "$BASE/api/v1/conversations/$convo/messages" \
+                   -H "Authorization: Bearer $token" \
+                   -H 'Content-Type: application/json' \
+                   -d '{"content":"What is the smoke test reimbursement limit?"}') || true
+
+        case "$answer" in
+          *'"citations":[{'*) ok "deep: the answer carries at least one citation" ;;
+          *)                  bad "deep: no citation in the answer" ;;
+        esac
+
+        # scores_calibrated is true ONLY when the Cohere call SUCCEEDED.
+        # An answer still arrives with a dead rerank key -- on fused RRF
+        # order, with the confidence gate effectively open -- so this is
+        # the assertion that separates "answered" from "answered well".
+        # It is the silent degradation this project has been bitten by
+        # before, and nothing else here would notice it.
+        case "$answer" in
+          *'"scores_calibrated":true'*) ok "deep: rerank scores are calibrated" ;;
+          *) bad "deep: scores_calibrated is not true -- the reranker fell back" ;;
+        esac
+      fi
+
+      # Always clean up, pass or fail. A smoke test that accumulates
+      # documents changes the corpus it is measuring. Deleting also
+      # bumps the org's index_version, which makes the cached answer
+      # unreachable rather than merely stale.
+      "${CURL[@]}" -o /dev/null -X DELETE "$BASE/api/v1/documents/$doc_id" \
+        -H "Authorization: Bearer $token" || true
+    fi
+  fi
+fi
+
 echo
 echo "smoke: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

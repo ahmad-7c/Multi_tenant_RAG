@@ -467,3 +467,78 @@ def test_a_failed_smoke_test_rolls_back():
 
     assert any("rollback" in l for l in block), "a failed smoke must roll back"
     assert any("exit 1" in l for l in block), "and must exit non-zero"
+
+
+# --------------------------------------------------------------------
+# The deep smoke check: opt-in, and never allowed to gate a deploy.
+# --------------------------------------------------------------------
+
+
+def test_the_deep_check_is_opt_in():
+    """Off unless SMOKE_DEEP=1.
+
+    Checks 1-6 cost nothing. This one uploads a document, asks a real
+    question and bills Gemini and Cohere -- on a free tier, running it
+    on every invocation could itself produce the 429 that fails it.
+    """
+    script = (ROOT / "scripts" / "smoke_test.sh").read_text(encoding="utf-8")
+    assert 'SMOKE_DEEP:-0' in script, "the deep check is not gated"
+    assert '"${SMOKE_DEEP:-0}" = "1"' in script, "the default is not off"
+
+
+def test_the_deep_check_asserts_a_citation_and_calibrated_scores():
+    """"Answered" is not "answered well".
+
+    An answer still arrives when the Cohere call fails -- on fused RRF
+    order, with the confidence gate effectively open. scores_calibrated
+    is the only field that distinguishes the two, and it is the silent
+    degradation this project has already been bitten by.
+    """
+    script = (ROOT / "scripts" / "smoke_test.sh").read_text(encoding="utf-8")
+    assert '"citations":[{' in script, "nothing asserts a citation"
+    assert '"scores_calibrated":true' in script, (
+        "nothing asserts the reranker actually ran"
+    )
+
+
+def test_the_deep_check_cleans_up_its_document():
+    """A smoke test that accumulates documents changes the corpus it
+    measures -- and every later run then asks a question against a
+    growing pile of identical policies."""
+    script = (ROOT / "scripts" / "smoke_test.sh").read_text(encoding="utf-8")
+    assert "-X DELETE" in script, "the deep check leaves its document behind"
+
+
+def test_the_deep_check_never_gates_the_deploy(cd: dict):
+    """The tradeoff, made structural.
+
+    deploy.sh reads a failed smoke as grounds to ROLL BACK. The deep
+    check can fail because a provider is down, and rolling back does not
+    fix that -- the previous image cannot reach Gemini either. So it must
+    run as a SEPARATE invocation (never through deploy.sh) and must not
+    fail the job.
+    """
+    deep = next(
+        s for s in _steps(cd) if "smoke_deep.sh" in str(s.get("run", ""))
+    )
+    assert deep.get("continue-on-error") is True, (
+        "the deep check would fail the deploy job"
+    )
+    assert "deploy.sh" not in deep["run"], (
+        "the deep check must not run through deploy.sh, or a provider "
+        "outage reaches the rollback path"
+    )
+
+    # And deploy.sh itself must never turn it on.
+    deploy = (ROOT / "scripts" / "deploy.sh").read_text(encoding="utf-8")
+    assert "SMOKE_DEEP" not in deploy, "deploy.sh enables the deep check"
+
+
+def test_the_deep_wrapper_takes_its_credentials_on_stdin():
+    """Same contract as deploy.sh: never in argv."""
+    wrapper = (ROOT / "scripts" / "smoke_deep.sh").read_text(encoding="utf-8")
+    read_at = wrapper.index("read -r SMOKE_ORG")
+    close_at = wrapper.index("exec < /dev/null")
+    assert read_at < close_at
+    assert "SMOKE_DEEP=1" in wrapper
+    assert "SMOKE_BASE_URL" in wrapper
